@@ -51,6 +51,8 @@ MAX_BOOK_AGE_MS = int(os.getenv("MAX_BOOK_AGE_MS", "750"))
 
 REPORT_DELAY_SECONDS = int(os.getenv("REPORT_DELAY_SECONDS", "300"))
 REPORT_CHECK_INTERVAL = int(os.getenv("REPORT_CHECK_INTERVAL", "30"))
+RESOLUTION_INTERVAL = float(os.getenv("RESOLUTION_INTERVAL", "10"))
+RESOLUTION_GRACE_SECONDS = int(os.getenv("RESOLUTION_GRACE_SECONDS", "10"))
 
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -330,6 +332,26 @@ async def fetch_event_by_slug(slug):
         if isinstance(data, list) and data and isinstance(data[0], dict):
             return data[0]
     return None
+
+async def fetch_gamma_market_by_condition(cid):
+    """Fallback lookup that does not depend on the event/slug endpoint."""
+    for params in (
+        {"condition_ids": cid},
+        {"conditionId": cid},
+    ):
+        data = await get_json(f"{GAMMA_API}/markets", params=params)
+        if isinstance(data, list):
+            for raw in data:
+                if isinstance(raw, dict) and str(raw.get("conditionId") or "") == str(cid):
+                    return raw
+        elif isinstance(data, dict) and str(data.get("conditionId") or "") == str(cid):
+            return data
+    return None
+
+async def fetch_clob_market(cid):
+    """Second independent resolution source."""
+    data = await get_json(f"{CLOB_API}/markets/{cid}")
+    return data if isinstance(data, dict) else None
 
 def parse_market_from_event(event, expected_slug):
     if not isinstance(event, dict):
@@ -972,27 +994,39 @@ def resolved_winner_from_market(raw):
     if not isinstance(raw, dict):
         return None, None
 
+    # CLOB-style token objects are the strongest signal when winner=true is present.
+    token_objs = raw.get("tokens")
+    if isinstance(token_objs, list):
+        for tok in token_objs:
+            if not isinstance(tok, dict):
+                continue
+            if bool(tok.get("winner", False)):
+                asset = str(
+                    tok.get("token_id")
+                    or tok.get("tokenId")
+                    or tok.get("asset_id")
+                    or tok.get("id")
+                    or ""
+                )
+                outcome = str(tok.get("outcome") or tok.get("name") or "")
+                if asset:
+                    return asset, outcome
+
     outcomes = [str(x) for x in parse_jsonish(raw.get("outcomes"))]
     tokens = [str(x) for x in parse_jsonish(raw.get("clobTokenIds"))]
     prices_raw = parse_jsonish(raw.get("outcomePrices"))
 
+    # Gamma commonly settles binary markets to [1,0] / [0,1].
     if len(outcomes) >= 2 and len(tokens) >= 2 and len(prices_raw) >= 2:
         prices = [sf(x, -1) for x in prices_raw]
-        idx = max(range(len(prices)), key=lambda i: prices[i])
-        best = prices[idx]
-        second = max(prices[i] for i in range(len(prices)) if i != idx)
-
-        if best >= 0.999 and second <= 0.001:
-            return tokens[idx], outcomes[idx]
-
-    token_objs = raw.get("tokens")
-    if isinstance(token_objs, list):
-        for tok in token_objs:
-            if isinstance(tok, dict) and bool(tok.get("winner", False)):
-                asset = str(tok.get("token_id") or tok.get("tokenId") or tok.get("id") or "")
-                outcome = str(tok.get("outcome") or tok.get("name") or "")
-                if asset:
-                    return asset, outcome
+        valid_n = min(len(outcomes), len(tokens), len(prices))
+        if valid_n >= 2:
+            idx = max(range(valid_n), key=lambda i: prices[i])
+            best = prices[idx]
+            others = [prices[i] for i in range(valid_n) if i != idx]
+            second = max(others) if others else -1
+            if best >= 0.999 and second <= 0.001:
+                return tokens[idx], outcomes[idx]
 
     return None, None
 
@@ -1048,39 +1082,71 @@ async def handle_ws_resolution(payload):
     if cid and winning_asset:
         await settle_market(cid, winning_asset, winning_outcome)
 
+async def resolve_one_market(row):
+    cid = str(row["condition_id"])
+    slug = str(row["slug"])
+
+    # Source 1: original event-by-slug path.
+    event = await fetch_event_by_slug(slug)
+    if isinstance(event, dict):
+        raw_markets = event.get("markets")
+        if isinstance(raw_markets, list):
+            raw = None
+            for m in raw_markets:
+                if isinstance(m, dict) and str(m.get("conditionId") or "") == cid:
+                    raw = m
+                    break
+            if raw is None and len(raw_markets) == 1 and isinstance(raw_markets[0], dict):
+                raw = raw_markets[0]
+
+            winning_asset, winning_outcome = resolved_winner_from_market(raw)
+            if winning_asset:
+                return winning_asset, winning_outcome, "GAMMA_EVENT"
+
+    # Source 2: Gamma market lookup by condition id.
+    raw = await fetch_gamma_market_by_condition(cid)
+    winning_asset, winning_outcome = resolved_winner_from_market(raw)
+    if winning_asset:
+        return winning_asset, winning_outcome, "GAMMA_MARKET"
+
+    # Source 3: CLOB market endpoint.
+    raw = await fetch_clob_market(cid)
+    winning_asset, winning_outcome = resolved_winner_from_market(raw)
+    if winning_asset:
+        return winning_asset, winning_outcome, "CLOB"
+
+    return None, None, None
+
 async def resolution_loop():
+    """
+    Keep every ended unresolved market in SQLite and retry it indefinitely.
+    A restart therefore does not lose pending settlements.
+    """
+    last_pending_log = 0.0
+
     while True:
         try:
-            cutoff = now_ts() - 10
+            cutoff = now_ts() - RESOLUTION_GRACE_SECONDS
 
             with db() as conn:
                 rows = conn.execute("""
                     SELECT * FROM markets
                     WHERE resolved=0 AND end_ts < ?
                     ORDER BY end_ts
-                    LIMIT 50
+                    LIMIT 100
                 """, (cutoff,)).fetchall()
 
+            if rows and time.monotonic() - last_pending_log >= 60:
+                log.info("RESOLUTION pending markets=%d", len(rows))
+                last_pending_log = time.monotonic()
+
             for row in rows:
-                event = await fetch_event_by_slug(str(row["slug"]))
-                if not isinstance(event, dict):
-                    continue
-
-                raw_markets = event.get("markets")
-                if not isinstance(raw_markets, list):
-                    continue
-
-                raw = None
-                for m in raw_markets:
-                    if str(m.get("conditionId") or "") == str(row["condition_id"]):
-                        raw = m
-                        break
-
-                if raw is None and len(raw_markets) == 1:
-                    raw = raw_markets[0]
-
-                winning_asset, winning_outcome = resolved_winner_from_market(raw)
+                winning_asset, winning_outcome, source = await resolve_one_market(row)
                 if winning_asset:
+                    log.info(
+                        "RESOLUTION %s | source=%s | winner=%s",
+                        str(row["slug"]), source, winning_outcome,
+                    )
                     await settle_market(
                         str(row["condition_id"]),
                         winning_asset,
@@ -1090,7 +1156,7 @@ async def resolution_loop():
         except Exception:
             log.exception("Resolution loop failed")
 
-        await asyncio.sleep(10)
+        await asyncio.sleep(RESOLUTION_INTERVAL)
 
 # ============================================================
 # REPORTING
@@ -1160,6 +1226,26 @@ def build_summary(start_ms=None, end_ms=None):
         key=lambda x: (x["pnl"], x["markets"]),
         reverse=True,
     )
+
+def unresolved_execution_count(start_ts, end_ts):
+    """
+    Count eligible paper executions belonging to markets ending in this hour
+    that still have no result. The hourly report must not advance past them.
+    """
+    sm = start_ts * 1000
+    em = end_ts * 1000
+    with db() as conn:
+        row = conn.execute("""
+            SELECT COUNT(*) AS c
+            FROM executions e
+            JOIN markets m ON m.condition_id = e.condition_id
+            LEFT JOIN results r ON r.execution_id = e.id
+            WHERE e.eligible=1
+              AND (m.end_ts * 1000) >= ?
+              AND (m.end_ts * 1000) < ?
+              AND r.execution_id IS NULL
+        """, (sm, em)).fetchone()
+        return si(row["c"]) if row else 0
 
 def make_hourly_report(start_ts, end_ts):
     sm = start_ts * 1000
@@ -1300,6 +1386,15 @@ async def reporter():
             while last_end < eligible:
                 start = last_end
                 end = start + 3600
+
+                pending = unresolved_execution_count(start, end)
+                if pending > 0:
+                    log.info(
+                        "REPORT waiting for settlement | %s -> %s | pending executions=%d",
+                        utc_iso(start), utc_iso(end), pending,
+                    )
+                    break
+
                 path, best = make_hourly_report(start, end)
 
                 if best:
@@ -1343,7 +1438,7 @@ async def health(request):
 
     return web.json_response({
         "ok": True,
-        "version": "1.0",
+        "version": "1.1-resolution-fix",
         "paper_only": True,
         "leader": LEADER_WALLET,
         "poll_interval_s": LEADER_POLL_INTERVAL,
@@ -1385,7 +1480,7 @@ async def main():
     state_set("launch_ts", now_ts())
 
     session = aiohttp.ClientSession(headers={
-        "User-Agent": "PowerwinnerLateSignalPaper/1.0",
+        "User-Agent": "PowerwinnerLateSignalPaper/1.1",
         "Accept": "application/json",
     })
 
