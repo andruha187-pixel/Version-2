@@ -21,45 +21,27 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ============================================================
-# CONFIG
+# POLYBTC SNIPER LAB — PAPER ONLY
+# Adaptation of the public polybtc stale-quote research thesis.
+# Four independent $500 paper accounts, same market/Binance snapshot.
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+VERSION = "1.0-polybtc-sniper-lab-paper"
+HOST = "https://clob.polymarket.com"
+GAMMA = "https://gamma-api.polymarket.com"
+POLY_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+BINANCE_SPOT_WS = os.getenv(
+    "BINANCE_SPOT_WS",
+    "wss://data-stream.binance.vision/stream?streams=btcusdt@bookTicker/btcusdt@aggTrade",
+)
+BINANCE_PERP_WS = os.getenv(
+    "BINANCE_PERP_WS",
+    "wss://fstream.binance.com/market/stream?streams=btcusdt@bookTicker/btcusdt@aggTrade",
+)
+BINANCE_DATA_API = os.getenv("BINANCE_DATA_API", "https://data-api.binance.vision")
+BINANCE_SYMBOL = os.getenv("BINANCE_SYMBOL", "BTCUSDT").upper()
 
 PORT = int(os.getenv("PORT", "8080"))
-
-# We intentionally start with BTC only because our Powerwinner dataset
-# is dominated by BTC 5-minute Up/Down markets.
-SYMBOL = os.getenv("SYMBOL", "BTC").upper()
-
-# The observed Powerwinner rhythm is about one strategy decision every 3 sec.
-DECISION_INTERVAL = float(os.getenv("DECISION_INTERVAL", "3.0"))
-
-# Stop opening new positions after this many seconds from market start.
-TRADE_WINDOW_SECONDS = int(os.getenv("TRADE_WINDOW_SECONDS", "180"))
-
-# Paper order size per signal. 10 shares keeps the simulation liquid and
-# makes variants comparable. Scale later after finding profitable logic.
-ORDER_SIZE = float(os.getenv("ORDER_SIZE", "10"))
-
-# Crypto taker fee rate from current Polymarket docs.
-CRYPTO_FEE_RATE = float(os.getenv("CRYPTO_FEE_RATE", "0.07"))
-
-# Market discovery frequency.
-DISCOVERY_INTERVAL = float(os.getenv("DISCOVERY_INTERVAL", "10"))
-
-# Full book older than this triggers REST refresh before simulated execution.
-MAX_BOOK_AGE_MS = int(os.getenv("MAX_BOOK_AGE_MS", "1000"))
-
-# Reports are sent 5 minutes after the hour closes.
-REPORT_DELAY_SECONDS = int(os.getenv("REPORT_DELAY_SECONDS", "300"))
-REPORT_CHECK_INTERVAL = int(os.getenv("REPORT_CHECK_INTERVAL", "30"))
-
-GAMMA_API = "https://gamma-api.polymarket.com"
-CLOB_API = "https://clob.polymarket.com"
-MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-
 DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data"))
 try:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -70,181 +52,134 @@ except Exception:
     DATA_DIR = Path("./data")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = DATA_DIR / "strategy_simulator.db"
-REPORT_DIR = DATA_DIR / "strategy_reports"
+DB_PATH = DATA_DIR / "polybtc_sniper_lab_v1.db"
+REPORT_DIR = DATA_DIR / "sniper_lab_reports"
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+PAPER_START_BALANCE = float(os.getenv("PAPER_START_BALANCE", "500"))
+MIN_FREE_CASH = float(os.getenv("MIN_FREE_CASH", "5"))
+MAX_BOOK_AGE_MS = int(os.getenv("MAX_BOOK_AGE_MS", "1500"))
+MAX_FEED_AGE_MS = int(os.getenv("MAX_FEED_AGE_MS", "1500"))
+DECISION_INTERVAL = float(os.getenv("DECISION_INTERVAL", "0.25"))
+PAPER_TAKER_LATENCY_MS = int(os.getenv("PAPER_TAKER_LATENCY_MS", "400"))
+ATTEMPT_COOLDOWN_MS = int(os.getenv("ATTEMPT_COOLDOWN_MS", "1200"))
+MEMORY_KEEP_RESOLVED_SEC = int(os.getenv("MEMORY_KEEP_RESOLVED_SEC", "1800"))
+
+# Source-backed research knobs.
+ROBUST_BETAS = tuple(float(x) for x in os.getenv("ROBUST_BETAS", "0.83,1.36").split(","))
+LATE_MODEL_WEIGHT = float(os.getenv("LATE_MODEL_WEIGHT", "0.95"))
+TAIL_WEIGHT = float(os.getenv("TAIL_WEIGHT", "0.15"))
+TAIL_SCALE = float(os.getenv("TAIL_SCALE", "2.5"))
+VOL_FAST_WINDOW_SEC = int(os.getenv("VOL_FAST_WINDOW_SEC", "60"))
+VOL_SLOW_WINDOW_SEC = int(os.getenv("VOL_SLOW_WINDOW_SEC", "600"))
+VOL_FAST_HALFLIFE_SEC = float(os.getenv("VOL_FAST_HALFLIFE_SEC", "30"))
+VOL_SLOW_HALFLIFE_SEC = float(os.getenv("VOL_SLOW_HALFLIFE_SEC", "300"))
+MIN_VOL_PER_SQRT_SEC = float(os.getenv("MIN_VOL_PER_SQRT_SEC", "0.00002"))
+BASIS_WINDOW_SEC = int(os.getenv("BASIS_WINDOW_SEC", "60"))
+
+# Four clean A/B/C/D experiments. Each has its own $500 account.
+STRATEGIES = [
+    {
+        "name": "S5_R10",
+        "short": "A / 5m robust edge>=10c",
+        "kind": "5m",
+        "leg": "snipe",
+        "min_tau": 1.0,
+        "max_tau": 60.0,
+        "min_edge": 0.10,
+        "max_edge": 0.20,
+        "min_ask": 0.50,
+        "max_ask": 0.70,
+        "min_take_usd": 10.0,
+        "max_take_usd": 25.0,
+        "max_market_usd": 50.0,
+    },
+    {
+        "name": "S5_R15",
+        "short": "B / 5m robust edge>=15c",
+        "kind": "5m",
+        "leg": "snipe",
+        "min_tau": 1.0,
+        "max_tau": 60.0,
+        "min_edge": 0.15,
+        "max_edge": 0.20,
+        "min_ask": 0.50,
+        "max_ask": 0.70,
+        "min_take_usd": 10.0,
+        "max_take_usd": 25.0,
+        "max_market_usd": 50.0,
+    },
+    {
+        "name": "S15_R10",
+        "short": "C / 15m robust edge>=10c",
+        "kind": "15m",
+        "leg": "snipe",
+        "min_tau": 1.0,
+        "max_tau": 60.0,
+        "min_edge": 0.10,
+        "max_edge": 0.20,
+        "min_ask": 0.50,
+        "max_ask": 0.70,
+        "min_take_usd": 10.0,
+        "max_take_usd": 25.0,
+        "max_market_usd": 50.0,
+    },
+    {
+        "name": "SCALP15",
+        "short": "D / 15m end-window scalp",
+        "kind": "15m",
+        "leg": "scalp",
+        "min_tau": 5.0,
+        "max_tau": 30.0,
+        "min_prob": 0.997,
+        "min_ask": 0.90,
+        "max_ask": 0.99,
+        "min_take_usd": 10.0,
+        "max_take_usd": 20.0,
+        "max_market_usd": 20.0,
+    },
+]
+STRATEGY_BY_NAME = {s["name"]: s for s in STRATEGIES}
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("strategy-sim")
+log = logging.getLogger("polybtc-sniper-lab")
 
 session: Optional[aiohttp.ClientSession] = None
 
-# ============================================================
-# STRATEGY GRID
-# ============================================================
-#
-# We do NOT pretend to know Powerwinner's exact formula yet.
-# Run several candidate variants simultaneously on the same live books.
-#
-# entry_move:
-#   minimum rise in ask price over lookback needed for first entry.
-#
-# pyramid_step:
-#   after buying a side, it must rise this much above its previous buy price
-#   before another fixed-size lot is added.
-#
-# lookback:
-#   number of 3-sec samples used to measure momentum.
-#
-# switch_move:
-#   minimum opposite-side momentum required to start buying the other side.
-#
-# max_buys_side:
-#   maximum number of lots on each side per market.
-#
-# min_price/max_price:
-#   avoid extreme contracts where movement has different behavior.
-#
-
-VARIANTS = [
-    {"name": "M03_P08_L2", "entry_move": 0.03, "pyramid_step": 0.08, "lookback": 2, "switch_move": 0.04, "max_buys_side": 6},
-    {"name": "M04_P08_L2", "entry_move": 0.04, "pyramid_step": 0.08, "lookback": 2, "switch_move": 0.04, "max_buys_side": 6},
-    {"name": "M05_P08_L2", "entry_move": 0.05, "pyramid_step": 0.08, "lookback": 2, "switch_move": 0.05, "max_buys_side": 6},
-    {"name": "M05_P10_L2", "entry_move": 0.05, "pyramid_step": 0.10, "lookback": 2, "switch_move": 0.05, "max_buys_side": 6},
-    {"name": "M06_P10_L2", "entry_move": 0.06, "pyramid_step": 0.10, "lookback": 2, "switch_move": 0.06, "max_buys_side": 6},
-    {"name": "M08_P10_L2", "entry_move": 0.08, "pyramid_step": 0.10, "lookback": 2, "switch_move": 0.08, "max_buys_side": 6},
-    {"name": "M05_P10_L3", "entry_move": 0.05, "pyramid_step": 0.10, "lookback": 3, "switch_move": 0.05, "max_buys_side": 6},
-    {"name": "M08_P12_L3", "entry_move": 0.08, "pyramid_step": 0.12, "lookback": 3, "switch_move": 0.08, "max_buys_side": 5},
-
-    # Prospective v2 filter derived from the first M03 research sample.
-    # IMPORTANT: keep these rules fixed while collecting new out-of-sample data.
-    {
-        "name": "M03_V2_LOCK",
-        "entry_move": 0.03,
-        "pyramid_step": 0.08,
-        "lookback": 2,
-        "switch_move": 999.0,       # effectively disabled
-        "max_buys_side": 6,
-        "entry_price_min": 0.55,
-        "entry_price_max": 0.75,
-        "momentum_cap": 0.30,
-        "allow_switch": False,
-    },
-    # 10-й вариант: исходный M03 без переворотов, новые покупки только до 90-й секунды.
-    {
-        "name": "M03_V3_NOSW90",
-        "entry_move": 0.03,
-        "pyramid_step": 0.08,
-        "lookback": 2,
-        "switch_move": 999.0,
-        "max_buys_side": 5,
-        "allow_switch": False,
-        "entry_cutoff_sec": 90,
-    },
-
-    # 11-й вариант: исходный M03, но SWITCH разрешён только пока новая сторона дешёвая.
-    {
-        "name": "M03_V4_SW45",
-        "entry_move": 0.03,
-        "pyramid_step": 0.08,
-        "lookback": 2,
-        "switch_move": 0.03,
-        "max_buys_side": 5,
-        "allow_switch": True,
-        "switch_price_max": 0.45,
-    },
-
-    # 12-й вариант: динамический M03 V5.
-    # Первые 60 сек: дорогие SWITCH > 0.45 блокируются.
-    # После 60 сек: <=0.45 разрешены; 0.46-0.50 только при momentum < 0.10;
-    # 0.51-0.70 блокируются; >0.70 оставляем как у исходного M03 для проверки.
-    {
-        "name": "M03_V5_DYNAMIC",
-        "entry_move": 0.03,
-        "pyramid_step": 0.08,
-        "lookback": 2,
-        "switch_move": 0.03,
-        "max_buys_side": 5,
-        "allow_switch": True,
-        "dynamic_switch_v5": True,
-    },
-
-]
-
-MIN_PRICE = float(os.getenv("MIN_PRICE", "0.08"))
-MAX_PRICE = float(os.getenv("MAX_PRICE", "0.95"))
-
-# ============================================================
-# BINANCE EXPERIMENT
-# ============================================================
-
-BINANCE_SYMBOL = os.getenv("BINANCE_SYMBOL", "btcusdt").lower()
-BINANCE_WS = (
-    "wss://fstream.binance.com/market/stream?streams="
-    f"{BINANCE_SYMBOL}@aggTrade/"
-    f"{BINANCE_SYMBOL}@depth20@100ms"
-)
-
-BINANCE_LARGE_TRADE_USD = float(os.getenv("BINANCE_LARGE_TRADE_USD", "50000"))
-
-BINANCE_SIGNAL_MAX_AGE_MS = int(os.getenv("BINANCE_SIGNAL_MAX_AGE_MS", "1500"))
-REGIME_WINDOW_SEC = int(os.getenv("REGIME_WINDOW_SEC", "30"))
-START_PRICE_CAPTURE_WINDOW_SEC = int(os.getenv("START_PRICE_CAPTURE_WINDOW_SEC", "3"))
-W_IMPULSE = float(os.getenv("W_IMPULSE", "22"))
-W_FLOW = float(os.getenv("W_FLOW", "18"))
-W_BOOK = float(os.getenv("W_BOOK", "14"))
-W_LARGE = float(os.getenv("W_LARGE", "8"))
-W_TREND = float(os.getenv("W_TREND", "14"))
-W_DISTANCE = float(os.getenv("W_DISTANCE", "18"))
-W_POLY_PRICE = float(os.getenv("W_POLY_PRICE", "6"))
-
-
-# Shadow filters do NOT change the original 12 strategies.
-# They only accept/skip trades already generated by those strategies.
-BINANCE_FILTER_MODES = [
-    "CONF55",
-    "CONF60",
-    "CONF65",
-    "CONF70",
-    "CONF75",
-]
-
-
-# ============================================================
-# SHARED MARKET STATE
-# ============================================================
-
+# Shared Polymarket state.
 books = {}
 markets = {}
 subscribed_assets = set()
 ws_send_queue: asyncio.Queue = asyncio.Queue()
 
-# price_history[condition][asset] -> deque [(timestamp_ms, ask)]
-price_history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=100)))
+# Binance spot/perp state.
+spot_bid = None
+spot_ask = None
+spot_last = None
+spot_last_ms = 0
+perp_bid = None
+perp_ask = None
+perp_last = None
+perp_last_ms = 0
+spot_second_prices = deque(maxlen=1800)  # (sec, price)
+basis_samples = deque(maxlen=600)       # (ms, perp_mid - spot_mid)
+market_open_cache = {}
 
-# strategy_state[(condition, variant)] -> state dict
-strategy_state = {}
-
-
-# Binance futures market state.
-binance_trades = deque(maxlen=20000)       # (ms, price, quote_usd, aggressor_sign)
-binance_second_prices = deque(maxlen=300) # (second_ts, last_price)
-binance_tick_prices = deque(maxlen=50000)
-market_binance_start_price = {}
-
-binance_depth_bids = []
-binance_depth_asks = []
-binance_last_event_ms = 0
-
-# Shadow portfolio state:
-# accepted_sides[(condition, variant, mode)] = set(asset ids already accepted)
-shadow_accepted_sides = defaultdict(set)
+# Execution state.
+inflight = set()  # (strategy, condition)
+last_attempt_ms = defaultdict(int)
+last_signature = {}
+spent_cache = {}
+settle_lock = asyncio.Lock()
 
 # ============================================================
-# HELPERS
+# Helpers
 # ============================================================
 
 def now_ts():
@@ -258,17 +193,17 @@ def utc_iso(ts=None):
         ts = time.time()
     return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
 
-def sf(v, default=0.0):
+def sf(v, d=0.0):
     try:
         return float(v)
     except (TypeError, ValueError):
-        return default
+        return d
 
-def si(v, default=0):
+def si(v, d=0):
     try:
         return int(float(v))
     except (TypeError, ValueError):
-        return default
+        return d
 
 def jd(v):
     return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
@@ -285,255 +220,366 @@ def parse_jsonish(v):
         return []
 
 def parse_iso(s):
-    if not s:
-        return None
     try:
-        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")) if s else None
     except Exception:
         return None
 
+def normal_cdf(x):
+    return 0.5 * (1.0 + math.erf(float(x) / math.sqrt(2.0)))
+
+def fee_per_share(price):
+    p = float(price)
+    return 0.07 * p * (1.0 - p)
+
 def fee_usdc(shares, price):
-    fee = shares * CRYPTO_FEE_RATE * price * (1.0 - price)
-    # Polymarket rounds fees to 5 decimals.
+    fee = float(shares) * fee_per_share(price)
     return round(fee, 5) if fee >= 0.000005 else 0.0
 
-def target_market_text(m):
-    return f"{m.get('question','')} {m.get('slug','')}".lower()
+def cash_key(strategy_name):
+    return f"paper_cash::{strategy_name}"
 
-def is_target_market(m):
-    s = target_market_text(m)
-
-    if SYMBOL == "BTC":
-        symbol_ok = ("bitcoin" in s or "btc" in s)
-    elif SYMBOL == "ETH":
-        symbol_ok = ("ethereum" in s or "eth" in s)
-    else:
-        symbol_ok = True
-
-    updown = ("up or down" in s or "up-down" in s)
-    return (
-        symbol_ok
-        and updown
-        and bool(m.get("enableOrderBook", True))
-        and not bool(m.get("closed", False))
-    )
+def initial_key(strategy_name):
+    return f"paper_initial::{strategy_name}"
 
 # ============================================================
-# DATABASE
+# Database
 # ============================================================
 
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
+    c = sqlite3.connect(DB_PATH, timeout=30)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA synchronous=NORMAL;")
+    return c
 
 def init_db():
-    with db() as conn:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS discovered_markets (
-            condition_id TEXT PRIMARY KEY,
-            question TEXT,
-            slug TEXT,
-            start_ts INTEGER,
-            end_ts INTEGER,
-            up_asset TEXT,
-            down_asset TEXT,
-            discovered_ms INTEGER,
-            resolved INTEGER DEFAULT 0,
-            winning_asset TEXT,
-            winning_outcome TEXT
+    with db() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS state(
+          key TEXT PRIMARY KEY,
+          value TEXT
         );
 
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            signal_ms INTEGER,
-            condition_id TEXT,
-            variant TEXT,
-            asset TEXT,
-            outcome TEXT,
-            ask REAL,
-            reference_ask REAL,
-            momentum REAL,
-            signal_type TEXT,
-            elapsed_sec REAL
+        CREATE TABLE IF NOT EXISTS markets(
+          condition_id TEXT PRIMARY KEY,
+          kind TEXT,
+          duration_sec INTEGER,
+          question TEXT,
+          slug TEXT,
+          start_ts INTEGER,
+          end_ts INTEGER,
+          up_asset TEXT,
+          down_asset TEXT,
+          btc_open REAL,
+          resolved INTEGER DEFAULT 0,
+          winning_asset TEXT,
+          winning_outcome TEXT
         );
 
-        CREATE TABLE IF NOT EXISTS paper_trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            trade_ms INTEGER,
-            condition_id TEXT,
-            variant TEXT,
-            asset TEXT,
-            outcome TEXT,
-            signal_type TEXT,
-            requested_shares REAL,
-            filled_shares REAL,
-            avg_price REAL,
-            gross_cost REAL,
-            fee REAL,
-            total_cost REAL,
-            book_age_ms INTEGER,
-            fills_json TEXT
+        CREATE TABLE IF NOT EXISTS signals(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          signal_ms INTEGER,
+          strategy TEXT,
+          condition_id TEXT,
+          kind TEXT,
+          outcome TEXT,
+          asset TEXT,
+          tau_sec REAL,
+          ask_before REAL,
+          market_mid REAL,
+          market_up_mid REAL,
+          model_up_lowbeta REAL,
+          model_up_highbeta REAL,
+          robust_side_prob REAL,
+          net_edge REAL,
+          fee_per_share REAL,
+          btc_open REAL,
+          spot_price REAL,
+          perp_price REAL,
+          effective_price REAL,
+          effective_source TEXT,
+          sigma_fast REAL,
+          sigma_slow REAL,
+          sigma_used REAL,
+          accepted INTEGER,
+          filled INTEGER,
+          reason TEXT
         );
 
-        CREATE TABLE IF NOT EXISTS market_results (
-            condition_id TEXT,
-            variant TEXT,
-            winning_asset TEXT,
-            winning_outcome TEXT,
-            total_cost REAL,
-            payout REAL,
-            pnl REAL,
-            trades INTEGER,
-            up_shares REAL,
-            down_shares REAL,
-            settled_ms INTEGER,
-            PRIMARY KEY(condition_id, variant)
+        CREATE TABLE IF NOT EXISTS trades(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          trade_ms INTEGER,
+          mode TEXT,
+          strategy TEXT,
+          condition_id TEXT,
+          kind TEXT,
+          asset TEXT,
+          outcome TEXT,
+          signal_type TEXT,
+          requested_usd REAL,
+          filled_shares REAL,
+          avg_price REAL,
+          gross_cost REAL,
+          fee REAL,
+          total_cost REAL,
+          cash_before REAL,
+          cash_after REAL,
+          tau_sec REAL,
+          robust_prob REAL,
+          net_edge REAL,
+          effective_price REAL,
+          effective_source TEXT,
+          sigma_used REAL,
+          latency_ms INTEGER,
+          fills_json TEXT
         );
 
-        CREATE TABLE IF NOT EXISTS binance_signal_features (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            signal_ms INTEGER,
-            condition_id TEXT,
-            variant TEXT,
-            asset TEXT,
-            outcome TEXT,
-            signal_type TEXT,
-            ret_3s REAL,
-            ret_10s REAL,
-            ema9 REAL,
-            ema21 REAL,
-            ema_bias REAL,
-            rsi14 REAL,
-            flow_10s REAL,
-            flow_30s REAL,
-            book_imbalance REAL,
-            large_delta_30s REAL,
-            score REAL,
-            mom_pass INTEGER,
-            flow_pass INTEGER,
-            book_pass INTEGER,
-            combo_pass INTEGER,
-            score_pass INTEGER
+        CREATE TABLE IF NOT EXISTS results(
+          condition_id TEXT,
+          strategy TEXT,
+          mode TEXT,
+          kind TEXT,
+          winning_asset TEXT,
+          winning_outcome TEXT,
+          total_cost REAL,
+          payout REAL,
+          pnl REAL,
+          trades INTEGER,
+          settled_ms INTEGER,
+          PRIMARY KEY(condition_id,strategy,mode)
         );
 
-        CREATE TABLE IF NOT EXISTS binance_v2_features (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            signal_ms INTEGER, condition_id TEXT, variant TEXT, asset TEXT, outcome TEXT, signal_type TEXT,
-            poly_ask REAL, btc_price REAL, start_price REAL, distance_from_start_pct REAL,
-            ret_250ms REAL, ret_500ms REAL, ret_1s REAL, ret_3s REAL, ret_10s REAL,
-            flow_1s REAL, flow_3s REAL, flow_10s REAL, flow_30s REAL,
-            book_imbalance REAL, large_delta_10s REAL, large_delta_30s REAL,
-            ema9 REAL, ema21 REAL, ema_bias REAL, rsi14 REAL,
-            path_efficiency REAL, direction_changes INTEGER, realized_move REAL, regime TEXT,
-            confidence REAL, data_age_ms INTEGER
-        );
-        CREATE INDEX IF NOT EXISTS idx_bv2_ms ON binance_v2_features(signal_ms);
-
-        CREATE TABLE IF NOT EXISTS binance_shadow_trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            trade_ms INTEGER,
-            condition_id TEXT,
-            variant TEXT,
-            mode TEXT,
-            asset TEXT,
-            outcome TEXT,
-            signal_type TEXT,
-            filled_shares REAL,
-            avg_price REAL,
-            gross_cost REAL,
-            fee REAL,
-            total_cost REAL,
-            accepted INTEGER,
-            reason TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS binance_shadow_results (
-            condition_id TEXT,
-            variant TEXT,
-            mode TEXT,
-            winning_asset TEXT,
-            winning_outcome TEXT,
-            total_cost REAL,
-            payout REAL,
-            pnl REAL,
-            trades INTEGER,
-            settled_ms INTEGER,
-            PRIMARY KEY(condition_id, variant, mode)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_bsf_ms
-            ON binance_signal_features(signal_ms);
-        CREATE INDEX IF NOT EXISTS idx_bst_ms
-            ON binance_shadow_trades(trade_ms);
-        CREATE INDEX IF NOT EXISTS idx_bst_cond
-            ON binance_shadow_trades(condition_id);
-        CREATE INDEX IF NOT EXISTS idx_bsr_cond
-            ON binance_shadow_results(condition_id);
-
-        CREATE TABLE IF NOT EXISTS state (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_trades_ms ON paper_trades(trade_ms);
-        CREATE INDEX IF NOT EXISTS idx_trades_condition ON paper_trades(condition_id);
         CREATE INDEX IF NOT EXISTS idx_signals_ms ON signals(signal_ms);
-        CREATE INDEX IF NOT EXISTS idx_results_ms ON market_results(settled_ms);
+        CREATE INDEX IF NOT EXISTS idx_signals_strategy ON signals(strategy,signal_ms);
+        CREATE INDEX IF NOT EXISTS idx_trades_ms ON trades(trade_ms);
+        CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy,trade_ms);
+        CREATE INDEX IF NOT EXISTS idx_results_strategy ON results(strategy,settled_ms);
         """)
+        for s in STRATEGIES:
+            name = s["name"]
+            if c.execute("SELECT 1 FROM state WHERE key=?", (cash_key(name),)).fetchone() is None:
+                c.execute("INSERT INTO state(key,value) VALUES(?,?)", (cash_key(name), str(PAPER_START_BALANCE)))
+            if c.execute("SELECT 1 FROM state WHERE key=?", (initial_key(name),)).fetchone() is None:
+                c.execute("INSERT INTO state(key,value) VALUES(?,?)", (initial_key(name), str(PAPER_START_BALANCE)))
+        if c.execute("SELECT 1 FROM state WHERE key='trading_enabled'").fetchone() is None:
+            c.execute("INSERT INTO state(key,value) VALUES('trading_enabled','0')")
+        if c.execute("SELECT 1 FROM state WHERE key='last_report_end'").fetchone() is None:
+            current_hour = (now_ts() // 3600) * 3600
+            c.execute("INSERT INTO state(key,value) VALUES('last_report_end',?)", (str(current_hour),))
+        c.commit()
 
-def state_get(key, default=None):
-    with db() as conn:
-        r = conn.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
-        return r["value"] if r else default
+def state_get(k, d=None):
+    with db() as c:
+        r = c.execute("SELECT value FROM state WHERE key=?", (k,)).fetchone()
+        return r["value"] if r else d
 
-def state_set(key, value):
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO state(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, str(value)),
+def state_set(k, v):
+    with db() as c:
+        c.execute(
+            "INSERT INTO state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (k, str(v)),
         )
-        conn.commit()
+        c.commit()
+
+def paper_cash(strategy):
+    return sf(state_get(cash_key(strategy), PAPER_START_BALANCE))
+
+def paper_initial(strategy):
+    return sf(state_get(initial_key(strategy), PAPER_START_BALANCE))
+
+def set_paper_cash(strategy, value):
+    state_set(cash_key(strategy), value)
+
+def trading_enabled():
+    return state_get("trading_enabled", "0") == "1"
 
 # ============================================================
-# HTTP
+# HTTP / market discovery
 # ============================================================
 
-async def get_json(url, params=None):
-    for attempt in range(3):
+async def get_json(url, params=None, timeout=12):
+    for i in range(3):
         try:
-            async with session.get(
-                url,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                text = await r.text()
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                txt = await r.text()
                 if r.status == 200:
-                    return json.loads(text)
-                log.warning("HTTP %s %s %s -> %s", r.status, url, params, text[:200])
+                    return json.loads(txt)
+                log.warning("HTTP %s %s -> %s", r.status, url, txt[:160])
         except Exception as e:
-            log.warning("GET %s failed: %s", url, e)
-
-        await asyncio.sleep(0.3 * (attempt + 1))
-
+            log.warning("GET failed %s: %s", url, e)
+        await asyncio.sleep(0.3 * (i + 1))
     return None
 
+def slot_start_from_slug(slug):
+    try:
+        return int(str(slug).rstrip("/").split("-")[-1])
+    except Exception:
+        return None
+
+async def fetch_event_by_slug(slug):
+    for url, params in (
+        (f"{GAMMA}/events/slug/{slug}", None),
+        (f"{GAMMA}/events", {"slug": slug}),
+    ):
+        d = await get_json(url, params)
+        if isinstance(d, dict):
+            return d
+        if isinstance(d, list) and d and isinstance(d[0], dict):
+            return d[0]
+    return None
+
+def parse_market(raw, event, kind, duration):
+    if not isinstance(raw, dict):
+        return None
+    cid = str(raw.get("conditionId") or raw.get("condition_id") or "")
+    if not cid:
+        return None
+    title = str(raw.get("question") or raw.get("title") or event.get("title") or "")
+    slug = str(raw.get("slug") or event.get("slug") or "")
+    text = (title + " " + slug).lower()
+    if "bitcoin" not in text and "btc" not in text:
+        return None
+    outcomes = [str(x).strip().upper() for x in parse_jsonish(raw.get("outcomes"))]
+    tokens = [str(x) for x in parse_jsonish(raw.get("clobTokenIds"))]
+    if len(tokens) < 2:
+        return None
+    up = down = None
+    for i, o in enumerate(outcomes):
+        if i >= len(tokens):
+            break
+        if o in {"UP", "YES"}:
+            up = tokens[i]
+        elif o in {"DOWN", "NO"}:
+            down = tokens[i]
+    up = up or tokens[0]
+    down = down or tokens[1]
+    start = slot_start_from_slug(slug)
+    if not start:
+        dt = parse_iso(raw.get("startDate")) or parse_iso(event.get("startDate"))
+        start = int(dt.timestamp()) if dt else None
+    if not start:
+        return None
+    return {
+        "condition_id": cid,
+        "kind": kind,
+        "duration_sec": duration,
+        "question": title,
+        "slug": slug,
+        "start_ts": start,
+        "end_ts": start + duration,
+        "up_asset": up,
+        "down_asset": down,
+        "btc_open": None,
+    }
+
+async def discover_slot(kind, duration, slot):
+    slug = f"btc-updown-{kind}-{slot}"
+    ev = await fetch_event_by_slug(slug)
+    if not ev or not isinstance(ev.get("markets"), list):
+        return None
+    for raw in ev["markets"]:
+        m = parse_market(raw, ev, kind, duration)
+        if m:
+            return m
+    return None
+
+async def fetch_binance_open(start_ts):
+    if start_ts in market_open_cache:
+        return market_open_cache[start_ts]
+    url = f"{BINANCE_DATA_API}/api/v3/klines"
+    d = await get_json(
+        url,
+        {
+            "symbol": BINANCE_SYMBOL,
+            "interval": "1m",
+            "startTime": int(start_ts) * 1000,
+            "limit": 1,
+        },
+    )
+    if isinstance(d, list) and d and isinstance(d[0], list) and len(d[0]) >= 2:
+        px = sf(d[0][1])
+        if px > 0:
+            market_open_cache[start_ts] = px
+            return px
+    # Runtime fallback: closest sampled second within 3 seconds of open.
+    best = None
+    best_dt = None
+    for sec, px in spot_second_prices:
+        dt = abs(sec - int(start_ts))
+        if dt <= 3 and (best_dt is None or dt < best_dt):
+            best, best_dt = px, dt
+    if best:
+        market_open_cache[start_ts] = best
+    return best
+
+def persist_market(m):
+    with db() as c:
+        c.execute(
+            """INSERT INTO markets(condition_id,kind,duration_sec,question,slug,start_ts,end_ts,up_asset,down_asset,btc_open)
+               VALUES(?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(condition_id) DO UPDATE SET
+                 kind=excluded.kind,duration_sec=excluded.duration_sec,question=excluded.question,
+                 slug=excluded.slug,start_ts=excluded.start_ts,end_ts=excluded.end_ts,
+                 up_asset=excluded.up_asset,down_asset=excluded.down_asset,
+                 btc_open=COALESCE(markets.btc_open,excluded.btc_open)""",
+            (
+                m["condition_id"], m["kind"], m["duration_sec"], m["question"], m["slug"],
+                m["start_ts"], m["end_ts"], m["up_asset"], m["down_asset"], m.get("btc_open"),
+            ),
+        )
+        c.commit()
+
+async def subscribe_asset(asset):
+    if asset and asset not in subscribed_assets:
+        subscribed_assets.add(asset)
+        await ws_send_queue.put({"operation": "subscribe", "assets_ids": [asset]})
+
+async def discovery_loop():
+    specs = (("5m", 300), ("15m", 900))
+    while True:
+        try:
+            n = now_ts()
+            for kind, duration in specs:
+                cur = (n // duration) * duration
+                for slot in (cur - duration, cur, cur + duration):
+                    m = await discover_slot(kind, duration, slot)
+                    if not m:
+                        continue
+                    cid = m["condition_id"]
+                    if cid not in markets:
+                        m["btc_open"] = await fetch_binance_open(m["start_ts"])
+                        markets[cid] = m
+                        persist_market(m)
+                        await subscribe_asset(m["up_asset"])
+                        await subscribe_asset(m["down_asset"])
+                        log.info(
+                            "MARKET %-3s %s | open=%s | %s",
+                            kind, m["slug"],
+                            f"{m['btc_open']:.2f}" if m.get("btc_open") else "NONE",
+                            utc_iso(m["start_ts"]),
+                        )
+                    elif not markets[cid].get("btc_open"):
+                        px = await fetch_binance_open(m["start_ts"])
+                        if px:
+                            markets[cid]["btc_open"] = px
+                            persist_market(markets[cid])
+        except Exception:
+            log.exception("Discovery failed")
+        await asyncio.sleep(8)
+
 # ============================================================
-# BOOK
+# Polymarket order book
 # ============================================================
 
 def level_map(rows):
     out = {}
     for x in rows or []:
-        if not isinstance(x, dict):
-            continue
-        p = sf(x.get("price"), math.nan)
-        q = sf(x.get("size"), 0)
-        if not math.isnan(p) and q > 0:
-            out[p] = q
+        if isinstance(x, dict):
+            p = sf(x.get("price"), math.nan)
+            q = sf(x.get("size"), 0)
+            if not math.isnan(p) and q > 0:
+                out[p] = q
     return out
 
 def apply_book(asset, payload, source="ws"):
@@ -545,269 +591,65 @@ def apply_book(asset, payload, source="ws"):
     }
 
 def apply_price_change(payload):
-    changes = payload.get("price_changes") or payload.get("priceChanges") or []
     recv = now_ms()
-
-    for ch in changes:
+    for ch in payload.get("price_changes") or payload.get("priceChanges") or []:
         if not isinstance(ch, dict):
             continue
-        asset = str(
-            ch.get("asset_id")
-            or ch.get("token_id")
-            or ch.get("tokenId")
-            or ""
-        )
+        asset = str(ch.get("asset_id") or ch.get("token_id") or ch.get("tokenId") or "")
         if not asset:
             continue
-
-        b = books.setdefault(asset, {
-            "bids": {},
-            "asks": {},
-            "received_ms": recv,
-            "source": "ws-delta",
-        })
-
+        b = books.setdefault(asset, {"bids": {}, "asks": {}, "received_ms": recv, "source": "delta"})
         p = sf(ch.get("price"), math.nan)
         q = sf(ch.get("size"), 0)
         side = str(ch.get("side", "")).upper()
-
         if math.isnan(p):
             continue
-
         target = b["bids"] if side == "BUY" else b["asks"]
-
         if q <= 0:
             target.pop(p, None)
         else:
             target[p] = q
-
         b["received_ms"] = recv
-        b["source"] = "ws"
 
 def best_ask(asset):
     b = books.get(asset)
-    if not b or not b["asks"]:
-        return None
-    return min(b["asks"])
+    return min(b["asks"]) if b and b["asks"] else None
+
+def best_bid(asset):
+    b = books.get(asset)
+    return max(b["bids"]) if b and b["bids"] else None
+
+def book_mid(asset):
+    bid = best_bid(asset)
+    ask = best_ask(asset)
+    if bid is not None and ask is not None:
+        return (bid + ask) / 2.0
+    if ask is not None:
+        return ask
+    if bid is not None:
+        return bid
+    return None
 
 async def refresh_book(asset):
-    data = await get_json(f"{CLOB_API}/book", params={"token_id": asset})
-    if isinstance(data, dict):
-        apply_book(asset, data, "rest")
+    d = await get_json(f"{HOST}/book", {"token_id": asset})
+    if isinstance(d, dict):
+        apply_book(asset, d, "rest")
         return True
     return False
 
 async def ensure_book(asset):
     b = books.get(asset)
-    if b and b["asks"]:
-        age = now_ms() - b["received_ms"]
-        if age <= MAX_BOOK_AGE_MS:
-            return age
-
+    if b and b["asks"] and now_ms() - b["received_ms"] <= MAX_BOOK_AGE_MS:
+        return now_ms() - b["received_ms"]
     await refresh_book(asset)
     b = books.get(asset)
-    if not b:
-        return None
-
-    return now_ms() - b["received_ms"]
-
-def simulate_buy(asset, wanted):
-    b = books.get(asset)
-    if not b or not b["asks"]:
-        return [], 0.0
-
-    remaining = wanted
-    fills = []
-
-    for p in sorted(b["asks"]):
-        q = b["asks"][p]
-        take = min(q, remaining)
-        if take > 0:
-            fills.append((p, take))
-            remaining -= take
-        if remaining <= 1e-12:
-            break
-
-    return fills, wanted - remaining
-
-
-def slot_start_from_slug(slug):
-    try:
-        return int(str(slug).rstrip("/").split("-")[-1])
-    except Exception:
-        return None
-
-
-async def fetch_event_by_slug(slug):
-    for url, params in (
-        (f"{GAMMA_API}/events/slug/{slug}", None),
-        (f"{GAMMA_API}/events", {"slug": slug}),
-    ):
-        data = await get_json(url, params=params)
-        if isinstance(data, dict):
-            return data
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            return data[0]
-    return None
-
-
-def parse_market_from_event(raw, event):
-    if not isinstance(raw, dict):
-        return None
-    cid = str(raw.get("conditionId") or raw.get("condition_id") or "")
-    if not cid:
-        return None
-    title = str(raw.get("question") or raw.get("title") or event.get("title") or event.get("question") or "Unknown")
-    slug = str(raw.get("slug") or event.get("slug") or "")
-    combined = f"{title} {slug}".lower()
-    if SYMBOL == "BTC" and "bitcoin" not in combined and "btc" not in combined:
-        return None
-    if SYMBOL == "ETH" and "ethereum" not in combined and "eth" not in combined:
-        return None
-    outcomes = [str(x).strip().upper() for x in parse_jsonish(raw.get("outcomes"))]
-    tokens = [str(x) for x in parse_jsonish(raw.get("clobTokenIds"))]
-    if len(tokens) < 2:
-        return None
-    up_asset = None
-    down_asset = None
-    for i, outcome in enumerate(outcomes):
-        if i >= len(tokens):
-            break
-        if outcome in {"UP", "YES"}:
-            up_asset = tokens[i]
-        elif outcome in {"DOWN", "NO"}:
-            down_asset = tokens[i]
-    up_asset = up_asset or tokens[0]
-    down_asset = down_asset or tokens[1]
-    start_ts = slot_start_from_slug(slug)
-    if not start_ts:
-        start_dt = parse_iso(raw.get("startDate")) or parse_iso(event.get("startDate"))
-        start_ts = int(start_dt.timestamp()) if start_dt else None
-    if not start_ts:
-        return None
-    if slot_start_from_slug(slug):
-        end_ts = start_ts + 300
-    else:
-        end_dt = parse_iso(raw.get("endDate")) or parse_iso(event.get("endDate"))
-        end_ts = int(end_dt.timestamp()) if end_dt else start_ts + 300
-    return {
-        "condition_id": cid,
-        "question": title,
-        "slug": slug,
-        "start_ts": int(start_ts),
-        "end_ts": int(end_ts),
-        "up_asset": str(up_asset),
-        "down_asset": str(down_asset),
-        "raw": raw,
-    }
-
-
-async def discover_slot_market(prefix, slot_start):
-    slug = f"{prefix}-{slot_start}"
-    event = await fetch_event_by_slug(slug)
-    if not event:
-        return None
-    raw_markets = event.get("markets")
-    if not isinstance(raw_markets, list):
-        return None
-    for raw in raw_markets:
-        market = parse_market_from_event(raw, event)
-        if market:
-            return market
-    return None
-
-
-# ============================================================
-# MARKET DISCOVERY
-# ============================================================
-
-def persist_market(m):
-    cid = m["condition_id"]
-    with db() as conn:
-        conn.execute("""
-            INSERT INTO discovered_markets(
-                condition_id, question, slug, start_ts, end_ts,
-                up_asset, down_asset, discovered_ms
-            ) VALUES (?,?,?,?,?,?,?,?)
-            ON CONFLICT(condition_id) DO UPDATE SET
-                question=excluded.question,
-                slug=excluded.slug,
-                start_ts=excluded.start_ts,
-                end_ts=excluded.end_ts,
-                up_asset=excluded.up_asset,
-                down_asset=excluded.down_asset
-        """, (
-            cid,
-            m["question"],
-            m["slug"],
-            m["start_ts"],
-            m["end_ts"],
-            m["up_asset"],
-            m["down_asset"],
-            now_ms(),
-        ))
-        conn.commit()
-
-async def subscribe_asset(asset):
-    if not asset or asset in subscribed_assets:
-        return
-
-    subscribed_assets.add(asset)
-    await ws_send_queue.put({
-        "operation": "subscribe",
-        "assets_ids": [asset],
-    })
-
-async def discovery_loop():
-    prefix = "btc-updown-5m" if SYMBOL == "BTC" else "eth-updown-5m"
-    last_current_slot = None
-    while True:
-        try:
-            now = now_ts()
-            current = (now // 300) * 300
-            candidates = []
-            for slot_start in (current, current + 300, current - 300):
-                market = await discover_slot_market(prefix, slot_start)
-                if market:
-                    candidates.append(market)
-            if candidates:
-                active = [m for m in candidates if m["start_ts"] - 5 <= now <= m["end_ts"] + 5]
-                chosen = min(active or candidates, key=lambda m: abs(now - m["start_ts"]))
-                for market in candidates:
-                    cid = market["condition_id"]
-                    if cid in markets:
-                        continue
-                    markets[cid] = market
-                    persist_market(market)
-                    await subscribe_asset(market["up_asset"])
-                    await subscribe_asset(market["down_asset"])
-                    log.info(
-                        "MARKET %s | slug=%s | start=%s | end=%s",
-                        market["question"],
-                        market["slug"],
-                        utc_iso(market["start_ts"]),
-                        utc_iso(market["end_ts"]),
-                    )
-                if current != last_current_slot:
-                    log.info("CURRENT SLOT %s | selected=%s", utc_iso(current), chosen["slug"])
-                    last_current_slot = current
-            else:
-                log.info("Discovery: slug market not found for slot %s; retrying", utc_iso(current))
-        except Exception:
-            log.exception("Discovery loop failed")
-        await asyncio.sleep(DISCOVERY_INTERVAL)
-
-# ============================================================
-# WEBSOCKET
-# ============================================================
+    return now_ms() - b["received_ms"] if b else None
 
 def parse_ws(raw):
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", "ignore")
-
     if raw in ("", "PING", "PONG"):
         return []
-
     try:
         x = json.loads(raw)
         return x if isinstance(x, list) else [x]
@@ -831,1150 +673,993 @@ async def ws_ping(ws):
             return
         await asyncio.sleep(10)
 
-async def ws_loop():
+async def poly_ws_loop():
     while True:
         try:
             if not subscribed_assets:
                 await asyncio.sleep(1)
                 continue
-
-            async with websockets.connect(
-                MARKET_WS,
-                ping_interval=None,
-                close_timeout=5,
-                max_size=20_000_000,
-            ) as ws:
-
-                await ws.send(jd({
-                    "assets_ids": list(subscribed_assets),
-                    "type": "market",
-                    "custom_feature_enabled": True,
-                }))
-
-                log.info("WS connected | assets=%d", len(subscribed_assets))
-
+            async with websockets.connect(POLY_WS, ping_interval=None, close_timeout=5, max_size=20_000_000) as ws:
+                await ws.send(jd({"assets_ids": list(subscribed_assets), "type": "market", "custom_feature_enabled": True}))
+                log.info("POLY WS connected | assets=%d", len(subscribed_assets))
                 sender = asyncio.create_task(ws_sender(ws))
                 ping = asyncio.create_task(ws_ping(ws))
-
                 try:
                     async for raw in ws:
                         for ev in parse_ws(raw):
                             if not isinstance(ev, dict):
                                 continue
-
                             et = str(ev.get("event_type") or ev.get("type") or "")
-                            payload = (
-                                ev.get("payload")
-                                if isinstance(ev.get("payload"), dict)
-                                else ev
-                            )
-
+                            p = ev.get("payload") if isinstance(ev.get("payload"), dict) else ev
                             if et == "book":
-                                asset = str(
-                                    payload.get("asset_id")
-                                    or payload.get("token_id")
-                                    or ""
-                                )
-                                if asset:
-                                    apply_book(asset, payload)
-
+                                a = str(p.get("asset_id") or p.get("token_id") or "")
+                                if a:
+                                    apply_book(a, p)
                             elif et == "price_change":
-                                apply_price_change(payload)
-
+                                apply_price_change(p)
                             elif et == "market_resolved":
-                                await settle_from_resolution(payload)
-
+                                await settle_from_ws(p)
                 finally:
                     sender.cancel()
                     ping.cancel()
-
         except Exception as e:
-            log.warning("WS reconnect: %s", e)
+            log.warning("POLY WS reconnect: %s", e)
             await asyncio.sleep(1)
 
-
 # ============================================================
-# BINANCE FUTURES RESEARCH ENGINE V2
+# Binance spot + perpetual fair-value state
 # ============================================================
 
-def _ema(values, period):
-    if not values:
-        return None
-    alpha = 2.0 / (period + 1.0)
-    e = float(values[0])
-    for v in values[1:]:
-        e = alpha * float(v) + (1.0 - alpha) * e
-    return e
+def _mid(bid, ask, last=None):
+    if bid and ask and bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    return last if last and last > 0 else None
 
-def _rsi(values, period=14):
-    if len(values) < period + 1:
-        return None
-    gains, losses = [], []
-    for i in range(-period, 0):
-        d = float(values[i]) - float(values[i - 1])
-        gains.append(max(d, 0.0)); losses.append(max(-d, 0.0))
-    ag = sum(gains) / period; al = sum(losses) / period
-    if al <= 1e-12:
-        return 100.0
-    rs = ag / al
-    return 100.0 - 100.0 / (1.0 + rs)
+def current_spot_mid():
+    return _mid(spot_bid, spot_ask, spot_last)
 
-def _latest_btc_price():
-    if binance_tick_prices:
-        return float(binance_tick_prices[-1][1])
-    if binance_second_prices:
-        return float(binance_second_prices[-1][1])
-    return None
+def current_perp_mid():
+    return _mid(perp_bid, perp_ask, perp_last)
 
-def _price_ms_ago(ms_ago):
-    if not binance_tick_prices:
-        return None
-    target = now_ms() - int(ms_ago)
-    for ts, px in reversed(binance_tick_prices):
-        if ts <= target:
-            return float(px)
-    return None
+def current_basis():
+    cutoff = now_ms() - BASIS_WINDOW_SEC * 1000
+    vals = [v for ts, v in basis_samples if ts >= cutoff]
+    if not vals:
+        return 0.0
+    vals.sort()
+    n = len(vals)
+    return vals[n // 2] if n % 2 else 0.5 * (vals[n // 2 - 1] + vals[n // 2])
 
-def _ret_ms(ms_ago):
-    last = _latest_btc_price(); prev = _price_ms_ago(ms_ago)
-    return (last / prev - 1.0) if last and prev else 0.0
+def effective_btc_price():
+    sm = current_spot_mid()
+    pm = current_perp_mid()
+    now = now_ms()
+    sage = now - spot_last_ms if spot_last_ms else 999999
+    page = now - perp_last_ms if perp_last_ms else 999999
+    basis = current_basis()
 
-def _signed_flow(window_sec):
-    cutoff = now_ms() - int(window_sec * 1000)
-    buy = sell = 0.0
-    for ts, price, quote, sign in reversed(binance_trades):
-        if ts < cutoff: break
-        if sign > 0: buy += quote
-        else: sell += quote
-    total = buy + sell
-    return (buy - sell) / total if total > 1e-9 else 0.0
+    # Use the perpetual as a faster estimator only when it is fresher.
+    if pm and page <= MAX_FEED_AGE_MS and (not sm or page + 20 < sage):
+        return pm - basis, "perp_led", sm, pm, sage, page
+    if sm and sage <= MAX_FEED_AGE_MS:
+        return sm, "spot", sm, pm, sage, page
+    if pm and page <= MAX_FEED_AGE_MS:
+        return pm - basis, "perp_fallback", sm, pm, sage, page
+    return None, "stale", sm, pm, sage, page
 
-def _large_delta(window_sec):
-    cutoff = now_ms() - int(window_sec * 1000)
-    buy = sell = 0.0
-    for ts, price, quote, sign in reversed(binance_trades):
-        if ts < cutoff: break
-        if quote < BINANCE_LARGE_TRADE_USD: continue
-        if sign > 0: buy += quote
-        else: sell += quote
-    total = buy + sell
-    return (buy - sell) / total if total > 1e-9 else 0.0
-
-def _book_imbalance():
-    bid = sum(sf(x[1]) for x in binance_depth_bids[:10])
-    ask = sum(sf(x[1]) for x in binance_depth_asks[:10])
-    total = bid + ask
-    return (bid - ask) / total if total > 1e-9 else 0.0
-
-def _regime_features(window_sec=30):
-    cutoff = now_ms() - int(window_sec * 1000)
-    pts = [(ts, float(px)) for ts, px in binance_tick_prices if ts >= cutoff]
-    if len(pts) < 4:
-        return {'path_efficiency':0.0,'direction_changes':0,'realized_move':0.0,'regime':'UNKNOWN'}
-    prices = [p for _, p in pts]
-    net = prices[-1] - prices[0]
-    path = sum(abs(prices[i] - prices[i-1]) for i in range(1, len(prices)))
-    eff = abs(net) / path if path > 1e-12 else 0.0
-    signs=[]
-    for i in range(1, len(prices)):
-        d=prices[i]-prices[i-1]
-        if abs(d)>1e-12: signs.append(1 if d>0 else -1)
-    changes=sum(1 for i in range(1,len(signs)) if signs[i]!=signs[i-1])
-    move=prices[-1]/prices[0]-1.0 if prices[0] else 0.0
-    regime='TREND' if eff>=0.55 and abs(move)>=0.0005 else ('CHOP' if eff<=0.25 and changes>=6 else 'MIXED')
-    return {'path_efficiency':eff,'direction_changes':changes,'realized_move':move,'regime':regime}
-
-def _ensure_start_price(condition, market):
-    if condition in market_binance_start_price:
-        return market_binance_start_price[condition]
-    target = int(market['start_ts'] * 1000)
-    best = None; best_dt = None
-    for ts, px in binance_tick_prices:
-        dt = abs(ts - target)
-        if dt <= START_PRICE_CAPTURE_WINDOW_SEC * 1000 and (best_dt is None or dt < best_dt):
-            best = float(px); best_dt = dt
-    if best is None:
-        best = _latest_btc_price()
-    if best is not None:
-        market_binance_start_price[condition] = best
-    return best
-
-def _confidence_from_features(outcome, poly_ask, f):
-    direction = 1.0 if str(outcome).lower() == 'up' else -1.0
-    impulse_raw = 0.35*(f['ret_250ms']/0.00020)+0.30*(f['ret_500ms']/0.00030)+0.20*(f['ret_1s']/0.00045)+0.15*(f['ret_3s']/0.00080)
-    impulse=max(-1.0,min(1.0,direction*impulse_raw))
-    flow=max(-1.0,min(1.0,direction*(0.45*f['flow_1s']+0.30*f['flow_3s']+0.25*f['flow_10s'])))
-    book=max(-1.0,min(1.0,direction*f['book_imbalance']))
-    large=max(-1.0,min(1.0,direction*(0.65*f['large_delta_10s']+0.35*f['large_delta_30s'])))
-    trend=1.0 if direction*f['ema_bias']>0 else -1.0
-    if f['regime']=='CHOP': trend*=0.20
-    elif f['regime']=='MIXED': trend*=0.55
-    dist=max(-1.0,min(1.0,direction*(f['distance_from_start_pct']/0.0015)))
-    poly_component=0.0 if poly_ask is None else max(-1.0,min(1.0,(0.72-float(poly_ask))/0.22))
-    weighted=W_IMPULSE*impulse+W_FLOW*flow+W_BOOK*book+W_LARGE*large+W_TREND*trend+W_DISTANCE*dist+W_POLY_PRICE*poly_component
-    return max(0.0,min(100.0,50.0+weighted/2.0))
-
-def binance_v2_snapshot(condition, market, outcome, poly_ask):
-    btc=_latest_btc_price(); start_price=_ensure_start_price(condition,market)
-    dist=(btc/start_price-1.0) if btc and start_price else 0.0
-    prices=[float(p) for _,p in binance_second_prices]
-    ema9=_ema(prices[-60:],9) if prices else None; ema21=_ema(prices[-90:],21) if prices else None
-    ema_bias=(ema9/ema21-1.0) if ema9 and ema21 else 0.0; rsi14=_rsi(prices,14) if prices else None
-    regime=_regime_features(REGIME_WINDOW_SEC)
-    f={'btc_price':btc,'start_price':start_price,'distance_from_start_pct':dist,'ret_250ms':_ret_ms(250),'ret_500ms':_ret_ms(500),'ret_1s':_ret_ms(1000),'ret_3s':_ret_ms(3000),'ret_10s':_ret_ms(10000),'flow_1s':_signed_flow(1),'flow_3s':_signed_flow(3),'flow_10s':_signed_flow(10),'flow_30s':_signed_flow(30),'book_imbalance':_book_imbalance(),'large_delta_10s':_large_delta(10),'large_delta_30s':_large_delta(30),'ema9':ema9,'ema21':ema21,'ema_bias':ema_bias,'rsi14':rsi14,**regime,'data_age_ms':max(0,now_ms()-binance_last_event_ms) if binance_last_event_ms else 999999}
-    f['confidence']=_confidence_from_features(outcome,poly_ask,f)
-    return f
-
-def shadow_mode_pass(mode, f):
-    threshold={'CONF55':55.0,'CONF60':60.0,'CONF65':65.0,'CONF70':70.0,'CONF75':75.0}.get(mode,101.0)
-    return f['data_age_ms'] <= BINANCE_SIGNAL_MAX_AGE_MS and f['confidence'] >= threshold
-
-def store_binance_v2_features(condition, variant, asset, outcome, signal_type, poly_ask, f, signal_ms):
-    with db() as conn:
-        conn.execute('''
-            INSERT INTO binance_v2_features(
-                signal_ms,condition_id,variant,asset,outcome,signal_type,poly_ask,btc_price,start_price,distance_from_start_pct,
-                ret_250ms,ret_500ms,ret_1s,ret_3s,ret_10s,flow_1s,flow_3s,flow_10s,flow_30s,book_imbalance,
-                large_delta_10s,large_delta_30s,ema9,ema21,ema_bias,rsi14,path_efficiency,direction_changes,realized_move,regime,confidence,data_age_ms
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        ''', (signal_ms,condition,variant['name'],asset,outcome,signal_type,poly_ask,f['btc_price'],f['start_price'],f['distance_from_start_pct'],f['ret_250ms'],f['ret_500ms'],f['ret_1s'],f['ret_3s'],f['ret_10s'],f['flow_1s'],f['flow_3s'],f['flow_10s'],f['flow_30s'],f['book_imbalance'],f['large_delta_10s'],f['large_delta_30s'],f['ema9'],f['ema21'],f['ema_bias'],f['rsi14'],f['path_efficiency'],f['direction_changes'],f['realized_move'],f['regime'],f['confidence'],f['data_age_ms']))
-        conn.commit()
-
-def record_shadow_trade(condition, variant, mode, asset, outcome, signal_type, filled, avg, gross, fee, total, accepted, reason, trade_ms):
-    with db() as conn:
-        conn.execute('''INSERT INTO binance_shadow_trades(trade_ms,condition_id,variant,mode,asset,outcome,signal_type,filled_shares,avg_price,gross_cost,fee,total_cost,accepted,reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (trade_ms,condition,variant['name'],mode,asset,outcome,signal_type,filled if accepted else 0.0,avg if accepted else None,gross if accepted else 0.0,fee if accepted else 0.0,total if accepted else 0.0,int(bool(accepted)),reason))
-        conn.commit()
-
-def process_binance_shadow_filters(condition, variant, asset, outcome, signal_type, filled, avg, gross, fee, total, signal_ms):
-    market=markets.get(condition)
-    if not market: return
-    poly_ask=best_ask(asset)
-    f=binance_v2_snapshot(condition,market,outcome,poly_ask)
-    store_binance_v2_features(condition,variant,asset,outcome,signal_type,poly_ask,f,signal_ms)
-    for mode in BINANCE_FILTER_MODES:
-        key=(condition,variant['name'],mode); sides=shadow_accepted_sides[key]
-        ok=shadow_mode_pass(mode,f); accepted=False
-        if signal_type in {'ENTRY','SWITCH'}:
-            if ok: accepted=True; sides.add(asset)
-        elif signal_type=='PYRAMID':
-            accepted=(asset in sides and ok)
-        reason=(f"conf={f['confidence']:.1f}" if accepted else ("no_shadow_position" if signal_type=='PYRAMID' and asset not in sides else f"blocked_conf={f['confidence']:.1f}"))
-        record_shadow_trade(condition,variant,mode,asset,outcome,signal_type,filled,avg,gross,fee,total,accepted,reason,signal_ms)
-
-async def binance_ws_loop():
-    global binance_depth_bids, binance_depth_asks, binance_last_event_ms
+async def binance_spot_ws_loop():
+    global spot_bid, spot_ask, spot_last, spot_last_ms
     while True:
         try:
-            async with websockets.connect(BINANCE_WS,ping_interval=20,ping_timeout=20,close_timeout=5,max_size=10_000_000) as ws:
-                log.info('BINANCE V2 WS connected | %s', BINANCE_SYMBOL.upper())
+            async with websockets.connect(
+                BINANCE_SPOT_WS, ping_interval=20, ping_timeout=20, close_timeout=5, max_size=10_000_000
+            ) as ws:
+                log.info("BINANCE SPOT WS connected")
                 async for raw in ws:
-                    data=json.loads(raw); payload=data.get('data',data); stream=str(data.get('stream',''))
-                    binance_last_event_ms=now_ms()
-                    if 'aggtrade' in stream.lower() or payload.get('e')=='aggTrade':
-                        ts=si(payload.get('T') or payload.get('E') or now_ms()); price=sf(payload.get('p')); qty=sf(payload.get('q')); quote=price*qty
-                        sign=-1 if bool(payload.get('m')) else 1
-                        binance_trades.append((ts,price,quote,sign)); binance_tick_prices.append((ts,price)); sec=ts//1000
-                        if binance_second_prices and binance_second_prices[-1][0]==sec: binance_second_prices[-1]=(sec,price)
-                        else: binance_second_prices.append((sec,price))
-                    elif 'depth' in stream.lower():
-                        binance_depth_bids=payload.get('b') or payload.get('bids') or []
-                        binance_depth_asks=payload.get('a') or payload.get('asks') or []
+                    recv = now_ms()
+                    d = json.loads(raw)
+                    p = d.get("data", d)
+                    stream = str(d.get("stream", "")).lower()
+                    if "bookticker" in stream or ("b" in p and "a" in p and "q" not in p):
+                        b = sf(p.get("b"))
+                        a = sf(p.get("a"))
+                        if b > 0 and a > 0:
+                            spot_bid, spot_ask, spot_last_ms = b, a, recv
+                    elif "aggtrade" in stream or p.get("e") == "aggTrade":
+                        px = sf(p.get("p"))
+                        if px > 0:
+                            spot_last, spot_last_ms = px, recv
         except Exception as e:
-            log.warning('BINANCE V2 WS reconnect: %s', e)
+            log.warning("BINANCE SPOT reconnect: %s", e)
             await asyncio.sleep(1)
 
-# ============================================================
-# STRATEGY ENGINE
-# ============================================================
-
-def get_variant_state(condition, variant):
-    key = (condition, variant["name"])
-
-    if key not in strategy_state:
-        strategy_state[key] = {
-            "buys": defaultdict(int),
-            "last_buy": {},
-            "started_sides": set(),
-            "last_signal_ms": 0,
-        }
-
-    return strategy_state[key]
-
-def momentum_for(condition, asset, lookback):
-    h = price_history[condition][asset]
-
-    if len(h) <= lookback:
-        return None, None
-
-    current = h[-1][1]
-    ref = h[-1 - lookback][1]
-
-    return current - ref, ref
-
-def store_signal(condition, variant, asset, outcome, ask, ref, mom, signal_type, elapsed):
-    with db() as conn:
-        conn.execute("""
-            INSERT INTO signals(
-                signal_ms, condition_id, variant, asset, outcome,
-                ask, reference_ask, momentum, signal_type, elapsed_sec
-            ) VALUES (?,?,?,?,?,?,?,?,?,?)
-        """, (
-            now_ms(), condition, variant["name"], asset, outcome,
-            ask, ref, mom, signal_type, elapsed,
-        ))
-        conn.commit()
-
-async def execute_paper(condition, variant, asset, outcome, signal_type):
-    age = await ensure_book(asset)
-    fills, filled = simulate_buy(asset, ORDER_SIZE)
-
-    if filled <= 0:
-        return False
-
-    gross = sum(p * q for p, q in fills)
-    fee = sum(fee_usdc(q, p) for p, q in fills)
-    avg = gross / filled
-    total = gross + fee
-
-    with db() as conn:
-        conn.execute("""
-            INSERT INTO paper_trades(
-                trade_ms, condition_id, variant, asset, outcome,
-                signal_type, requested_shares, filled_shares,
-                avg_price, gross_cost, fee, total_cost,
-                book_age_ms, fills_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            now_ms(), condition, variant["name"], asset, outcome,
-            signal_type, ORDER_SIZE, filled,
-            avg, gross, fee, total,
-            age,
-            jd([{"price": p, "shares": q} for p, q in fills]),
-        ))
-        conn.commit()
-
-    st = get_variant_state(condition, variant)
-    st["buys"][asset] += 1
-    st["last_buy"][asset] = avg
-    st["started_sides"].add(asset)
-
-    log.info(
-        "%s %s %s %s %.1fsh @ %.4f fee=%.4f",
-        variant["name"],
-        signal_type,
-        outcome,
-        condition[-6:],
-        filled,
-        avg,
-        fee,
-    )
-
-    # Binance experiment is a SHADOW layer only.
-    # Original 12 strategies and their strategy_state remain untouched.
-    process_binance_shadow_filters(
-        condition, variant, asset, outcome, signal_type,
-        filled, avg, gross, fee, total, now_ms()
-    )
-
-    return True
-
-async def evaluate_variant(market, variant, elapsed):
-    cid = market["condition_id"]
-
-    sides = [
-        (market["up_asset"], "Up"),
-        (market["down_asset"], "Down"),
-    ]
-
-    st = get_variant_state(cid, variant)
-
-    candidates = []
-    # Для V3 после заданной секунды рынка новые покупки не создаём.
-    entry_cutoff_sec = variant.get("entry_cutoff_sec")
-    if entry_cutoff_sec is not None and elapsed > float(entry_cutoff_sec):
-        return
-
-
-    # Optional v2 controls. Existing 8 variants keep their old behaviour.
-    allow_switch = bool(variant.get("allow_switch", True))
-    entry_price_min = variant.get("entry_price_min")
-    entry_price_max = variant.get("entry_price_max")
-    momentum_cap = variant.get("momentum_cap")
-
-    # For locked-direction variants, remember which asset became PRIMARY.
-    primary_asset = st.get("primary_asset")
-
-    for asset, outcome in sides:
-        ask = best_ask(asset)
-
-        if ask is None or ask < MIN_PRICE or ask > MAX_PRICE:
-            continue
-
-        mom, ref = momentum_for(cid, asset, variant["lookback"])
-        if mom is None:
-            continue
-
-        buys = st["buys"][asset]
-        signal = None
-
-        if buys == 0:
-            if not st["started_sides"]:
-                # FIRST ENTRY.
-                # M03_V2_LOCK applies a prospective price band and momentum cap.
-                if entry_price_min is not None and ask < float(entry_price_min):
-                    continue
-                if entry_price_max is not None and ask > float(entry_price_max):
-                    continue
-                if momentum_cap is not None and mom > float(momentum_cap):
-                    continue
-
-                if mom >= variant["entry_move"]:
-                    signal = "ENTRY"
-
-            else:
-                # Opposite-side entry = SWITCH for the old variants.
-                # Locked-direction v2 never buys the opposite outcome.
-                if not allow_switch:
-                    continue
-
-                switch_price_max = variant.get("switch_price_max")
-                if switch_price_max is not None and ask > float(switch_price_max):
-                    continue
-
-                # M03 V5: dynamic SWITCH filter derived from the 120-market sample.
-                # Keep this rule fixed while collecting fresh out-of-sample data.
-                if variant.get("dynamic_switch_v5"):
-                    if elapsed <= 60.0 and ask > 0.45:
-                        continue
-                    if elapsed > 60.0:
-                        if 0.45 < ask <= 0.50 and mom >= 0.10:
-                            continue
-                        if 0.50 < ask <= 0.70:
-                            continue
-
-                if mom >= variant["switch_move"]:
-                    signal = "SWITCH"
-
-        else:
-            # Locked variant can pyramid only the original PRIMARY side.
-            if not allow_switch and primary_asset is not None and asset != primary_asset:
-                continue
-
-            # If current momentum becomes extreme, M03 v2 stops adding risk.
-            if momentum_cap is not None and mom > float(momentum_cap):
-                continue
-
-            last_buy = st["last_buy"].get(asset)
-
-            if (
-                last_buy is not None
-                and ask >= last_buy + variant["pyramid_step"]
-                and mom > 0
-                and buys < variant["max_buys_side"]
-            ):
-                signal = "PYRAMID"
-
-        if signal:
-            candidates.append((mom, asset, outcome, ask, ref, signal))
-
-    # One decision / one order per variant per 3-second tick.
-    if not candidates:
-        return
-
-    candidates.sort(reverse=True, key=lambda x: x[0])
-    mom, asset, outcome, ask, ref, signal = candidates[0]
-
-    store_signal(
-        cid, variant, asset, outcome, ask, ref, mom, signal, elapsed
-    )
-
-    filled = await execute_paper(cid, variant, asset, outcome, signal)
-
-    # Lock the very first successfully executed direction for v2.
-    if filled and not allow_switch and signal == "ENTRY":
-        st["primary_asset"] = asset
-
-async def strategy_loop():
-    # Align decisions roughly to 3-second cadence rather than drift.
+async def binance_perp_ws_loop():
+    global perp_bid, perp_ask, perp_last, perp_last_ms
     while True:
-        started = time.monotonic()
-        now = time.time()
-
         try:
-            for cid, market in list(markets.items()):
-                elapsed = now - market["start_ts"]
+            async with websockets.connect(
+                BINANCE_PERP_WS, ping_interval=20, ping_timeout=20, close_timeout=5, max_size=10_000_000
+            ) as ws:
+                log.info("BINANCE PERP WS connected")
+                async for raw in ws:
+                    recv = now_ms()
+                    d = json.loads(raw)
+                    p = d.get("data", d)
+                    stream = str(d.get("stream", "")).lower()
+                    if "bookticker" in stream or ("b" in p and "a" in p and "q" not in p):
+                        b = sf(p.get("b"))
+                        a = sf(p.get("a"))
+                        if b > 0 and a > 0:
+                            perp_bid, perp_ask, perp_last_ms = b, a, recv
+                    elif "aggtrade" in stream or p.get("e") == "aggTrade":
+                        px = sf(p.get("p"))
+                        if px > 0:
+                            perp_last, perp_last_ms = px, recv
+        except Exception as e:
+            log.warning("BINANCE PERP reconnect: %s", e)
+            await asyncio.sleep(1)
 
-                # Record prices from shortly before open through resolution.
-                if -30 <= elapsed <= 310:
-                    for asset in (market["up_asset"], market["down_asset"]):
-                        ask = best_ask(asset)
-                        if ask is not None:
-                            price_history[cid][asset].append((now_ms(), ask))
-
-                if elapsed < 0 or elapsed > TRADE_WINDOW_SECONDS:
-                    continue
-
-                # Need both books to compare / switch reliably.
-                if best_ask(market["up_asset"]) is None:
-                    continue
-                if best_ask(market["down_asset"]) is None:
-                    continue
-
-                for variant in VARIANTS:
-                    await evaluate_variant(market, variant, elapsed)
-
-        except Exception:
-            log.exception("Strategy loop failed")
-
-        spent = time.monotonic() - started
-        await asyncio.sleep(max(0.05, DECISION_INTERVAL - spent))
-
-# ============================================================
-# RESOLUTION
-# ============================================================
-
-async def settle_from_resolution(ev):
-    cid = str(ev.get("market") or ev.get("condition_id") or "")
-    winning_asset = str(ev.get("winning_asset_id") or ev.get("winning_asset") or "")
-    winning_outcome = str(ev.get("winning_outcome") or "")
-
-    if not cid or not winning_asset:
+async def bootstrap_binance_history():
+    # 1-second spot closes give the dual-horizon vol estimator an immediate warmup.
+    url = f"{BINANCE_DATA_API}/api/v3/klines"
+    d = await get_json(url, {"symbol": BINANCE_SYMBOL, "interval": "1s", "limit": 1000})
+    if not isinstance(d, list):
+        log.warning("BINANCE history bootstrap unavailable; live sampler will warm up")
         return
+    for row in d:
+        if isinstance(row, list) and len(row) >= 5:
+            sec = si(row[0]) // 1000
+            px = sf(row[4])
+            if sec > 0 and px > 0:
+                if spot_second_prices and spot_second_prices[-1][0] == sec:
+                    spot_second_prices[-1] = (sec, px)
+                else:
+                    spot_second_prices.append((sec, px))
+    log.info("BINANCE history bootstrap | seconds=%d", len(spot_second_prices))
 
-    await settle_market(cid, winning_asset, winning_outcome)
+async def binance_sampler_loop():
+    while True:
+        try:
+            sec = now_ts()
+            sm = current_spot_mid()
+            pm = current_perp_mid()
+            px = sm or pm
+            if px:
+                if spot_second_prices and spot_second_prices[-1][0] == sec:
+                    spot_second_prices[-1] = (sec, px)
+                else:
+                    spot_second_prices.append((sec, px))
+            if sm and pm and now_ms() - spot_last_ms <= 2000 and now_ms() - perp_last_ms <= 2000:
+                basis_samples.append((now_ms(), pm - sm))
+        except Exception:
+            log.exception("Binance sampler failed")
+        await asyncio.sleep(1.0)
 
-async def settle_market(cid, winning_asset, winning_outcome):
-    market = markets.get(cid)
+def _returns_for_window(window_sec):
+    cutoff = now_ts() - int(window_sec)
+    pts = [(s, p) for s, p in spot_second_prices if s >= cutoff and p > 0]
+    if len(pts) < 3:
+        return []
+    rets = []
+    for i in range(1, len(pts)):
+        p0, p1 = pts[i - 1][1], pts[i][1]
+        if p0 > 0 and p1 > 0:
+            rets.append(math.log(p1 / p0))
+    return rets
 
-    if not market:
-        with db() as conn:
-            row = conn.execute(
-                "SELECT * FROM discovered_markets WHERE condition_id=?",
-                (cid,),
+def ewma_std(values, half_life_samples):
+    if len(values) < 2:
+        return 0.0
+    lam = math.exp(math.log(0.5) / max(1.0, float(half_life_samples)))
+    mean = 0.0
+    var = 0.0
+    wsum = 0.0
+    w = 1.0
+    for x in reversed(values):
+        wsum += w
+        mean += w * x
+        w *= lam
+    if wsum <= 0:
+        return 0.0
+    mean /= wsum
+    w = 1.0
+    wsum2 = 0.0
+    for x in reversed(values):
+        var += w * (x - mean) ** 2
+        wsum2 += w
+        w *= lam
+    return math.sqrt(max(0.0, var / max(wsum2, 1e-12)))
+
+def vol_snapshot():
+    fast_r = _returns_for_window(VOL_FAST_WINDOW_SEC)
+    slow_r = _returns_for_window(VOL_SLOW_WINDOW_SEC)
+    fast = ewma_std(fast_r, VOL_FAST_HALFLIFE_SEC)
+    slow = ewma_std(slow_r, VOL_SLOW_HALFLIFE_SEC)
+    used = max(fast, slow, MIN_VOL_PER_SQRT_SEC)
+    ready = len(fast_r) >= 30 and len(slow_r) >= 60
+    return fast, slow, used, ready
+
+def mixture_prob(z):
+    # Two-regime Gaussian mixture. Wider tail component prevents extreme overconfidence.
+    core = normal_cdf(z)
+    tail = normal_cdf(z / max(TAIL_SCALE, 1.0001))
+    return (1.0 - TAIL_WEIGHT) * core + TAIL_WEIGHT * tail
+
+def fair_up_bounds(effective_price, open_price, sigma, tau_sec, market_up_mid):
+    if not effective_price or not open_price or effective_price <= 0 or open_price <= 0:
+        return None
+    tau = max(float(tau_sec), 0.25)
+    denom = max(float(sigma) * math.sqrt(tau), 1e-12)
+    d = math.log(float(effective_price) / float(open_price)) / denom
+    weight = LATE_MODEL_WEIGHT
+    out = []
+    for beta in ROBUST_BETAS:
+        model = mixture_prob(float(beta) * d)
+        blended = weight * model + (1.0 - weight) * float(market_up_mid)
+        out.append(max(0.0001, min(0.9999, blended)))
+    return out
+
+# ============================================================
+# Strategy / paper FAK execution
+# ============================================================
+
+def market_spent(strategy_name, cid):
+    key = (strategy_name, cid)
+    if key not in spent_cache:
+        with db() as c:
+            row = c.execute(
+                "SELECT COALESCE(SUM(total_cost),0) x FROM trades WHERE mode='PAPER' AND strategy=? AND condition_id=?",
+                (strategy_name, cid),
             ).fetchone()
-            if not row:
-                return
-            market = dict(row)
+        spent_cache[key] = sf(row["x"] if row else 0)
+    return spent_cache[key]
 
-    with db() as conn:
-        already = conn.execute(
-            "SELECT COUNT(*) c FROM market_results WHERE condition_id=?",
-            (cid,),
-        ).fetchone()["c"]
+def add_market_spent(strategy_name, cid, amount):
+    key = (strategy_name, cid)
+    spent_cache[key] = market_spent(strategy_name, cid) + float(amount)
 
-        if already >= len(VARIANTS):
+def simulate_buy_budget(asset, target_total, max_price):
+    b = books.get(asset)
+    if not b or not b.get("asks"):
+        return [], 0.0, 0.0
+    budget = max(0.0, float(target_total))
+    fills = []
+    total = 0.0
+    shares = 0.0
+    for p in sorted(b["asks"]):
+        if p > max_price + 1e-12:
+            break
+        q = b["asks"][p]
+        per = p + fee_per_share(p)
+        if per <= 0:
+            continue
+        take = min(q, max(0.0, (budget - total) / per))
+        if take <= 1e-9:
+            break
+        fills.append((p, take))
+        total += p * take + fee_usdc(take, p)
+        shares += take
+        if total >= budget - 1e-8:
+            break
+    return fills, shares, total
+
+def favorite_side(m):
+    up_mid = book_mid(m["up_asset"])
+    dn_mid = book_mid(m["down_asset"])
+    if up_mid is None or dn_mid is None:
+        return None
+    if up_mid >= dn_mid:
+        return m["up_asset"], "Up", up_mid, up_mid
+    return m["down_asset"], "Down", dn_mid, up_mid
+
+def store_signal(s, m, outcome, asset, tau, ask, market_mid, up_mid, bounds, robust_prob,
+                 edge, fee_ps, open_px, spot_px, perp_px, eff_px, eff_source,
+                 vf, vs, vu, accepted, filled, reason):
+    low = bounds[0] if bounds else None
+    high = bounds[1] if bounds and len(bounds) > 1 else low
+    with db() as c:
+        c.execute(
+            """INSERT INTO signals(
+              signal_ms,strategy,condition_id,kind,outcome,asset,tau_sec,ask_before,market_mid,market_up_mid,
+              model_up_lowbeta,model_up_highbeta,robust_side_prob,net_edge,fee_per_share,btc_open,
+              spot_price,perp_price,effective_price,effective_source,sigma_fast,sigma_slow,sigma_used,
+              accepted,filled,reason
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                now_ms(), s["name"], m["condition_id"], m["kind"], outcome, asset, tau, ask, market_mid, up_mid,
+                low, high, robust_prob, edge, fee_ps, open_px, spot_px, perp_px, eff_px, eff_source,
+                vf, vs, vu, 1 if accepted else 0, 1 if filled else 0, reason,
+            ),
+        )
+        c.commit()
+
+def update_last_signal_fill(strategy_name, cid, filled, reason):
+    with db() as c:
+        row = c.execute(
+            "SELECT id FROM signals WHERE strategy=? AND condition_id=? ORDER BY id DESC LIMIT 1",
+            (strategy_name, cid),
+        ).fetchone()
+        if row:
+            c.execute("UPDATE signals SET filled=?,reason=? WHERE id=?", (1 if filled else 0, reason, row["id"]))
+            c.commit()
+
+def account_can_trade(s, cid):
+    cash = paper_cash(s["name"])
+    free = max(0.0, cash - MIN_FREE_CASH)
+    remaining_market = max(0.0, s["max_market_usd"] - market_spent(s["name"], cid))
+    return cash, min(free, remaining_market)
+
+def target_take_usd(s, edge):
+    if s["leg"] == "snipe":
+        scale = min(1.0, max(0.0, float(edge) / max(2.0 * s["min_edge"], 1e-9)))
+        return s["max_take_usd"] * scale
+    return s["max_take_usd"]
+
+async def execute_candidate(s, m, asset, outcome, tau, ask0, market_mid, up_mid, bounds,
+                            robust_prob, edge, open_px, snapshot):
+    key = (s["name"], m["condition_id"])
+    try:
+        # Commit-to-fill latency model: wait, then revalidate the same FAK price.
+        await asyncio.sleep(PAPER_TAKER_LATENCY_MS / 1000.0)
+        await ensure_book(asset)
+        ask1 = best_ask(asset)
+        if ask1 is None:
+            update_last_signal_fill(s["name"], m["condition_id"], False, "fak_no_book")
+            return
+        if ask1 > ask0 + 1e-12:
+            update_last_signal_fill(s["name"], m["condition_id"], False, f"fak_quote_gone:{ask0:.3f}->{ask1:.3f}")
             return
 
-        for variant in VARIANTS:
-            exists = conn.execute(
-                "SELECT 1 FROM market_results WHERE condition_id=? AND variant=?",
-                (cid, variant["name"]),
-            ).fetchone()
+        cash, budget_cap = account_can_trade(s, m["condition_id"])
+        desired = target_take_usd(s, edge)
+        budget = min(desired, budget_cap)
+        if budget < s["min_take_usd"] - 1e-9:
+            update_last_signal_fill(s["name"], m["condition_id"], False, "account_or_market_cap")
+            return
 
-            if exists:
-                continue
+        fills, shares, total = simulate_buy_budget(asset, budget, ask0)
+        if shares <= 1e-8 or total < s["min_take_usd"] - 1e-6:
+            update_last_signal_fill(s["name"], m["condition_id"], False, f"fak_insufficient_depth:${total:.2f}")
+            return
 
-            rows = conn.execute("""
-                SELECT * FROM paper_trades
-                WHERE condition_id=? AND variant=?
-            """, (cid, variant["name"])).fetchall()
+        gross = sum(p * q for p, q in fills)
+        fee = sum(fee_usdc(q, p) for p, q in fills)
+        avg = gross / shares
+        after = cash - total
+        if after < -1e-7:
+            update_last_signal_fill(s["name"], m["condition_id"], False, "cash_race")
+            return
 
-            total_cost = sum(sf(r["total_cost"]) for r in rows)
-            payout = sum(
-                sf(r["filled_shares"])
-                for r in rows
-                if str(r["asset"]) == winning_asset
+        with db() as c:
+            c.execute(
+                """INSERT INTO trades(
+                  trade_ms,mode,strategy,condition_id,kind,asset,outcome,signal_type,requested_usd,
+                  filled_shares,avg_price,gross_cost,fee,total_cost,cash_before,cash_after,tau_sec,
+                  robust_prob,net_edge,effective_price,effective_source,sigma_used,latency_ms,fills_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    now_ms(), "PAPER", s["name"], m["condition_id"], m["kind"], asset, outcome,
+                    "SNIPE" if s["leg"] == "snipe" else "SCALP", desired, shares, avg, gross, fee, total,
+                    cash, after, tau, robust_prob, edge, snapshot["effective_price"], snapshot["effective_source"],
+                    snapshot["sigma_used"], PAPER_TAKER_LATENCY_MS,
+                    jd([{"price": p, "shares": q} for p, q in fills]),
+                ),
             )
-            pnl = payout - total_cost
-
-            up_asset = market["up_asset"]
-            down_asset = market["down_asset"]
-
-            up_shares = sum(
-                sf(r["filled_shares"]) for r in rows if str(r["asset"]) == up_asset
+            c.execute(
+                "INSERT INTO state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (cash_key(s["name"]), str(after)),
             )
-            down_shares = sum(
-                sf(r["filled_shares"]) for r in rows if str(r["asset"]) == down_asset
+            c.commit()
+        add_market_spent(s["name"], m["condition_id"], total)
+        update_last_signal_fill(s["name"], m["condition_id"], True, f"filled_fak_after_{PAPER_TAKER_LATENCY_MS}ms")
+        log.info(
+            "PAPER %-9s %-4s %-5s | tau=%4.1fs edge=%+.3f fair=%.3f ask=%.3f | %.2fsh cost=$%.2f cash %.2f->%.2f",
+            s["name"], m["kind"], outcome, tau, edge, robust_prob, avg, shares, total, cash, after,
+        )
+    except Exception:
+        log.exception("Candidate execution failed | %s %s", s["name"], m["condition_id"][-6:])
+    finally:
+        inflight.discard(key)
+
+async def evaluate_strategy(s, m, now):
+    if s["kind"] != m["kind"]:
+        return
+    tau = m["end_ts"] - now
+    if tau < s["min_tau"] or tau > s["max_tau"]:
+        return
+
+    key = (s["name"], m["condition_id"])
+    if key in inflight:
+        return
+    if now_ms() - last_attempt_ms[key] < ATTEMPT_COOLDOWN_MS:
+        return
+
+    fav = favorite_side(m)
+    if not fav:
+        return
+    asset, outcome, mkt_mid, up_mid = fav
+    ask = best_ask(asset)
+    if ask is None or ask < s["min_ask"] or ask > s["max_ask"]:
+        return
+
+    if not m.get("btc_open"):
+        m["btc_open"] = await fetch_binance_open(m["start_ts"])
+        if m.get("btc_open"):
+            persist_market(m)
+        else:
+            return
+
+    eff, eff_source, sm, pm, sage, page = effective_btc_price()
+    vf, vs, vu, vol_ready = vol_snapshot()
+    if not eff or not vol_ready:
+        return
+
+    bounds = fair_up_bounds(eff, m["btc_open"], vu, tau, up_mid)
+    if not bounds:
+        return
+    if outcome == "Up":
+        side_probs = bounds
+    else:
+        side_probs = [1.0 - x for x in bounds]
+    robust_prob = min(side_probs)
+    fee_ps = fee_per_share(ask)
+    edge = robust_prob - ask - fee_ps
+
+    qualifies = False
+    reason = ""
+    if s["leg"] == "snipe":
+        qualifies = edge >= s["min_edge"] and edge <= s["max_edge"]
+        reason = "qualifies" if qualifies else "edge_gate"
+    else:
+        qualifies = robust_prob >= s["min_prob"]
+        reason = "qualifies" if qualifies else "prob_gate"
+
+    # Log only near-opportunities / actual candidates, not every 250ms snapshot.
+    near = qualifies or (s["leg"] == "snipe" and edge >= s["min_edge"] - 0.02) or (
+        s["leg"] == "scalp" and robust_prob >= s["min_prob"] - 0.01
+    )
+    if not near:
+        return
+
+    sig = (asset, round(ask, 3), round(edge, 3), int(tau))
+    if not qualifies:
+        # Keep blocked diagnostics but deduplicate identical state.
+        if last_signature.get(key) != sig:
+            store_signal(
+                s, m, outcome, asset, tau, ask, mkt_mid, up_mid, bounds, robust_prob, edge, fee_ps,
+                m["btc_open"], sm, pm, eff, eff_source, vf, vs, vu, False, False, reason,
             )
+            last_signature[key] = sig
+        return
 
-            conn.execute("""
-                INSERT INTO market_results(
-                    condition_id, variant, winning_asset, winning_outcome,
-                    total_cost, payout, pnl, trades, up_shares,
-                    down_shares, settled_ms
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                cid, variant["name"], winning_asset, winning_outcome,
-                total_cost, payout, pnl, len(rows),
-                up_shares, down_shares, now_ms(),
-            ))
+    cash, cap = account_can_trade(s, m["condition_id"])
+    if cap < s["min_take_usd"]:
+        return
 
-        for variant in VARIANTS:
-            for mode in BINANCE_FILTER_MODES:
-                exists_shadow = conn.execute("""
-                    SELECT 1 FROM binance_shadow_results
-                    WHERE condition_id=? AND variant=? AND mode=?
-                """, (cid, variant["name"], mode)).fetchone()
-
-                if exists_shadow:
-                    continue
-
-                shadow_rows = conn.execute("""
-                    SELECT * FROM binance_shadow_trades
-                    WHERE condition_id=? AND variant=? AND mode=? AND accepted=1
-                """, (cid, variant["name"], mode)).fetchall()
-
-                total_cost_shadow = sum(sf(r["total_cost"]) for r in shadow_rows)
-                payout_shadow = sum(
-                    sf(r["filled_shares"])
-                    for r in shadow_rows
-                    if str(r["asset"]) == str(winning_asset)
-                )
-                pnl_shadow = payout_shadow - total_cost_shadow
-
-                conn.execute("""
-                    INSERT INTO binance_shadow_results(
-                        condition_id, variant, mode, winning_asset,
-                        winning_outcome, total_cost, payout, pnl,
-                        trades, settled_ms
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
-                """, (
-                    cid, variant["name"], mode, winning_asset,
-                    winning_outcome, total_cost_shadow, payout_shadow,
-                    pnl_shadow, len(shadow_rows), now_ms()
-                ))
-
-        conn.execute("""
-            UPDATE discovered_markets
-            SET resolved=1, winning_asset=?, winning_outcome=?
-            WHERE condition_id=?
-        """, (winning_asset, winning_outcome, cid))
-
-        conn.commit()
-
-    log.info(
-        "RESOLVED %s | winner=%s",
-        market.get("question", cid),
-        winning_outcome or winning_asset[-8:],
+    last_attempt_ms[key] = now_ms()
+    last_signature[key] = sig
+    inflight.add(key)
+    snapshot = {
+        "effective_price": eff,
+        "effective_source": eff_source,
+        "sigma_used": vu,
+    }
+    store_signal(
+        s, m, outcome, asset, tau, ask, mkt_mid, up_mid, bounds, robust_prob, edge, fee_ps,
+        m["btc_open"], sm, pm, eff, eff_source, vf, vs, vu, True, False, "fak_committed",
+    )
+    asyncio.create_task(
+        execute_candidate(s, m, asset, outcome, tau, ask, mkt_mid, up_mid, bounds, robust_prob, edge, m["btc_open"], snapshot)
     )
 
-def resolve_winner_from_market(market_row):
-    """
-    Return (winning_asset, winning_outcome) when Gamma clearly exposes
-    the resolved outcome, otherwise (None, None).
+async def strategy_loop():
+    while True:
+        started = time.monotonic()
+        n = time.time()
+        try:
+            if trading_enabled():
+                for cid, m in list(markets.items()):
+                    if n < m["start_ts"] or n > m["end_ts"]:
+                        continue
+                    if best_ask(m["up_asset"]) is None or best_ask(m["down_asset"]) is None:
+                        continue
+                    for s in STRATEGIES:
+                        await evaluate_strategy(s, m, n)
+        except Exception:
+            log.exception("Strategy loop failed")
+        elapsed = time.monotonic() - started
+        await asyncio.sleep(max(0.02, DECISION_INTERVAL - elapsed))
 
-    Handles the formats we have seen from Gamma:
-    - outcomePrices -> ["1", "0"] / ["0", "1"]
-    - outcomePrices -> [1, 0]
-    - outcomes + clobTokenIds
-    - optional winner flags inside tokens/outcomes structures
-    """
-    if not isinstance(market_row, dict):
-        return None, None
+# ============================================================
+# Settlement
+# ============================================================
 
-    outcomes = [
-        str(x)
-        for x in parse_jsonish(market_row.get("outcomes"))
-    ]
-    tokens = [
-        str(x)
-        for x in parse_jsonish(market_row.get("clobTokenIds"))
-    ]
-    prices_raw = parse_jsonish(market_row.get("outcomePrices"))
-
-    if len(outcomes) >= 2 and len(tokens) >= 2 and len(prices_raw) >= 2:
-        prices = [sf(x, -1) for x in prices_raw]
-
-        # Require a near-certain resolved pair, not merely a live 0.99 quote.
-        best_idx = max(range(len(prices)), key=lambda i: prices[i])
-        best = prices[best_idx]
-        others = [prices[i] for i in range(len(prices)) if i != best_idx]
-        second = max(others) if others else -1
-
-        closed = bool(market_row.get("closed", False))
-        resolved_flag = bool(
-            market_row.get("resolved", False)
-            or market_row.get("umaResolutionStatus") == "resolved"
-        )
-
-        if (
-            best >= 0.999
-            and second <= 0.001
-            and (closed or resolved_flag or best >= 0.9999)
+def resolve_winner(row):
+    outcomes = [str(x) for x in parse_jsonish(row.get("outcomes"))]
+    tokens = [str(x) for x in parse_jsonish(row.get("clobTokenIds"))]
+    prices = [sf(x, -1) for x in parse_jsonish(row.get("outcomePrices"))]
+    if len(outcomes) >= 2 and len(tokens) >= 2 and len(prices) >= 2:
+        i = max(range(len(prices)), key=lambda j: prices[j])
+        others = [prices[j] for j in range(len(prices)) if j != i]
+        if prices[i] >= 0.999 and max(others or [-1]) <= 0.001 and bool(
+            row.get("closed", False) or row.get("resolved", False) or prices[i] >= 0.9999
         ):
-            return tokens[best_idx], outcomes[best_idx]
-
-    # Some Gamma payloads may expose token objects with winner=true.
-    token_objs = market_row.get("tokens")
-    if isinstance(token_objs, list):
-        for tok in token_objs:
-            if not isinstance(tok, dict):
-                continue
-            if bool(tok.get("winner", False)):
-                asset = str(
-                    tok.get("token_id")
-                    or tok.get("tokenId")
-                    or tok.get("id")
-                    or ""
-                )
-                outcome = str(
-                    tok.get("outcome")
-                    or tok.get("name")
-                    or ""
-                )
-                if asset:
-                    return asset, outcome
-
+            return tokens[i], outcomes[i]
     return None, None
 
+async def settle_from_ws(ev):
+    cid = str(ev.get("market") or ev.get("condition_id") or "")
+    win = str(ev.get("winning_asset_id") or ev.get("winning_asset") or "")
+    out = str(ev.get("winning_outcome") or "")
+    if cid and win:
+        await settle_market(cid, win, out)
 
-async def fetch_resolved_market_by_slug(slug, condition_id):
-    """
-    Query the exact event slug (same proven discovery route) and return the
-    embedded market matching condition_id when available.
-    """
-    event = await fetch_event_by_slug(slug)
+async def settle_market(cid, win, out):
+    async with settle_lock:
+        m = markets.get(cid)
+        with db() as c:
+            mr = c.execute("SELECT * FROM markets WHERE condition_id=?", (cid,)).fetchone()
+            kind = (m or {}).get("kind") or (mr["kind"] if mr else "")
+            lines = []
+            for s in STRATEGIES:
+                name = s["name"]
+                if c.execute(
+                    "SELECT 1 FROM results WHERE condition_id=? AND strategy=? AND mode='PAPER'",
+                    (cid, name),
+                ).fetchone():
+                    continue
+                rows = c.execute(
+                    "SELECT * FROM trades WHERE condition_id=? AND strategy=? AND mode='PAPER'",
+                    (cid, name),
+                ).fetchall()
+                if not rows:
+                    continue
+                cost = sum(sf(r["total_cost"]) for r in rows)
+                payout = sum(sf(r["filled_shares"]) for r in rows if str(r["asset"]) == win)
+                pnl = payout - cost
+                cash = paper_cash(name)
+                after = cash + payout
+                c.execute(
+                    """INSERT INTO results(condition_id,strategy,mode,kind,winning_asset,winning_outcome,total_cost,payout,pnl,trades,settled_ms)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (cid, name, "PAPER", kind, win, out, cost, payout, pnl, len(rows), now_ms()),
+                )
+                c.execute(
+                    "INSERT INTO state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (cash_key(name), str(after)),
+                )
+                lines.append(f"{name}: {pnl:+.2f} -> ${after:.2f}")
+            c.execute(
+                "UPDATE markets SET resolved=1,winning_asset=?,winning_outcome=? WHERE condition_id=?",
+                (win, out, cid),
+            )
+            c.commit()
+        if lines:
+            log.info("SETTLED %s %s winner=%s | %s", kind, cid[-6:], out, " | ".join(lines))
+            await tg_send("✅ MARKET SETTLED\n" + f"{kind} | Winner: {out}\n" + "\n".join(lines))
 
-    if not isinstance(event, dict):
-        return None
-
-    embedded = event.get("markets")
-
-    if not isinstance(embedded, list):
-        return None
-
-    for m in embedded:
-        if not isinstance(m, dict):
-            continue
-
-        cid = str(m.get("conditionId") or m.get("condition_id") or "")
-
-        if cid == str(condition_id):
-            return m
-
-    # A 5m event normally has one market, so use it as a safe fallback.
-    if len(embedded) == 1 and isinstance(embedded[0], dict):
-        return embedded[0]
-
-    return None
-
-
-async def resolution_fallback_loop():
-    """
-    Reliable settlement fallback.
-
-    WebSocket market_resolved remains the fastest route. If that event is
-    missed, poll the exact Gamma event slug for every ended unresolved market.
-
-    This uses the SAME slug method that reliably discovers BTC 5m markets,
-    instead of scanning /markets by condition_ids.
-    """
+async def resolution_loop():
     while True:
         try:
-            # Give Gamma a short grace period after the 5-minute close.
-            cutoff = now_ts() - 10
-
-            with db() as conn:
-                rows = conn.execute("""
-                    SELECT condition_id, slug, question, end_ts
-                    FROM discovered_markets
-                    WHERE resolved=0
-                      AND end_ts < ?
-                    ORDER BY end_ts
-                    LIMIT 50
-                """, (cutoff,)).fetchall()
-
-            for row in rows:
-                cid = str(row["condition_id"])
-                slug = str(row["slug"] or "")
-
-                if not slug:
+            cutoff = now_ts() - 8
+            with db() as c:
+                rows = c.execute(
+                    "SELECT * FROM markets WHERE resolved=0 AND end_ts<? ORDER BY end_ts LIMIT 100",
+                    (cutoff,),
+                ).fetchall()
+            for r in rows:
+                ev = await fetch_event_by_slug(r["slug"])
+                if not ev or not isinstance(ev.get("markets"), list):
                     continue
-
-                m = await fetch_resolved_market_by_slug(slug, cid)
-
-                if not m:
+                raw = next((x for x in ev["markets"] if str(x.get("conditionId") or "") == r["condition_id"]), None)
+                if raw is None and len(ev["markets"]) == 1:
+                    raw = ev["markets"][0]
+                if not raw:
                     continue
-
-                winning_asset, winning_outcome = resolve_winner_from_market(m)
-
-                if not winning_asset:
-                    continue
-
-                log.info(
-                    "RESOLUTION FALLBACK %s | winner=%s",
-                    slug,
-                    winning_outcome or winning_asset[-8:],
-                )
-
-                await settle_market(
-                    cid,
-                    winning_asset,
-                    winning_outcome,
-                )
-
+                win, out = resolve_winner(raw)
+                if win:
+                    await settle_market(r["condition_id"], win, out)
         except Exception:
             log.exception("Resolution fallback failed")
-
-        # Check frequently enough that the hourly report at +5 min contains
-        # all markets from the completed hour.
         await asyncio.sleep(10)
 
 # ============================================================
-# HOURLY REPORT
+# Stats / reports
 # ============================================================
 
-def csv_bytes(rows, columns=None):
-    s = io.StringIO()
+def account_stats(strategy_name):
+    cash = paper_cash(strategy_name)
+    initial = paper_initial(strategy_name)
+    with db() as c:
+        realized = sf(c.execute(
+            "SELECT COALESCE(SUM(pnl),0) p FROM results WHERE strategy=? AND mode='PAPER'",
+            (strategy_name,),
+        ).fetchone()["p"])
+        wins = c.execute(
+            "SELECT COUNT(*) c FROM results WHERE strategy=? AND mode='PAPER' AND pnl>0",
+            (strategy_name,),
+        ).fetchone()["c"]
+        losses = c.execute(
+            "SELECT COUNT(*) c FROM results WHERE strategy=? AND mode='PAPER' AND pnl<0",
+            (strategy_name,),
+        ).fetchone()["c"]
+        trades = c.execute(
+            "SELECT COUNT(*) c FROM trades WHERE strategy=? AND mode='PAPER'",
+            (strategy_name,),
+        ).fetchone()["c"]
+        fees = sf(c.execute(
+            "SELECT COALESCE(SUM(fee),0) f FROM trades WHERE strategy=? AND mode='PAPER'",
+            (strategy_name,),
+        ).fetchone()["f"])
+        open_cost = sf(c.execute(
+            """SELECT COALESCE(SUM(t.total_cost),0) x FROM trades t
+               LEFT JOIN results r ON r.condition_id=t.condition_id AND r.strategy=t.strategy AND r.mode=t.mode
+               WHERE t.strategy=? AND t.mode='PAPER' AND r.condition_id IS NULL""",
+            (strategy_name,),
+        ).fetchone()["x"])
+        attempts = c.execute(
+            "SELECT COUNT(*) c FROM signals WHERE strategy=? AND accepted=1",
+            (strategy_name,),
+        ).fetchone()["c"]
+        fills = c.execute(
+            "SELECT COUNT(*) c FROM signals WHERE strategy=? AND accepted=1 AND filled=1",
+            (strategy_name,),
+        ).fetchone()["c"]
+        cost = sf(c.execute(
+            "SELECT COALESCE(SUM(total_cost),0) x FROM trades WHERE strategy=? AND mode='PAPER'",
+            (strategy_name,),
+        ).fetchone()["x"])
+    equity = cash + open_cost
+    return {
+        "initial": initial, "cash": cash, "open_cost": open_cost, "equity": equity,
+        "realized": realized, "wins": wins, "losses": losses, "trades": trades,
+        "fees": fees, "attempts": attempts, "fills": fills, "cost": cost,
+    }
 
-    if rows:
-        if columns is None:
-            columns = list(rows[0].keys())
+def period_summary(start_ms, end_ms, strategy_name):
+    with db() as c:
+        tr = c.execute(
+            "SELECT * FROM trades WHERE strategy=? AND trade_ms>=? AND trade_ms<?",
+            (strategy_name, start_ms, end_ms),
+        ).fetchall()
+        rs = c.execute(
+            "SELECT * FROM results WHERE strategy=? AND settled_ms>=? AND settled_ms<?",
+            (strategy_name, start_ms, end_ms),
+        ).fetchall()
+        attempts = c.execute(
+            "SELECT COUNT(*) c FROM signals WHERE strategy=? AND accepted=1 AND signal_ms>=? AND signal_ms<?",
+            (strategy_name, start_ms, end_ms),
+        ).fetchone()["c"]
+        fills = c.execute(
+            "SELECT COUNT(*) c FROM signals WHERE strategy=? AND accepted=1 AND filled=1 AND signal_ms>=? AND signal_ms<?",
+            (strategy_name, start_ms, end_ms),
+        ).fetchone()["c"]
+    pnl = sum(sf(r["pnl"]) for r in rs)
+    wins = sum(1 for r in rs if sf(r["pnl"]) > 0)
+    losses = sum(1 for r in rs if sf(r["pnl"]) < 0)
+    fees = sum(sf(r["fee"]) for r in tr)
+    cost = sum(sf(r["total_cost"]) for r in tr)
+    return {
+        "pnl": pnl, "wins": wins, "losses": losses, "trades": len(tr), "fees": fees,
+        "cost": cost, "attempts": attempts, "fills": fills,
+    }
 
-        w = csv.DictWriter(s, fieldnames=columns, extrasaction="ignore")
-        w.writeheader()
+def rows_to_csv(rows):
+    if not rows:
+        return ""
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(rows)
+    return output.getvalue()
 
-        for r in rows:
-            w.writerow(dict(r))
+def make_hourly_report(start_ts, end_ts):
+    start_ms, end_ms = start_ts * 1000, end_ts * 1000
+    stamp_a = datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime("%Y-%m-%d_%H-%M")
+    stamp_b = datetime.fromtimestamp(end_ts, tz=timezone.utc).strftime("%H-%M")
+    zip_path = REPORT_DIR / f"sniper_lab_{stamp_a}_{stamp_b}_UTC.zip"
 
-    elif columns:
-        w = csv.DictWriter(s, fieldnames=columns)
-        w.writeheader()
+    summary_rows = []
+    for s in STRATEGIES:
+        p = period_summary(start_ms, end_ms, s["name"])
+        all_s = account_stats(s["name"])
+        fill_rate = p["fills"] / p["attempts"] if p["attempts"] else 0.0
+        roi = p["pnl"] / p["cost"] * 100 if p["cost"] else 0.0
+        summary_rows.append({
+            "strategy": s["name"], "label": s["short"],
+            "hour_pnl": round(p["pnl"], 6), "hour_wins": p["wins"], "hour_losses": p["losses"],
+            "hour_trades": p["trades"], "hour_fees": round(p["fees"], 6), "hour_cost": round(p["cost"], 6),
+            "hour_roi_pct": round(roi, 4), "fak_attempts": p["attempts"], "fak_fills": p["fills"],
+            "fak_fill_rate_pct": round(fill_rate * 100, 2),
+            "cash": round(all_s["cash"], 6), "equity": round(all_s["equity"], 6),
+            "realized_total": round(all_s["realized"], 6), "total_wins": all_s["wins"],
+            "total_losses": all_s["losses"], "total_trades": all_s["trades"],
+        })
 
-    return s.getvalue().encode("utf-8-sig")
-
-def variant_summary(start_ms, end_ms):
-    out = []
-
-    with db() as conn:
-        for v in VARIANTS:
-            rows = conn.execute("""
-                SELECT mr.*
-                FROM market_results mr
-                JOIN discovered_markets dm
-                  ON dm.condition_id = mr.condition_id
-                WHERE mr.variant=?
-                  AND (dm.end_ts * 1000) >= ?
-                  AND (dm.end_ts * 1000) < ?
-            """, (v["name"], start_ms, end_ms)).fetchall()
-
-            pnl = sum(sf(r["pnl"]) for r in rows)
-            cost = sum(sf(r["total_cost"]) for r in rows)
-            wins = sum(1 for r in rows if sf(r["pnl"]) > 0)
-            losses = sum(1 for r in rows if sf(r["pnl"]) < 0)
-
-            trades = conn.execute("""
-                SELECT COUNT(*) c
-                FROM paper_trades
-                WHERE variant=? AND trade_ms>=? AND trade_ms<?
-            """, (v["name"], start_ms, end_ms)).fetchone()["c"]
-
-            fees = conn.execute("""
-                SELECT COALESCE(SUM(fee),0) f
-                FROM paper_trades
-                WHERE variant=? AND trade_ms>=? AND trade_ms<?
-            """, (v["name"], start_ms, end_ms)).fetchone()["f"]
-
-            out.append({
-                "variant": v["name"],
-                "entry_move": v["entry_move"],
-                "pyramid_step": v["pyramid_step"],
-                "lookback_ticks": v["lookback"],
-                "switch_move": v["switch_move"],
-                "max_buys_side": v["max_buys_side"],
-                "entry_price_min": v.get("entry_price_min", ""),
-                "entry_price_max": v.get("entry_price_max", ""),
-                "momentum_cap": v.get("momentum_cap", ""),
-                "allow_switch": v.get("allow_switch", True),
-                "entry_cutoff_sec": v.get("entry_cutoff_sec", ""),
-                "switch_price_max": v.get("switch_price_max", ""),
-                "markets_settled": len(rows),
-                "winning_markets": wins,
-                "losing_markets": losses,
-                "paper_trades": trades,
-                "fees": round(sf(fees), 5),
-                "cost": round(cost, 5),
-                "pnl": round(pnl, 5),
-                "roi_pct": round((pnl / cost * 100) if cost > 0 else 0, 4),
-            })
-
-    return sorted(out, key=lambda x: x["pnl"], reverse=True)
-
-
-def binance_shadow_summary(start_ms, end_ms):
-    out = []
-
-    with db() as conn:
-        for v in VARIANTS:
-            for mode in BINANCE_FILTER_MODES:
-                rows = conn.execute("""
-                    SELECT bsr.*
-                    FROM binance_shadow_results bsr
-                    JOIN discovered_markets dm
-                      ON dm.condition_id=bsr.condition_id
-                    WHERE bsr.variant=? AND bsr.mode=?
-                      AND (dm.end_ts*1000)>=?
-                      AND (dm.end_ts*1000)<?
-                """, (v["name"], mode, start_ms, end_ms)).fetchall()
-
-                pnl = sum(sf(r["pnl"]) for r in rows)
-                cost = sum(sf(r["total_cost"]) for r in rows)
-                wins = sum(1 for r in rows if sf(r["pnl"]) > 0)
-                losses = sum(1 for r in rows if sf(r["pnl"]) < 0)
-                trades = sum(si(r["trades"]) for r in rows)
-
-                out.append({
-                    "variant": v["name"],
-                    "mode": mode,
-                    "markets_settled": len(rows),
-                    "winning_markets": wins,
-                    "losing_markets": losses,
-                    "paper_trades": trades,
-                    "cost": round(cost, 5),
-                    "pnl": round(pnl, 5),
-                    "roi_pct": round((pnl / cost * 100) if cost > 0 else 0.0, 4),
-                })
-
-    return sorted(out, key=lambda x: x["pnl"], reverse=True)
-
-def make_report(start_ts, end_ts):
-    sm = start_ts * 1000
-    em = end_ts * 1000
-
-    with db() as conn:
-        trades = conn.execute("""
-            SELECT * FROM paper_trades
-            WHERE trade_ms>=? AND trade_ms<?
-            ORDER BY trade_ms
-        """, (sm, em)).fetchall()
-
-        signals = conn.execute("""
-            SELECT * FROM signals
-            WHERE signal_ms>=? AND signal_ms<?
-            ORDER BY signal_ms
-        """, (sm, em)).fetchall()
-
-        results = conn.execute("""
-            SELECT mr.*
-            FROM market_results mr
-            JOIN discovered_markets dm
-              ON dm.condition_id = mr.condition_id
-            WHERE (dm.end_ts * 1000) >= ?
-              AND (dm.end_ts * 1000) < ?
-            ORDER BY dm.end_ts, mr.variant
-        """, (sm, em)).fetchall()
-
-        markets_rows = conn.execute("""
-            SELECT * FROM discovered_markets
-            WHERE discovered_ms<? AND end_ts>=?
-            ORDER BY start_ts
-        """, (em, start_ts - 300)).fetchall()
-
-
-        binance_features_rows = conn.execute("""
-            SELECT * FROM binance_v2_features
-            WHERE signal_ms>=? AND signal_ms<?
-            ORDER BY signal_ms
-        """, (sm, em)).fetchall()
-
-        binance_shadow_trades_rows = conn.execute("""
-            SELECT * FROM binance_shadow_trades
-            WHERE trade_ms>=? AND trade_ms<?
-            ORDER BY trade_ms, variant, mode
-        """, (sm, em)).fetchall()
-
-        binance_shadow_results_rows = conn.execute("""
-            SELECT bsr.*
-            FROM binance_shadow_results bsr
-            JOIN discovered_markets dm
-              ON dm.condition_id=bsr.condition_id
-            WHERE (dm.end_ts*1000)>=?
-              AND (dm.end_ts*1000)<?
-            ORDER BY dm.end_ts, bsr.variant, bsr.mode
-        """, (sm, em)).fetchall()
-
-    summary = variant_summary(sm, em)
-    bsummary = binance_shadow_summary(sm, em)
+    with db() as c:
+        trades = [dict(r) for r in c.execute(
+            "SELECT * FROM trades WHERE trade_ms>=? AND trade_ms<? ORDER BY trade_ms",
+            (start_ms, end_ms),
+        ).fetchall()]
+        signals = [dict(r) for r in c.execute(
+            "SELECT * FROM signals WHERE signal_ms>=? AND signal_ms<? ORDER BY signal_ms",
+            (start_ms, end_ms),
+        ).fetchall()]
+        results = [dict(r) for r in c.execute(
+            "SELECT * FROM results WHERE settled_ms>=? AND settled_ms<? ORDER BY settled_ms",
+            (start_ms, end_ms),
+        ).fetchall()]
 
     lines = [
-        "POWERWINNER-INSPIRED STRATEGY SIMULATOR v1",
-        "=" * 70,
+        f"PolyBTC Sniper Lab hourly report",
         f"Period UTC: {utc_iso(start_ts)} -> {utc_iso(end_ts)}",
-        f"Symbol: {SYMBOL}",
-        f"Decision interval: {DECISION_INTERVAL}s",
-        f"Trading window: first {TRADE_WINDOW_SECONDS}s",
-        f"Paper lot: {ORDER_SIZE} shares",
+        f"Version: {VERSION}",
         "",
-        "VARIANTS RANKED BY REALIZED PNL",
     ]
-
-    for x in summary:
+    for row in summary_rows:
         lines.append(
-            f"{x['variant']}: pnl=${x['pnl']:+.2f} | "
-            f"ROI={x['roi_pct']:+.2f}% | markets={x['markets_settled']} | "
-            f"W/L={x['winning_markets']}/{x['losing_markets']} | "
-            f"trades={x['paper_trades']} | fees=${x['fees']:.2f}"
+            f"{row['strategy']}: pnl={row['hour_pnl']:+.2f} W/L={row['hour_wins']}/{row['hour_losses']} "
+            f"trades={row['hour_trades']} cost={row['hour_cost']:.2f} ROI={row['hour_roi_pct']:+.2f}% "
+            f"FAK={row['fak_fills']}/{row['fak_attempts']} equity={row['equity']:.2f}"
         )
 
-    lines += [
-        "",
-        "BINANCE V2 CONFIDENCE SHADOW — TOP 15",
-    ]
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("summary.csv", rows_to_csv(summary_rows))
+        z.writestr("trades.csv", rows_to_csv(trades))
+        z.writestr("signals.csv", rows_to_csv(signals))
+        z.writestr("results.csv", rows_to_csv(results))
+        z.writestr("report.txt", "\n".join(lines) + "\n")
+    return zip_path, summary_rows
 
-    for x in bsummary[:15]:
-        lines.append(
-            f"{x['variant']} + {x['mode']}: pnl=${x['pnl']:+.2f} | "
-            f"ROI={x['roi_pct']:+.2f}% | W/L={x['winning_markets']}/{x['losing_markets']} | "
-            f"trades={x['paper_trades']}"
-        )
-
-    lines += [
-        "",
-        "IMPORTANT",
-        "This is an independent paper strategy test. It does NOT copy Powerwinner.",
-        "All fills use the live public order book and taker fees.",
-        "No real orders are placed.",
-    ]
-
-    d1 = datetime.fromtimestamp(start_ts, tz=timezone.utc)
-    d2 = datetime.fromtimestamp(end_ts, tz=timezone.utc)
-
-    path = REPORT_DIR / f"strategy_sim_{d1:%Y-%m-%d_%H-%M}_{d2:%H-%M}_UTC.zip"
-
-    summary_cols = [
-        "variant", "entry_move", "pyramid_step", "lookback_ticks",
-        "switch_move", "max_buys_side", "entry_price_min", "entry_price_max",
-        "momentum_cap", "allow_switch", "entry_cutoff_sec", "switch_price_max", "markets_settled",
-        "winning_markets", "losing_markets", "paper_trades",
-        "fees", "cost", "pnl", "roi_pct"
-    ]
-
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("variants_summary.csv", csv_bytes(summary, summary_cols))
-        z.writestr("paper_trades.csv", csv_bytes(trades))
-        z.writestr("signals.csv", csv_bytes(signals))
-        z.writestr("market_results.csv", csv_bytes(results))
-        z.writestr("markets.csv", csv_bytes(markets_rows))
-        z.writestr("binance_v2_features.csv", csv_bytes(binance_features_rows))
-        z.writestr("binance_shadow_trades.csv", csv_bytes(binance_shadow_trades_rows))
-        z.writestr("binance_shadow_results.csv", csv_bytes(binance_shadow_results_rows))
-        z.writestr("binance_shadow_summary.csv", csv_bytes(bsummary))
-        z.writestr("report.txt", "\n".join(lines).encode("utf-8"))
-
-    return path, summary
-
-async def tg_file(path, caption):
+async def tg_send_document(path, caption=""):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured: %s", path)
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
-
+        return
     try:
         form = aiohttp.FormData()
         form.add_field("chat_id", TELEGRAM_CHAT_ID)
-        form.add_field("caption", caption[:1024])
-        form.add_field(
-            "document",
-            path.read_bytes(),
-            filename=path.name,
-            content_type="application/zip",
-        )
-
-        async with session.post(
-            url,
+        if caption:
+            form.add_field("caption", caption[:1024])
+        form.add_field("document", path.read_bytes(), filename=path.name, content_type="application/zip")
+        await session.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
             data=form,
-            timeout=aiohttp.ClientTimeout(total=120),
-        ) as r:
-            if r.status != 200:
-                log.warning("Telegram: %s", await r.text())
-                return False
-            return True
-
+            timeout=aiohttp.ClientTimeout(total=30),
+        )
     except Exception:
-        log.exception("Telegram send failed")
-        return False
+        log.exception("Telegram document send failed")
 
 async def report_loop():
-    saved = si(state_get("last_report_end", "0"))
-
-    if saved <= 0:
-        d = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-        saved = int(d.timestamp())
-        state_set("last_report_end", saved)
-
-    last_end = saved
-
     while True:
         try:
-            eligible = ((now_ts() - REPORT_DELAY_SECONDS) // 3600) * 3600
-
-            while last_end < eligible:
-                start = last_end
-                end = start + 3600
-
-                path, summary = make_report(start, end)
-
-                best = summary[0] if summary else None
-
-                if best:
-                    extra = (
-                        f"Best: {best['variant']} | "
-                        f"PnL ${best['pnl']:+.2f} | ROI {best['roi_pct']:+.2f}%"
-                    )
-                else:
-                    extra = "No settled markets yet"
-
-                ok = await tg_file(
-                    path,
-                    (
-                        "🧪 Strategy Simulator\n"
-                        f"{utc_iso(start)} → {utc_iso(end)}\n"
-                        f"{extra}"
-                    ),
-                )
-
-                if not ok:
-                    break
-
-                last_end = end
-                state_set("last_report_end", last_end)
-
+            await asyncio.sleep(15)
+            end_ts = (now_ts() // 3600) * 3600
+            last_end = si(state_get("last_report_end", end_ts))
+            while last_end < end_ts:
+                start_ts = last_end
+                next_end = last_end + 3600
+                path, rows = make_hourly_report(start_ts, next_end)
+                caption = " | ".join(f"{r['strategy']} {r['hour_pnl']:+.2f}" for r in rows)
+                await tg_send_document(path, f"📦 Sniper Lab {caption}")
+                state_set("last_report_end", next_end)
+                last_end = next_end
         except Exception:
-            log.exception("Report loop failed")
-
-        await asyncio.sleep(REPORT_CHECK_INTERVAL)
+            log.exception("Hourly report failed")
+            await asyncio.sleep(30)
 
 # ============================================================
-# HEALTH
+# Telegram
 # ============================================================
+
+def keyboard():
+    return {
+        "keyboard": [
+            [{"text": "▶️ START"}, {"text": "⏹ STOP"}],
+            [{"text": "💰 BALANCE"}, {"text": "📊 STATISTICS"}],
+            [{"text": "📈 POSITIONS"}, {"text": "📜 TRADES"}],
+            [{"text": "📦 REPORT"}, {"text": "🚨 EMERGENCY STOP"}],
+        ],
+        "resize_keyboard": True,
+    }
+
+async def tg_send(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        await session.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:4096], "reply_markup": keyboard()},
+            timeout=aiohttp.ClientTimeout(total=15),
+        )
+    except Exception:
+        log.exception("Telegram send failed")
+
+async def send_balances():
+    blocks = []
+    for s in STRATEGIES:
+        st = account_stats(s["name"])
+        blocks.append(
+            f"{s['short']}\nCash ${st['cash']:.2f} | Open ${st['open_cost']:.2f} | Equity ${st['equity']:.2f}\n"
+            f"Realized {st['realized']:+.2f}"
+        )
+    await tg_send("💰 FOUR INDEPENDENT $500 PAPER ACCOUNTS\n\n" + "\n\n".join(blocks))
+
+async def send_statistics():
+    blocks = []
+    for s in STRATEGIES:
+        st = account_stats(s["name"])
+        denom = st["wins"] + st["losses"]
+        wr = st["wins"] / denom * 100 if denom else 0
+        fr = st["fills"] / st["attempts"] * 100 if st["attempts"] else 0
+        roi = st["realized"] / st["cost"] * 100 if st["cost"] else 0
+        blocks.append(
+            f"{s['short']}\nW/L {st['wins']}/{st['losses']} ({wr:.1f}%) | Trades {st['trades']}\n"
+            f"PnL {st['realized']:+.2f} | Fees ${st['fees']:.2f} | ROI/cost {roi:+.1f}%\n"
+            f"FAK fills {st['fills']}/{st['attempts']} ({fr:.1f}%)"
+        )
+    await tg_send("📊 SNIPER LAB STATISTICS\n\n" + "\n\n".join(blocks))
+
+async def send_positions():
+    for s in STRATEGIES:
+        with db() as c:
+            rows = c.execute(
+                """SELECT t.condition_id,t.kind,t.outcome,SUM(t.filled_shares) shares,SUM(t.total_cost) cost
+                   FROM trades t LEFT JOIN results r
+                     ON r.condition_id=t.condition_id AND r.strategy=t.strategy AND r.mode=t.mode
+                   WHERE t.strategy=? AND t.mode='PAPER' AND r.condition_id IS NULL
+                   GROUP BY t.condition_id,t.kind,t.outcome ORDER BY MAX(t.trade_ms) DESC LIMIT 15""",
+                (s["name"],),
+            ).fetchall()
+        body = "\n".join(
+            f"{r['kind']} {r['condition_id'][-6:]} {r['outcome']}: {r['shares']:.2f}sh ${r['cost']:.2f}"
+            for r in rows
+        ) if rows else "None"
+        await tg_send(f"📈 {s['short']}\n{body}")
+
+async def send_trades():
+    for s in STRATEGIES:
+        with db() as c:
+            rows = c.execute(
+                "SELECT * FROM trades WHERE strategy=? ORDER BY id DESC LIMIT 10", (s["name"],)
+            ).fetchall()
+        lines = []
+        for r in rows:
+            t = datetime.fromtimestamp(r["trade_ms"] / 1000, tz=timezone.utc).strftime("%H:%M:%S")
+            lines.append(
+                f"{t} {r['kind']} {r['outcome']} @{r['avg_price']:.3f} "
+                f"edge={r['net_edge']:+.3f} ${r['total_cost']:.2f}"
+            )
+        await tg_send(f"📜 {s['short']} LAST TRADES\n" + ("\n".join(lines) if lines else "None"))
+
+async def send_latest_report():
+    end_ts = (now_ts() // 3600) * 3600
+    start_ts = end_ts - 3600
+    path, rows = make_hourly_report(start_ts, end_ts)
+    caption = " | ".join(f"{r['strategy']} {r['hour_pnl']:+.2f}" for r in rows)
+    await tg_send_document(path, f"📦 Last complete hour | {caption}")
+
+async def handle_tg(text):
+    t = text.strip().upper()
+    if t in {"/START", "▶️ START", "START"}:
+        state_set("trading_enabled", "1")
+        await tg_send("▶️ Sniper Lab STARTED\nPAPER only | 4 independent $500 accounts")
+    elif t in {"⏹ STOP", "STOP", "/STOP"}:
+        state_set("trading_enabled", "0")
+        await tg_send("⏹ New paper entries stopped. Open positions settle normally.")
+    elif t in {"🚨 EMERGENCY STOP", "EMERGENCY STOP"}:
+        state_set("trading_enabled", "0")
+        await tg_send("🚨 EMERGENCY STOP. No new paper orders.")
+    elif t in {"💰 BALANCE", "BALANCE", "/BALANCE"}:
+        await send_balances()
+    elif t in {"📊 STATISTICS", "STATISTICS", "/STATS"}:
+        await send_statistics()
+    elif t in {"📈 POSITIONS", "POSITIONS"}:
+        await send_positions()
+    elif t in {"📜 TRADES", "TRADES"}:
+        await send_trades()
+    elif t in {"📦 REPORT", "REPORT"}:
+        await send_latest_report()
+    elif t in {"LIVE", "🔴 LIVE"}:
+        await tg_send("🔒 LIVE is deliberately disabled in this research build.")
+    else:
+        await tg_send(
+            "PolyBTC Sniper Lab\n"
+            "A S5_R10 | B S5_R15 | C S15_R10 | D SCALP15\n"
+            "Each account starts at $500. PAPER only."
+        )
+
+async def telegram_loop():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram not configured")
+        return
+    offset = 0
+    await tg_send(
+        f"🤖 {VERSION} online\nTrading: {'ON' if trading_enabled() else 'OFF'}\n"
+        "A/B/C/D each has an independent $500 PAPER account."
+    )
+    while True:
+        try:
+            async with session.get(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                params={"timeout": 25, "offset": offset},
+                timeout=aiohttp.ClientTimeout(total=35),
+            ) as r:
+                d = await r.json()
+            for u in d.get("result", []):
+                offset = max(offset, si(u.get("update_id")) + 1)
+                msg = u.get("message") or {}
+                chat = str((msg.get("chat") or {}).get("id", ""))
+                if chat != str(TELEGRAM_CHAT_ID):
+                    continue
+                text = msg.get("text")
+                if text:
+                    await handle_tg(text)
+        except Exception as e:
+            log.warning("Telegram polling: %s", e)
+            await asyncio.sleep(2)
+
+# ============================================================
+# Cleanup / health
+# ============================================================
+
+def cleanup_old_runtime():
+    cutoff = now_ts() - MEMORY_KEEP_RESOLVED_SEC
+    old = []
+    with db() as c:
+        rows = c.execute(
+            "SELECT condition_id,up_asset,down_asset FROM markets WHERE resolved=1 AND end_ts<?",
+            (cutoff,),
+        ).fetchall()
+    for r in rows:
+        cid = str(r["condition_id"])
+        if cid in markets:
+            old.append(cid)
+    for cid in old:
+        markets.pop(cid, None)
+        for s in STRATEGIES:
+            spent_cache.pop((s["name"], cid), None)
+            last_attempt_ms.pop((s["name"], cid), None)
+            last_signature.pop((s["name"], cid), None)
+    keep_assets = set()
+    for m in markets.values():
+        keep_assets.add(m["up_asset"])
+        keep_assets.add(m["down_asset"])
+    for a in list(books):
+        if a not in keep_assets:
+            books.pop(a, None)
+    subscribed_assets.intersection_update(keep_assets)
+    return len(old)
+
+async def cleanup_loop():
+    while True:
+        try:
+            n = cleanup_old_runtime()
+            if n:
+                log.info("CLEANUP markets=%d", n)
+        except Exception:
+            log.exception("Cleanup failed")
+        await asyncio.sleep(60)
 
 async def health(request):
-    with db() as conn:
-        t = conn.execute("SELECT COUNT(*) c FROM paper_trades").fetchone()["c"]
-        r = conn.execute("SELECT COUNT(*) c FROM market_results").fetchone()["c"]
-        p = conn.execute("SELECT COALESCE(SUM(pnl),0) p FROM market_results").fetchone()["p"]
-
+    eff, source, sm, pm, sage, page = effective_btc_price()
+    vf, vs, vu, ready = vol_snapshot()
     return web.json_response({
         "ok": True,
-        "version": "2.0-binance-research",
-        "symbol": SYMBOL,
-        "decision_interval": DECISION_INTERVAL,
-        "trade_window_seconds": TRADE_WINDOW_SECONDS,
-        "order_size": ORDER_SIZE,
-        "variants": len(VARIANTS),
-        "markets_tracked": len(markets),
-        "assets_subscribed": len(subscribed_assets),
+        "version": VERSION,
+        "paper_only": True,
+        "trading_enabled": trading_enabled(),
+        "markets": len(markets),
         "books": len(books),
-        "paper_trades": t,
-        "settled_variant_results": r,
-        "aggregate_all_variant_pnl": p,
-        "binance_symbol": BINANCE_SYMBOL.upper(),
-        "binance_last_event_ms": binance_last_event_ms,
-        "binance_trade_buffer": len(binance_trades),
-        "binance_tick_buffer": len(binance_tick_prices),
-        "binance_depth_bids": len(binance_depth_bids),
-        "binance_depth_asks": len(binance_depth_asks),
+        "spot": sm,
+        "perp": pm,
+        "effective": eff,
+        "effective_source": source,
+        "spot_age_ms": sage,
+        "perp_age_ms": page,
+        "vol_fast": vf,
+        "vol_slow": vs,
+        "vol_used": vu,
+        "vol_ready": ready,
+        "accounts": {s["name"]: account_stats(s["name"]) for s in STRATEGIES},
         "time_utc": utc_iso(),
     })
 
@@ -1982,54 +1667,41 @@ async def web_server():
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
-
     runner = web.AppRunner(app)
     await runner.setup()
-
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-
-    log.info("Health server on :%d", PORT)
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    log.info("Health server :%d", PORT)
 
 # ============================================================
-# MAIN
+# Main
 # ============================================================
 
 async def main():
     global session
-
     init_db()
-
-    session = aiohttp.ClientSession(headers={
-        "User-Agent": "PowerwinnerInspiredStrategySimulator/2.0-binance-research",
-        "Accept": "application/json",
-    })
-
-    tasks = [
-        asyncio.create_task(web_server()),
-        asyncio.create_task(discovery_loop()),
-        asyncio.create_task(ws_loop()),
-        asyncio.create_task(strategy_loop()),
-        asyncio.create_task(resolution_fallback_loop()),
-        asyncio.create_task(report_loop()),
-        asyncio.create_task(binance_ws_loop()),
-    ]
-
-    log.info(
-        "Strategy Simulator started | %d variants | %.1fs cycle | lot=%.1f",
-        len(VARIANTS),
-        DECISION_INTERVAL,
-        ORDER_SIZE,
-    )
-
+    session = aiohttp.ClientSession(headers={"User-Agent": "PolyBTCSniperLab/1.0", "Accept": "application/json"})
+    await bootstrap_binance_history()
+    tasks = [asyncio.create_task(x()) for x in (
+        web_server,
+        discovery_loop,
+        poly_ws_loop,
+        binance_spot_ws_loop,
+        binance_perp_ws_loop,
+        binance_sampler_loop,
+        strategy_loop,
+        resolution_loop,
+        telegram_loop,
+        report_loop,
+        cleanup_loop,
+    )]
+    balances = ", ".join(f"{s['name']}=${paper_cash(s['name']):.2f}" for s in STRATEGIES)
+    log.info("%s started | PAPER ONLY | %s", VERSION, balances)
     try:
         await asyncio.gather(*tasks)
     finally:
         for t in tasks:
             t.cancel()
-
-        if session:
-            await session.close()
+        await session.close()
 
 if __name__ == "__main__":
     try:
