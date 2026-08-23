@@ -21,12 +21,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ============================================================
-# POLYBTC SNIPER LAB — PAPER ONLY
+# POLYBTC 15M EDGE LAB — PAPER ONLY
 # Adaptation of the public polybtc stale-quote research thesis.
-# Four independent $500 paper accounts, same market/Binance snapshot.
+# Four independent 15m $500 paper accounts, same market/Binance snapshot.
 # ============================================================
 
-VERSION = "1.0-polybtc-sniper-lab-paper"
+VERSION = "1.1-polybtc-15m-edge-lab-paper"
 HOST = "https://clob.polymarket.com"
 GAMMA = "https://gamma-api.polymarket.com"
 POLY_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -52,8 +52,8 @@ except Exception:
     DATA_DIR = Path("./data")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = DATA_DIR / "polybtc_sniper_lab_v1.db"
-REPORT_DIR = DATA_DIR / "sniper_lab_reports"
+DB_PATH = DATA_DIR / "polybtc_15m_edge_lab_v1_1.db"
+REPORT_DIR = DATA_DIR / "polybtc_15m_edge_reports"
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -80,12 +80,14 @@ VOL_SLOW_HALFLIFE_SEC = float(os.getenv("VOL_SLOW_HALFLIFE_SEC", "300"))
 MIN_VOL_PER_SQRT_SEC = float(os.getenv("MIN_VOL_PER_SQRT_SEC", "0.00002"))
 BASIS_WINDOW_SEC = int(os.getenv("BASIS_WINDOW_SEC", "60"))
 
-# Four clean A/B/C/D experiments. Each has its own $500 account.
+# Four clean 15-minute A/B/C/D experiments. Each has its own $500 account.
+# Design: A/B/C isolate the edge threshold on the same final-60s window;
+# D isolates the window length at the middle 12.5c threshold.
 STRATEGIES = [
     {
-        "name": "S5_R10",
-        "short": "A / 5m robust edge>=10c",
-        "kind": "5m",
+        "name": "S15_E10_60",
+        "short": "A / 15m edge>=10c / 60s",
+        "kind": "15m",
         "leg": "snipe",
         "min_tau": 1.0,
         "max_tau": 60.0,
@@ -98,9 +100,24 @@ STRATEGIES = [
         "max_market_usd": 50.0,
     },
     {
-        "name": "S5_R15",
-        "short": "B / 5m robust edge>=15c",
-        "kind": "5m",
+        "name": "S15_E125_60",
+        "short": "B / 15m edge>=12.5c / 60s",
+        "kind": "15m",
+        "leg": "snipe",
+        "min_tau": 1.0,
+        "max_tau": 60.0,
+        "min_edge": 0.125,
+        "max_edge": 0.20,
+        "min_ask": 0.50,
+        "max_ask": 0.70,
+        "min_take_usd": 10.0,
+        "max_take_usd": 25.0,
+        "max_market_usd": 50.0,
+    },
+    {
+        "name": "S15_E15_60",
+        "short": "C / 15m edge>=15c / 60s",
+        "kind": "15m",
         "leg": "snipe",
         "min_tau": 1.0,
         "max_tau": 60.0,
@@ -113,33 +130,19 @@ STRATEGIES = [
         "max_market_usd": 50.0,
     },
     {
-        "name": "S15_R10",
-        "short": "C / 15m robust edge>=10c",
+        "name": "S15_E125_90",
+        "short": "D / 15m edge>=12.5c / 90s",
         "kind": "15m",
         "leg": "snipe",
         "min_tau": 1.0,
-        "max_tau": 60.0,
-        "min_edge": 0.10,
+        "max_tau": 90.0,
+        "min_edge": 0.125,
         "max_edge": 0.20,
         "min_ask": 0.50,
         "max_ask": 0.70,
         "min_take_usd": 10.0,
         "max_take_usd": 25.0,
         "max_market_usd": 50.0,
-    },
-    {
-        "name": "SCALP15",
-        "short": "D / 15m end-window scalp",
-        "kind": "15m",
-        "leg": "scalp",
-        "min_tau": 5.0,
-        "max_tau": 30.0,
-        "min_prob": 0.997,
-        "min_ask": 0.90,
-        "max_ask": 0.99,
-        "min_take_usd": 10.0,
-        "max_take_usd": 20.0,
-        "max_market_usd": 20.0,
     },
 ]
 STRATEGY_BY_NAME = {s["name"]: s for s in STRATEGIES}
@@ -536,7 +539,8 @@ async def subscribe_asset(asset):
         await ws_send_queue.put({"operation": "subscribe", "assets_ids": [asset]})
 
 async def discovery_loop():
-    specs = (("5m", 300), ("15m", 900))
+    # 15m-only lab: do not waste subscriptions/REST calls on 5m markets.
+    specs = (("15m", 900),)
     while True:
         try:
             n = now_ts()
@@ -1357,7 +1361,7 @@ def make_hourly_report(start_ts, end_ts):
     start_ms, end_ms = start_ts * 1000, end_ts * 1000
     stamp_a = datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime("%Y-%m-%d_%H-%M")
     stamp_b = datetime.fromtimestamp(end_ts, tz=timezone.utc).strftime("%H-%M")
-    zip_path = REPORT_DIR / f"sniper_lab_{stamp_a}_{stamp_b}_UTC.zip"
+    zip_path = REPORT_DIR / f"polybtc_15m_edge_{stamp_a}_{stamp_b}_UTC.zip"
 
     summary_rows = []
     for s in STRATEGIES:
@@ -1391,7 +1395,7 @@ def make_hourly_report(start_ts, end_ts):
         ).fetchall()]
 
     lines = [
-        f"PolyBTC Sniper Lab hourly report",
+        f"PolyBTC 15m Edge Lab hourly report",
         f"Period UTC: {utc_iso(start_ts)} -> {utc_iso(end_ts)}",
         f"Version: {VERSION}",
         "",
@@ -1496,7 +1500,7 @@ async def send_statistics():
             f"PnL {st['realized']:+.2f} | Fees ${st['fees']:.2f} | ROI/cost {roi:+.1f}%\n"
             f"FAK fills {st['fills']}/{st['attempts']} ({fr:.1f}%)"
         )
-    await tg_send("📊 SNIPER LAB STATISTICS\n\n" + "\n\n".join(blocks))
+    await tg_send("📊 15M EDGE LAB STATISTICS\n\n" + "\n\n".join(blocks))
 
 async def send_positions():
     for s in STRATEGIES:
@@ -1541,7 +1545,7 @@ async def handle_tg(text):
     t = text.strip().upper()
     if t in {"/START", "▶️ START", "START"}:
         state_set("trading_enabled", "1")
-        await tg_send("▶️ Sniper Lab STARTED\nPAPER only | 4 independent $500 accounts")
+        await tg_send("▶️ 15m Edge Lab STARTED\nPAPER only | 4 independent $500 accounts")
     elif t in {"⏹ STOP", "STOP", "/STOP"}:
         state_set("trading_enabled", "0")
         await tg_send("⏹ New paper entries stopped. Open positions settle normally.")
@@ -1562,8 +1566,8 @@ async def handle_tg(text):
         await tg_send("🔒 LIVE is deliberately disabled in this research build.")
     else:
         await tg_send(
-            "PolyBTC Sniper Lab\n"
-            "A S5_R10 | B S5_R15 | C S15_R10 | D SCALP15\n"
+            "PolyBTC 15m Edge Lab\n"
+            "A S15_E10_60 | B S15_E125_60 | C S15_E15_60 | D S15_E125_90\n"
             "Each account starts at $500. PAPER only."
         )
 
@@ -1679,7 +1683,7 @@ async def web_server():
 async def main():
     global session
     init_db()
-    session = aiohttp.ClientSession(headers={"User-Agent": "PolyBTCSniperLab/1.0", "Accept": "application/json"})
+    session = aiohttp.ClientSession(headers={"User-Agent": "PolyBTC15mEdgeLab/1.1", "Accept": "application/json"})
     await bootstrap_binance_history()
     tasks = [asyncio.create_task(x()) for x in (
         web_server,

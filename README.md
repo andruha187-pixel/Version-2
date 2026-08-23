@@ -1,88 +1,73 @@
-# PolyBTC Sniper Lab v1.0 — PAPER only
+# PolyBTC 15m Edge Lab v1.1 — PAPER only
 
-Separate research bot adapted to the user's existing Render/Telegram Polymarket setup. It does **not** replace the running M03 A/B/C bot. It tests the public `LukasNSteel/polybtc` stale-quote thesis on the same live Polymarket books with Binance spot + perpetual data.
+This build removes the weak 5-minute sniper accounts and the inactive 15m scalp from v1.0. It concentrates the test on the only branch that was positive in the first half-day sample: 15-minute stale-quote / fair-value entries.
 
-## What the upstream research actually supports
+All four strategies share the exact same Polymarket books, Binance spot/perp state, volatility snapshot and decision loop. Each strategy has a completely independent PAPER account starting at $500.
 
-The public study reports 1,853 resolved BTC Up/Down markets and 3.53M taker executions. Its strongest repeated finding is not generic momentum-following: the useful signal is concentrated in short-lived dislocations where Binance-derived fair value moves before resting Polymarket asks fully reprice. The later go-live review reports 202 paper snipe fills over ~54h, +$2,078 paper PnL, but also ~61% FAK capture and a $407 max drawdown; the authors explicitly say that sample is not enough to justify full live deployment.
+## Four 15-minute experiments
 
-The later June-16 review also supersedes one earlier recommendation: the June-12 study found very large model edges attractive, while live-paper forensics found the 0.20–0.25 edge band toxic and suggested `max_edge=0.20`, `max_ask=0.70`, and `min_take_usd=10`. This lab uses the **later** guardrails.
+### A — `S15_E10_60`
+- 15m only
+- final 60 seconds
+- favorite side only
+- ask 0.50–0.70
+- robust net edge after fee: 0.10–0.20
+- max $25 per take, max $50 per market
 
-Sources:
-- https://github.com/LukasNSteel/polybtc
-- https://github.com/LukasNSteel/polybtc/blob/main/research/REPORT.md
-- https://github.com/LukasNSteel/polybtc/blob/main/research/GO_LIVE_REVIEW_2026-06-16.md
+### B — `S15_E125_60`
+Same as A, but minimum edge is 0.125. This is the middle threshold.
 
-## Four independent $500 accounts
+### C — `S15_E15_60`
+Same as A, but minimum edge is 0.15. This tests whether fewer, stronger dislocations improve quality.
 
-### A — `S5_R10`
-5-minute stale-quote sniper. Final 60 seconds only. Favorite side only. Ask 0.50–0.70. Net robust edge after fee must be 0.10–0.20.
+### D — `S15_E125_90`
+Same 0.125 threshold as B, but the entry window is extended to the final 90 seconds. This isolates the effect of window length without changing the edge threshold.
 
-### B — `S5_R15`
-Same 5-minute sniper but stricter: robust net edge 0.15–0.20. This isolates the high-edge bucket from the more permissive gate.
+This design lets us answer two questions cleanly:
+1. On the same 60-second window, is 10c, 12.5c or 15c the better edge gate?
+2. At the same 12.5c edge gate, is 60s or 90s the better entry window?
 
-### C — `S15_R10`
-Same robust stale-quote logic on 15-minute markets, final 60 seconds, edge 0.10–0.20.
+## Fair-value / fill logic retained from v1.0
 
-### D — `SCALP15`
-15-minute end-window scalp, final 5–30 seconds. Favorite ask 0.90–0.99 and robust fair probability >= 0.997. The upstream study found 5m scalping negative and 15m/1h more promising, so 5m scalp is deliberately excluded.
-
-Each strategy has its own persistent virtual cash balance starting at $500. Cash, trades, settlement PnL, fees, W/L and FAK fill rate are tracked separately.
-
-## Fair-value adaptation
-
-Implemented from the public research description:
-
-`P(Up) = Phi( ln(S/O) / (sigma * sqrt(tau)) )`
-
-with:
-- dual-beta robust bounds: beta `0.83` and `1.36`; a trade must survive the worse regime;
-- two-component Gaussian mixture to reduce tail overconfidence;
-- Polymarket-mid blend, model weight 0.95 in the final minute;
-- fast 60s and slow 10m realized-vol estimates, using the larger one;
-- Binance perpetual-led spot estimate: if the perp quote is fresher, use `perp_mid - rolling_basis`; otherwise use spot;
-- taker fee `shares * 0.07 * p * (1-p)`.
-
-**Important:** `TAIL_WEIGHT=0.15`, `TAIL_SCALE=2.5`, and the precise EWMA half-lives in this package are adaptation defaults, not claimed byte-for-byte copies of upstream `config.yaml`. They are exposed as environment variables so we can calibrate them from our own hourly data instead of pretending they are known exactly.
-
-## More realistic PAPER fills
-
-A qualifying signal does not fill immediately. The lab waits `PAPER_TAKER_LATENCY_MS=400`, then rechecks the live book. If the original cheap ask disappeared, the FAK attempt is rejected. If it remains, only liquidity at or below the original ask is consumed. Sub-$10 fills are rejected. This is intentionally harsher than the older instant-fill simulator.
-
-Sizing follows the upstream idea `edge / (2 * min_edge)`, capped. With the conservative test cap of $25 per take, an edge exactly at threshold asks for ~$12.50 and a full-strength edge asks for $25. Maximum cost per market is $50 for snipers and $20 for the scalp account.
+- dual robust betas 0.83 / 1.36;
+- fast and slow realized volatility, using the conservative value;
+- Binance Spot + Perpetual with rolling basis adjustment;
+- favorite-side only;
+- edge is fair probability minus Polymarket ask minus estimated taker fee;
+- 400ms PAPER taker latency by default;
+- after the latency the original quote must still be available or the attempt is recorded as a FAK miss;
+- liquidity is consumed only at or below the committed ask;
+- sub-$10 fills are rejected.
 
 ## Telegram
 
-Buttons:
-- START / STOP
-- BALANCE — all four accounts separately
-- STATISTICS — separate W/L, PnL, fees, ROI-on-cost and FAK fill rate
-- POSITIONS — separate open positions
-- TRADES — separate last-10 messages for each strategy
-- REPORT — ZIP for the last completed UTC hour
+`BALANCE`, `STATISTICS`, `POSITIONS`, and `TRADES` are reported separately for A/B/C/D. At each completed UTC hour the bot sends a ZIP with:
 
-At every UTC hour the bot automatically sends a ZIP containing:
 - `summary.csv`
 - `trades.csv`
 - `signals.csv`
 - `results.csv`
 - `report.txt`
 
-The hourly `signals.csv` is especially important: it preserves fair value, robust probability, edge, spot/perp/effective BTC prices and fast/slow vol so we can diagnose why a strategy won or lost.
+The `signals.csv` file contains fair probabilities, edge, volatility, effective Binance price and FAK result for later analysis.
+
+## New database
+
+`/var/data/polybtc_15m_edge_lab_v1_1.db`
+
+This intentionally does not reuse v1.0 results. Every strategy starts a clean $500 test.
 
 ## Render
 
-1. Put `main.py`, `requirements.txt`, `.env.example` in a new repo/service.
-2. Build: `pip install -r requirements.txt`
-3. Start: `python main.py`
+1. Upload `main.py`, `requirements.txt`, `.env.example`.
+2. Build command: `pip install -r requirements.txt`
+3. Start command: `python main.py`
 4. Persistent disk: `/var/data`
-5. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
-6. Keep this service PAPER-only. There is no LIVE path in this build.
+5. Configure `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
+6. In Telegram press `START` after deployment.
 
-New DB: `/var/data/polybtc_sniper_lab_v1.db`.
+Expected log:
 
-## Expected startup log
+`1.1-polybtc-15m-edge-lab-paper started | PAPER ONLY | S15_E10_60=$500.00, S15_E125_60=$500.00, S15_E15_60=$500.00, S15_E125_90=$500.00`
 
-`1.0-polybtc-sniper-lab-paper started | PAPER ONLY | S5_R10=$500.00, S5_R15=$500.00, S15_R10=$500.00, SCALP15=$500.00`
-
-Do not judge the strategy from one or two hours. The upstream results themselves were fat-tailed and concentrated in a few windows; compare at least several days and pay special attention to FAK capture rate and maximum drawdown.
+Keep this PAPER-only until enough 15m fills are collected. The first v1.0 sample had only two filled 15m trades, so it was promising but far too small to infer profitability.
