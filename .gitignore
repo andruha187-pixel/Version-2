@@ -1,7 +1,8 @@
 .env
 __pycache__/
 *.pyc
-data/
-*.db
-*.db-wal
-*.db-shm
+.venv/
+venv/
+data/*.db
+logs/*.log
+.DS_Store

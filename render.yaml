@@ -1,13 +1,13 @@
 services:
-  - type: web
-    name: strategy-binance-v2
-    runtime: python
+  - type: worker
+    name: polymarket-btc-bot
+    env: python
     plan: starter
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
-    healthCheckPath: /health
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m src.main"
     envVars:
-      - key: DATA_DIR
-        value: /var/data
-      - key: BINANCE_SYMBOL
-        value: btcusdt
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # Остальные переменные (POLY_PRIVATE_KEY, TELEGRAM_BOT_TOKEN и т.д.)
+      # задаются вручную в Render Dashboard -> Environment, не в этом файле —
+      # секреты в render.yaml коммитить нельзя.
