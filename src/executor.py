@@ -50,14 +50,20 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
             f"вход заблокирован до конца дня. Поменять лимит можно в 🛑 Стоп-лосс в меню."
         )
         return
+    if storage.count_open_trades() >= settings.MAX_OPEN_POSITIONS:
+        # Общий потолок по ВСЕМ активам/таймфреймам разом — при нескольких
+        # параллельных потоках несколько сигналов могут совпасть по времени.
+        return
 
     base_size = runtime_state.get("trade_size_usdc")
     score_threshold = runtime_state.get("safety_score_threshold")
-    trade_size = _scale_trade_size(base_size, decision.safety_score, score_threshold)
+    if runtime_state.get("size_scaling_enabled"):
+        trade_size = _scale_trade_size(base_size, decision.safety_score, score_threshold)
+    else:
+        trade_size = base_size
     dry_run = runtime_state.get("dry_run")
 
     token_id = market.up_token_id if decision.direction == "UP" else market.down_token_id
-    size_shares = round(trade_size / decision.entry_price, 2)
 
     # Между тем, как strategy.evaluate() прочитала ask, и моментом реальной
     # отправки ордера проходит какое-то время (сеть + подпись). Даём себе
@@ -72,9 +78,11 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
     order_id = "dry-run"
     if not dry_run:
         try:
-            resp = polymarket_client.place_buy_order(token_id, execution_price, size_shares)
-            order_id = resp.get("orderID") or resp.get("order_id") or str(resp)
-            status = resp.get("status", "SUBMITTED")
+            # amount_usdc — это ДОЛЛАРОВАЯ сумма для BUY market-ордера, не
+            # количество акций: конвертация не нужна, SDK делает это сам.
+            resp = await polymarket_client.place_buy_order(token_id, execution_price, trade_size, tick)
+            order_id = polymarket_client.response_field(resp, "order_id") or polymarket_client.response_field(resp, "orderID") or str(resp)
+            status = polymarket_client.response_field(resp, "status") or "SUBMITTED"
         except Exception as exc:  # noqa: BLE001 — любая ошибка биржи не должна ронять бота
             await telegram_notify.notify(f"❌ Ошибка при выставлении ордера: {exc}")
             return
@@ -96,6 +104,21 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
         f"(тик {tick:g}) | Размер: {trade_size:.2f} из {base_size:.0f} USDC (score {decision.safety_score}/{score_threshold:.0f})\n"
         f"Расхождение: {decision.distance_atr} ATR | До конца рынка: {decision.minutes_left:.1f} мин"
     )
+
+
+async def label_resolved_markets(exclude_slugs: set[str] | None = None) -> None:
+    """
+    Подписывает исходом ВСЕ ещё не подписанные сигналы прошлых рынков —
+    основа для отчёта/анализа: без метки "что реально произошло" по
+    каждому тику нельзя понять, какой сигнал был бы правильным, даже если
+    бот в тот рынок не входил. exclude_slugs — слаги сейчас активных
+    рынков по ВСЕМ активам/таймфреймам (их исход ещё не может быть
+    известен, спрашивать API бессмысленно).
+    """
+    for slug in storage.get_markets_needing_outcome(exclude_slugs=exclude_slugs, limit=10):
+        outcome = await get_resolution(slug)
+        if outcome:
+            storage.label_signals_outcome(slug, outcome)
 
 
 async def settle_resolved_trades() -> None:
