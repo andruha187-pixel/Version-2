@@ -77,6 +77,14 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
     status = "DRY_RUN"
     order_id = "dry-run"
     if not dry_run:
+        if not settings.POLY_PRIVATE_KEY:
+            # Не должно случиться благодаря проверкам в telegram_notify/main.py,
+            # но лучше явная ошибка тут, чем AttributeError глубоко внутри SDK.
+            await telegram_notify.notify(
+                "❌ LIVE включён, но POLY_PRIVATE_KEY не задан — вход пропущен. "
+                "Проверь переменные окружения и передеплой."
+            )
+            return
         try:
             # amount_usdc — это ДОЛЛАРОВАЯ сумма для BUY market-ордера, не
             # количество акций: конвертация не нужна, SDK делает это сам.
@@ -96,6 +104,7 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
         order_id=order_id,
         status=status,
         dry_run=dry_run,
+        token_id=token_id,
     )
 
     await telegram_notify.notify(
@@ -122,7 +131,7 @@ async def label_resolved_markets(exclude_slugs: set[str] | None = None) -> None:
 
 
 async def settle_resolved_trades() -> None:
-    for trade_id, market_slug, condition_id, direction, entry_price, size_usdc, dry_run in storage.get_unsettled_trades():
+    for trade_id, market_slug, condition_id, direction, entry_price, size_usdc, dry_run, token_id in storage.get_unsettled_trades():
         outcome = await get_resolution(market_slug)
         if outcome is None:
             continue
@@ -137,4 +146,65 @@ async def settle_resolved_trades() -> None:
             f"{emoji} Рынок {market_slug} зарезолвился: {outcome}. "
             f"Наша ставка: {direction}. PnL: {pnl:+.2f} USDC"
             + (" (dry run)" if dry_run else "")
+        )
+
+
+async def check_position_stop_losses() -> None:
+    """
+    Стоп-лосс ОТДЕЛЬНОЙ позиции в процентах (не дневной!) — включается и
+    настраивается кнопкой в Telegram. Пока рынок ещё не зарезолвился, но
+    цена ушла против нас настолько, что текущая стоимость позиции упала на
+    position_stop_loss_pct% и больше от суммы входа — закрываем продажей
+    прямо сейчас, не дожидаясь исхода, чтобы не рисковать потерять 100%.
+
+    Оценка stops по best bid из живого стакана (book_stream) — тот же
+    источник, что и для входа, без лишнего REST-запроса, если стакан свежий.
+    """
+    if not runtime_state.get("position_stop_loss_enabled"):
+        return
+    stop_pct = runtime_state.get("position_stop_loss_pct")
+
+    for trade_id, market_slug, condition_id, direction, entry_price, size_usdc, dry_run, token_id in storage.get_unsettled_trades():
+        if not token_id:
+            continue  # старые сделки до появления этого поля — пропускаем, не падаем
+
+        book = await polymarket_client.get_orderbook_cached(token_id)
+        if book.best_bid is None:
+            continue  # нет ставок на продажу прямо сейчас — не с чем сравнивать
+
+        shares = size_usdc / entry_price
+        current_value = shares * book.best_bid
+        loss_pct = (current_value - size_usdc) / size_usdc * 100  # отрицательное число при убытке
+
+        if loss_pct > -abs(stop_pct):
+            continue  # просадка ещё не достигла порога
+
+        pnl_estimate = current_value - size_usdc
+
+        if dry_run:
+            storage.settle_trade(trade_id, "STOPPED", pnl_estimate)
+            await telegram_notify.notify(
+                f"🧪 [DRY RUN] 📉 Стоп-лосс позиции сработал бы: {market_slug} ({direction})\n"
+                f"Просадка {loss_pct:.1f}% (порог {stop_pct:.0f}%) | Оценка PnL: {pnl_estimate:+.2f} USDC"
+            )
+            continue
+
+        if not settings.POLY_PRIVATE_KEY:
+            await telegram_notify.notify(
+                f"❌ Стоп-лосс сработал для {market_slug}, но POLY_PRIVATE_KEY не задан — "
+                "продать не могу. Проверь переменные окружения."
+            )
+            continue
+
+        try:
+            resp = await polymarket_client.place_sell_order(token_id, shares, min_price=book.best_bid * 0.98)
+        except Exception as exc:  # noqa: BLE001
+            await telegram_notify.notify(f"❌ Не удалось закрыть позицию по стоп-лоссу ({market_slug}): {exc}")
+            continue
+
+        status = polymarket_client.response_field(resp, "status") or "SOLD"
+        storage.settle_trade(trade_id, "STOPPED", pnl_estimate)
+        await telegram_notify.notify(
+            f"📉 Стоп-лосс сработал: {market_slug} ({direction}) продано по ~{book.best_bid:.3f}\n"
+            f"Просадка {loss_pct:.1f}% (порог {stop_pct:.0f}%) | Оценка PnL: {pnl_estimate:+.2f} USDC | статус: {status}"
         )
