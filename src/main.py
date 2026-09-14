@@ -116,12 +116,10 @@ async def _instance_loop(asset: str, timeframe: TimeframeProfile) -> None:
 
 async def settlement_loop() -> None:
     """Общая (не привязанная к конкретному активу) фоновая задача: резолюция
-    сделок, стоп-лосс открытых позиций и разметка исходов сигналов по всем
-    потокам разом."""
+    сделок и разметка исходов сигналов по всем потокам разом."""
     while True:
         try:
             await executor.settle_resolved_trades()
-            await executor.check_position_stop_losses()
             await executor.label_resolved_markets(exclude_slugs=set(_active_slugs.values()))
         except Exception as exc:  # noqa: BLE001
             log.exception("Ошибка в settlement_loop: %s", exc)
@@ -133,15 +131,6 @@ async def main():
     storage.init_db()
     runtime_state.init_from_db()
 
-    # Защита от "тихого" LIVE без ключа: если в БД с прошлого раза сохранён
-    # LIVE-режим, а сейчас POLY_PRIVATE_KEY не задан (новый хостинг, забыли
-    # перенести переменную и т.п.) — принудительно откатываемся в DRY RUN,
-    # а не пытаемся торговать клиентом без прав на ордера.
-    forced_back_to_dry_run = False
-    if not runtime_state.get("dry_run") and not settings.POLY_PRIVATE_KEY:
-        runtime_state.set("dry_run", True)
-        forced_back_to_dry_run = True
-
     app = telegram_notify.build_app()
     async with app:
         await app.start()
@@ -151,16 +140,10 @@ async def main():
         dry_run = runtime_state.get("dry_run")
         assets_line = ", ".join(a.upper() for a in settings.ASSETS)
         timeframes_line = ", ".join(tf.label for tf in TIMEFRAMES)
-        forced_note = (
-            "\n⚠️ Был сохранён LIVE-режим с прошлого раза, но POLY_PRIVATE_KEY сейчас не задан — "
-            "принудительно откатил в DRY RUN, чтобы не пытаться торговать без ключа."
-            if forced_back_to_dry_run else ""
-        )
         await telegram_notify.notify(
             f"🤖 Бот запущен. Режим: {'DRY RUN (без реальных сделок)' if dry_run else 'LIVE — реальные сделки!'}\n"
             f"Активы: {assets_line}\nТаймфреймы: {timeframes_line}\n"
             f"Открой /menu для управления (старт/стоп, размер позиции, стоп-лосс, настройки)."
-            f"{forced_note}"
         )
 
         book_stream_task = None

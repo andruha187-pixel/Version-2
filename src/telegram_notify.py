@@ -23,7 +23,6 @@ _pending_input: str | None = None  # "size" | "stoploss" | None — ждём л�
 
 SIZE_PRESETS = [5, 10, 20, 50, 100]
 STOPLOSS_PRESETS = [20, 50, 100, 200]
-POSITION_SL_PRESETS = [20, 30, 50, 70]
 SCORE_PRESETS = [65, 75, 85, 90]
 
 
@@ -38,14 +37,12 @@ def _main_menu_text() -> str:
     s = _state_ref  # dict: "asset:timeframe" -> instance state
     paused = runtime_state.get("paused")
     dry_run = runtime_state.get("dry_run")
-    pos_sl_on = runtime_state.get("position_stop_loss_enabled")
     lines = [
         "🤖 *Polymarket Multi-Asset Bot*",
         "",
         f"Статус: {'⏸ на паузе' if paused else '▶️ активен'} | Режим: {'🧪 DRY RUN' if dry_run else '🔴 LIVE'}",
         f"Размер позиции: {runtime_state.get('trade_size_usdc'):.0f} USDC",
-        f"Стоп-лосс/день: {runtime_state.get('daily_loss_limit_usdc'):.0f} USDC",
-        f"Стоп-лосс позиции: {'вкл ' + str(round(runtime_state.get('position_stop_loss_pct'))) + '%' if pos_sl_on else 'выкл'}",
+        f"Стоп-лосс: {runtime_state.get('daily_loss_limit_usdc'):.0f} USDC/день",
         f"Safety score порог: {runtime_state.get('safety_score_threshold'):.0f}",
     ]
     if s:
@@ -67,10 +64,7 @@ def _main_menu_markup() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("▶️ Старт" if paused else "⏸ Стоп", callback_data="pause_toggle")],
         [
             InlineKeyboardButton("💰 Размер позиции", callback_data="menu:size"),
-            InlineKeyboardButton("🛑 Стоп-лосс/день", callback_data="menu:sl"),
-        ],
-        [
-            InlineKeyboardButton("📉 Стоп-лосс позиции", callback_data="menu:possl"),
+            InlineKeyboardButton("🛑 Стоп-лосс", callback_data="menu:sl"),
         ],
         [
             InlineKeyboardButton("📊 Статистика", callback_data="stats"),
@@ -118,31 +112,6 @@ def _stoploss_menu_markup() -> InlineKeyboardMarkup:
         InlineKeyboardButton("+10", callback_data="sl_delta:+10"),
     ])
     rows.append([InlineKeyboardButton("✏️ Свой лимит", callback_data="sl_custom")])
-    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
-    return InlineKeyboardMarkup(rows)
-
-
-def _position_sl_menu_markup() -> InlineKeyboardMarkup:
-    current = runtime_state.get("position_stop_loss_pct")
-    enabled = runtime_state.get("position_stop_loss_enabled")
-    row = []
-    rows = []
-    for val in POSITION_SL_PRESETS:
-        mark = "✅ " if abs(val - current) < 0.01 else ""
-        row.append(InlineKeyboardButton(f"{mark}{val}%", callback_data=f"possl_set:{val}"))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([
-        InlineKeyboardButton("−5", callback_data="possl_delta:-5"),
-        InlineKeyboardButton("+5", callback_data="possl_delta:+5"),
-    ])
-    rows.append([InlineKeyboardButton("✏️ Свой процент", callback_data="possl_custom")])
-    rows.append([InlineKeyboardButton(
-        "🔴 Выключить" if enabled else "🟢 Включить", callback_data="possl_toggle",
-    )])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -275,14 +244,7 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif _pending_input == "stoploss":
         runtime_state.set("daily_loss_limit_usdc", value)
         _pending_input = None
-        await update.message.reply_text(f"✅ Стоп-лосс/день: {value:.2f} USDC", reply_markup=_stoploss_menu_markup())
-    elif _pending_input == "position_sl":
-        value = min(99.0, value)  # 100%+ бессмысленно — это уже полная потеря
-        runtime_state.set("position_stop_loss_pct", value)
-        _pending_input = None
-        await update.message.reply_text(
-            f"✅ Стоп-лосс позиции: {value:.1f}%", reply_markup=_position_sl_menu_markup(),
-        )
+        await update.message.reply_text(f"✅ Стоп-лосс: {value:.2f} USDC/день", reply_markup=_stoploss_menu_markup())
 
 
 # ------------------------------------------------------------- кнопки -----
@@ -304,17 +266,6 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🛑 Дневной стоп-лосс: {runtime_state.get('daily_loss_limit_usdc'):.0f} USDC.\n"
             "При достижении убытка на эту сумму за день бот перестаёт открывать новые позиции до полуночи.",
             reply_markup=_stoploss_menu_markup(),
-        )
-
-    elif data == "menu:possl":
-        enabled = runtime_state.get("position_stop_loss_enabled")
-        await query.edit_message_text(
-            f"📉 Стоп-лосс ОТДЕЛЬНОЙ позиции: {'🟢 включён' if enabled else '🔴 выключен'}, "
-            f"порог {runtime_state.get('position_stop_loss_pct'):.0f}%.\n\n"
-            "Если стоимость открытой позиции (по текущей цене в стакане) падает на этот "
-            "процент от суммы входа ещё ДО резолюции рынка — бот продаёт её досрочно, "
-            "не дожидаясь исхода. Это отдельно от дневного лимита в USDC.",
-            reply_markup=_position_sl_menu_markup(),
         )
 
     elif data == "menu:settings":
@@ -369,33 +320,6 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:sl")]]),
         )
 
-    elif data.startswith("possl_set:"):
-        val = float(data.split(":", 1)[1])
-        runtime_state.set("position_stop_loss_pct", val)
-        await query.edit_message_text(f"✅ Стоп-лосс позиции: {val:.0f}%", reply_markup=_position_sl_menu_markup())
-
-    elif data.startswith("possl_delta:"):
-        delta = float(data.split(":", 1)[1])
-        new_val = min(99.0, max(1.0, runtime_state.get("position_stop_loss_pct") + delta))
-        runtime_state.set("position_stop_loss_pct", new_val)
-        await query.edit_message_text(
-            f"✅ Стоп-лосс позиции: {new_val:.0f}%", reply_markup=_position_sl_menu_markup(),
-        )
-
-    elif data == "possl_custom":
-        _pending_input = "position_sl"
-        await query.edit_message_text(
-            "✏️ Напиши процент просадки следующим сообщением, например: 40",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:possl")]]),
-        )
-
-    elif data == "possl_toggle":
-        new_val = not runtime_state.get("position_stop_loss_enabled")
-        runtime_state.set("position_stop_loss_enabled", new_val)
-        msg = (f"🟢 Стоп-лосс позиции включён, порог {runtime_state.get('position_stop_loss_pct'):.0f}%."
-               if new_val else "🔴 Стоп-лосс позиции выключен — позиции держим до резолюции рынка в любом случае.")
-        await query.edit_message_text(msg, reply_markup=_position_sl_menu_markup())
-
     elif data.startswith("score_delta:"):
         delta = float(data.split(":", 1)[1])
         new_val = min(100.0, max(0.0, runtime_state.get("safety_score_threshold") + delta))
@@ -421,13 +345,6 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "mode_toggle":
         if runtime_state.get("dry_run"):
-            if not settings.POLY_PRIVATE_KEY:
-                await query.edit_message_text(
-                    "❌ Нельзя включить LIVE: POLY_PRIVATE_KEY не задан в переменных окружения.\n"
-                    "Добавь ключ и передеплой бота, потом попробуй снова.",
-                    reply_markup=_main_menu_markup(),
-                )
-                return
             # DRY RUN -> LIVE — это реальные деньги, спрашиваем подтверждение
             await query.edit_message_text(
                 "⚠️ Включить LIVE-режим? Бот начнёт выставлять реальные ордера на Polymarket.",
@@ -441,14 +358,6 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     elif data == "mode_confirm_live":
-        if not settings.POLY_PRIVATE_KEY:
-            # Двойная защита: ключ мог пропасть между нажатием "Старт" и подтверждением
-            # (например, кто-то параллельно поменял env и не передеплоил).
-            await query.edit_message_text(
-                "❌ Нельзя включить LIVE: POLY_PRIVATE_KEY не задан. Остаёмся в DRY RUN.",
-                reply_markup=_main_menu_markup(),
-            )
-            return
         runtime_state.set("dry_run", False)
         await query.edit_message_text(
             "🔴 LIVE включён. Бот будет выставлять реальные ордера на реальные деньги.",
