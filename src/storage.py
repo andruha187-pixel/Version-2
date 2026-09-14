@@ -75,6 +75,10 @@ _SIGNALS_MIGRATIONS = [
     ("timeframe", "TEXT"),
 ]
 
+_TRADES_MIGRATIONS = [
+    ("token_id", "TEXT"),
+]
+
 
 @contextmanager
 def _conn():
@@ -94,6 +98,10 @@ def init_db():
         for col, sql_type in _SIGNALS_MIGRATIONS:
             if col not in existing:
                 conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {sql_type}")
+        existing_trades = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
+        for col, sql_type in _TRADES_MIGRATIONS:
+            if col not in existing_trades:
+                conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {sql_type}")
 
 
 def log_signal(market_slug: str, current_price: float, strike_price: float, decision,
@@ -159,15 +167,15 @@ def get_markets_needing_outcome(exclude_slugs: set[str] | None, limit: int = 50)
 
 
 def log_trade(market_slug: str, condition_id: str, direction: str, entry_price: float,
-              size_usdc: float, order_id: str, status: str, dry_run: bool) -> int:
+              size_usdc: float, order_id: str, status: str, dry_run: bool, token_id: str = "") -> int:
     with _conn() as conn:
         cur = conn.execute(
             """INSERT INTO trades
                (ts, market_slug, condition_id, direction, entry_price, size_usdc,
-                order_id, status, outcome, pnl_usdc, dry_run)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)""",
+                order_id, status, outcome, pnl_usdc, dry_run, token_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)""",
             (int(time.time()), market_slug, condition_id, direction, entry_price,
-             size_usdc, order_id, status, int(dry_run)),
+             size_usdc, order_id, status, int(dry_run), token_id),
         )
         return cur.lastrowid
 
@@ -212,7 +220,7 @@ def parse_market_slug(slug: str) -> tuple[str, str]:
 def get_unsettled_trades():
     with _conn() as conn:
         cur = conn.execute(
-            "SELECT id, market_slug, condition_id, direction, entry_price, size_usdc, dry_run "
+            "SELECT id, market_slug, condition_id, direction, entry_price, size_usdc, dry_run, token_id "
             "FROM trades WHERE outcome IS NULL",
         )
         return cur.fetchall()
@@ -282,7 +290,7 @@ SIGNALS_COLUMNS = [
 
 TRADES_COLUMNS = [
     "id", "ts", "market_slug", "condition_id", "direction", "entry_price", "size_usdc",
-    "order_id", "status", "outcome", "pnl_usdc", "dry_run",
+    "order_id", "status", "outcome", "pnl_usdc", "dry_run", "token_id",
 ]
 
 

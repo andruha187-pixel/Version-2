@@ -105,21 +105,40 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
 
 async def _instance_loop(asset: str, timeframe: TimeframeProfile) -> None:
     key = f"{asset}:{timeframe.label}"
+    consecutive_failures = 0
+    notified_dead = False
     while True:
         try:
             await _instance_tick(asset, timeframe)
+            consecutive_failures = 0
+            notified_dead = False
         except Exception as exc:  # noqa: BLE001 — один сломанный поток не должен ронять остальные
-            log.exception("Ошибка в потоке %s: %s", key, exc)
-            # Не спамим Telegram при каждом сбое одного из 12 потоков — только раз в N попыток.
-        await asyncio.sleep(timeframe.poll_interval_seconds)
+            consecutive_failures += 1
+            log.exception("Ошибка в потоке %s (%d подряд): %s", key, consecutive_failures, exc)
+            if consecutive_failures == 10 and not notified_dead:
+                # После 10 неудач подряд это, скорее всего, не временный сбой сети, а
+                # актив/таймфрейм, для которого рынка просто не существует (например,
+                # у XRP на момент написания нет часового Up/Down рынка) — не спамим
+                # логи и Telegram вечно, а один раз сообщаем и переходим на редкий опрос.
+                notified_dead = True
+                await telegram_notify.notify(
+                    f"⚠️ Поток {key} не может найти рынок уже {consecutive_failures} попыток подряд "
+                    f"({exc}). Похоже, этого рынка не существует для данного актива/таймфрейма. "
+                    f"Перехожу на редкий опрос (раз в 10 минут), остальные потоки не затронуты."
+                )
+
+        sleep_for = timeframe.poll_interval_seconds if consecutive_failures < 10 else 600
+        await asyncio.sleep(sleep_for)
 
 
 async def settlement_loop() -> None:
     """Общая (не привязанная к конкретному активу) фоновая задача: резолюция
-    сделок и разметка исходов сигналов по всем потокам разом."""
+    сделок, стоп-лосс открытых позиций и разметка исходов сигналов по всем
+    потокам разом."""
     while True:
         try:
             await executor.settle_resolved_trades()
+            await executor.check_position_stop_losses()
             await executor.label_resolved_markets(exclude_slugs=set(_active_slugs.values()))
         except Exception as exc:  # noqa: BLE001
             log.exception("Ошибка в settlement_loop: %s", exc)
@@ -131,6 +150,15 @@ async def main():
     storage.init_db()
     runtime_state.init_from_db()
 
+    # Защита от "тихого" LIVE без ключа: если в БД с прошлого раза сохранён
+    # LIVE-режим, а сейчас POLY_PRIVATE_KEY не задан (новый хостинг, забыли
+    # перенести переменную и т.п.) — принудительно откатываемся в DRY RUN,
+    # а не пытаемся торговать клиентом без прав на ордера.
+    forced_back_to_dry_run = False
+    if not runtime_state.get("dry_run") and not settings.POLY_PRIVATE_KEY:
+        runtime_state.set("dry_run", True)
+        forced_back_to_dry_run = True
+
     app = telegram_notify.build_app()
     async with app:
         await app.start()
@@ -140,10 +168,16 @@ async def main():
         dry_run = runtime_state.get("dry_run")
         assets_line = ", ".join(a.upper() for a in settings.ASSETS)
         timeframes_line = ", ".join(tf.label for tf in TIMEFRAMES)
+        forced_note = (
+            "\n⚠️ Был сохранён LIVE-режим с прошлого раза, но POLY_PRIVATE_KEY сейчас не задан — "
+            "принудительно откатил в DRY RUN, чтобы не пытаться торговать без ключа."
+            if forced_back_to_dry_run else ""
+        )
         await telegram_notify.notify(
             f"🤖 Бот запущен. Режим: {'DRY RUN (без реальных сделок)' if dry_run else 'LIVE — реальные сделки!'}\n"
             f"Активы: {assets_line}\nТаймфреймы: {timeframes_line}\n"
             f"Открой /menu для управления (старт/стоп, размер позиции, стоп-лосс, настройки)."
+            f"{forced_note}"
         )
 
         book_stream_task = None

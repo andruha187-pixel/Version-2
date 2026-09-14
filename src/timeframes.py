@@ -21,10 +21,12 @@
   ближе к экспирации, так что верхняя граница (сколько минут ДО конца всё
   ещё можно входить) не растягивается пропорционально — оставляем более
   консервативный запас на развороты в последние 10 минут.
-- **discovery_mode="series"**: часовые рынки Polymarket выровнены по
-  границам Eastern Time (которые сдвигаются из-за перехода на летнее
-  время), а не по чистой UTC-сетке — детерминированно вычислить слаг
-  нельзя, только спросить у Gamma API, какой рынок сейчас активен.
+- **discovery_mode="hourly_et_named"**: у часовых рынков Polymarket
+  СОВСЕМ ДРУГОЙ формат слага, не unix-таймстемп, а человекочитаемый и
+  привязанный к Eastern Time: `bitcoin-up-or-down-september-13-2026-8pm-et`.
+  Плюс часть активов называется полным именем, а не тикером (bitcoin,
+  ethereum, solana — но xrp, bnb, hype как тикер). Обнаружено эмпирически
+  через сайт Polymarket, не из документации — см. src/market_discovery.py.
 - **Опрос реже** (30с вместо 5с) — часовой рынок меняется гораздо
   медленнее, незачем дёргать API так же часто, как для 15-минутного.
 
@@ -64,7 +66,7 @@ class TimeframeProfile:
     max_minutes_left: float
     atr_distance_mult: float
     atr_spike_mult: float
-    discovery_mode: str            # "deterministic" | "series"
+    discovery_mode: str            # "deterministic" | "hourly_et_named" | "series"
     poll_interval_seconds: int
 
 
@@ -96,7 +98,7 @@ TIMEFRAMES: list[TimeframeProfile] = [
         max_minutes_left=_f("TF_1H_MAX_MINUTES_LEFT", 45.0),
         atr_distance_mult=_f("TF_1H_ATR_DISTANCE_MULT", 1.3),
         atr_spike_mult=_f("TF_1H_ATR_SPIKE_MULT", 2.2),
-        discovery_mode="series",
+        discovery_mode="hourly_et_named",
         poll_interval_seconds=_i("TF_1H_POLL_SECONDS", 20),
     ),
 ]

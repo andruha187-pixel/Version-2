@@ -2,29 +2,45 @@
 Поиск текущего активного Up/Down рынка на Polymarket — по активу и профилю
 таймфрейма (см. src/timeframes.py).
 
-Два режима обнаружения:
+Режимы обнаружения:
 - "deterministic" (15m и короче): слаг вычисляется как
   {asset}-updown-{label}-<unix_ts_начала_окна>, окна выровнены по чистой
   UTC-сетке floor(now / interval) * interval. Быстро, без лишнего запроса.
-- "series" (1h и длиннее): часовые (и более длинные) рынки Polymarket
-  выровнены по границам Eastern Time, которые сдвигаются между EST/EDT —
-  детерминированно вычислить слаг нельзя, только спросить Gamma API,
-  какой рынок сейчас активен, через серию (series_slug + closed=false).
-
-Slug серии пробуем в двух написаниях ("asset-up-or-down-label" и
-"asset-updown-label") — в документации Polymarket это не зафиксировано
-единообразно, а ошибиться тут значит вообще не найти активный рынок.
+- "hourly_et_named" (1h): у часовых рынков СОВСЕМ ДРУГОЙ формат слага —
+  человекочитаемый, по Eastern Time, и с полным/особым именем актива, а не
+  тикером: "bitcoin-up-or-down-september-13-2026-8pm-et" (не unix-таймстемп,
+  как у 5m/15m/4h!). Обнаружено эмпирически через сайт Polymarket — окна
+  выровнены по границам ET (сдвигаются между EST/EDT), поэтому вычисляем
+  через zoneinfo, а не через простой floor() по UTC-эпохе.
+- "series" — резервный путь (используется, если построенный по правилам
+  выше слаг не найден): спрашиваем Gamma API по series_slug + closed=false.
 """
 from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 
 from config import settings
 from src import binance_feed
 from src.timeframes import TimeframeProfile
+
+_ET = ZoneInfo("America/New_York")
+
+# У часовых рынков в слаге не всегда короткий тикер — часть активов Polymarket
+# называет полным именем. Проверено по факту (fetch сайта): bitcoin, ethereum,
+# solana — полным именем; xrp, bnb, hype — как тикер.
+HOURLY_ASSET_NAMES = {
+    "btc": "bitcoin",
+    "eth": "ethereum",
+    "sol": "solana",
+    "xrp": "xrp",
+    "bnb": "bnb",
+    "hype": "hype",
+}
 
 
 @dataclass
@@ -51,6 +67,28 @@ def _expected_slug(asset: str, label: str, start_ts: int) -> str:
     return f"{asset}-updown-{label}-{start_ts}"
 
 
+def _hourly_et_window(now: float | None = None) -> tuple[int, int]:
+    """Часовые рынки выровнены по началу часа В Eastern Time, а не UTC."""
+    now = now if now is not None else time.time()
+    dt_et = datetime.fromtimestamp(now, tz=timezone.utc).astimezone(_ET)
+    start_et = dt_et.replace(minute=0, second=0, microsecond=0)
+    start_ts = int(start_et.astimezone(timezone.utc).timestamp())
+    return start_ts, start_ts + 3600
+
+
+def _hourly_slug(asset: str, start_ts: int) -> str:
+    """'bitcoin-up-or-down-september-13-2026-8pm-et' — по времени НАЧАЛА
+    часа в Eastern Time, человекочитаемо, без unix-таймстемпа."""
+    name = HOURLY_ASSET_NAMES.get(asset.lower(), asset.lower())
+    dt_et = datetime.fromtimestamp(start_ts, tz=timezone.utc).astimezone(_ET)
+    month = dt_et.strftime("%B").lower()
+    day = dt_et.day
+    year = dt_et.year
+    hour12 = dt_et.strftime("%I").lstrip("0") or "12"
+    ampm = dt_et.strftime("%p").lower()
+    return f"{name}-up-or-down-{month}-{day}-{year}-{hour12}{ampm}-et"
+
+
 async def _fetch_event_by_slug(slug: str) -> dict | None:
     url = f"{settings.GAMMA_HOST}/events"
     params = {"slug": slug}
@@ -75,8 +113,9 @@ async def _fetch_events_by_series(series_slug: str) -> list[dict]:
 
 
 async def _fetch_active_from_series(asset: str, label: str, interval_minutes: int) -> dict | None:
-    """Ищем событие, окно которого содержит 'сейчас', пробуя оба варианта
-    написания series_slug — источники по Polymarket расходятся."""
+    """Резервный путь (если детерминированный/ET-слаг не сработал): ищем
+    событие, окно которого содержит 'сейчас', пробуя оба варианта написания
+    series_slug — источники по Polymarket расходятся."""
     candidates = [f"{asset}-up-or-down-{label}", f"{asset}-updown-{label}"]
 
     events: list[dict] = []
@@ -112,7 +151,6 @@ def _parse_timestamp(value) -> int | None:
     except (TypeError, ValueError):
         pass
     try:
-        from datetime import datetime
         return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
     except (ValueError, TypeError):
         return None
@@ -148,14 +186,26 @@ async def get_active_market(asset: str, timeframe: TimeframeProfile) -> ActiveMa
 
     event = None
     matched_by_slug = False
+    start_ts = end_ts = None
 
     if timeframe.discovery_mode == "deterministic":
         start_ts, end_ts = _window_bounds(timeframe.interval_minutes)
         slug = _expected_slug(asset, label, start_ts)
         event = await _fetch_event_by_slug(slug)
         matched_by_slug = event is not None
-    else:
-        start_ts = end_ts = None  # заполнится из события ниже
+
+    elif timeframe.discovery_mode == "hourly_et_named":
+        # Пробуем текущий час по ET, а на всякий случай (граничные эффекты
+        # округления) — соседние часы, прежде чем падать в резервный путь.
+        now = time.time()
+        for offset_hours in (0, -1, 1):
+            start_ts, end_ts = _hourly_et_window(now + offset_hours * 3600)
+            slug = _hourly_slug(asset, start_ts)
+            event = await _fetch_event_by_slug(slug)
+            if event is not None and start_ts <= now < end_ts:
+                matched_by_slug = True
+                break
+            event = None
 
     if event is None:
         event = await _fetch_active_from_series(asset, label, timeframe.interval_minutes)
