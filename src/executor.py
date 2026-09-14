@@ -65,17 +65,6 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
 
     token_id = market.up_token_id if decision.direction == "UP" else market.down_token_id
 
-    # Проверяем реальную глубину стакана ПЕРЕД отправкой — FOK отменяет
-    # ордер целиком, если не может закрыть всю сумму по цене не хуже
-    # потолка. Если объём меньше запрошенного — торгуем тем, что реально
-    # есть (с запасом на случай, что часть заберут раньше нас), а не
-    # отправляем заведомо обречённый на отмену ордер на полную сумму.
-    available_liquidity = book_stream.ask_liquidity_usdc(token_id, depth_levels=10)
-    if available_liquidity < settings.MIN_VIABLE_TRADE_USDC:
-        return  # почти пустой стакан — не о чем говорить, тихо пропускаем тик
-    if available_liquidity < trade_size:
-        trade_size = round(available_liquidity * 0.9, 2)
-
     # Между тем, как strategy.evaluate() прочитала ask, и моментом реальной
     # отправки ордера проходит какое-то время (сеть + подпись). Даём себе
     # небольшой запас на слиппедж, но не платим больше жёсткого потолка, и
@@ -100,32 +89,11 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
             # amount_usdc — это ДОЛЛАРОВАЯ сумма для BUY market-ордера, не
             # количество акций: конвертация не нужна, SDK делает это сам.
             resp = await polymarket_client.place_buy_order(token_id, execution_price, trade_size, tick)
-        except Exception as exc:  # noqa: BLE001
-            if "fully filled" in str(exc).lower() or "fok" in str(exc).lower():
-                # Гонка: между нашей проверкой глубины и отправкой ордера кто-то
-                # успел забрать ликвидность. Пробуем ещё раз меньшим объёмом —
-                # один раз, не зацикливаемся.
-                retry_size = round(trade_size * 0.5, 2)
-                if retry_size < settings.MIN_VIABLE_TRADE_USDC:
-                    await telegram_notify.notify(
-                        f"⚠️ Сигнал по {market.slug} пропущен: не хватило ликвидности в стакане "
-                        f"даже для уменьшенного объёма (FOK отменил ордер)."
-                    )
-                    return
-                try:
-                    resp = await polymarket_client.place_buy_order(token_id, execution_price, retry_size, tick)
-                    trade_size = retry_size
-                except Exception as exc2:  # noqa: BLE001
-                    await telegram_notify.notify(
-                        f"⚠️ Сигнал по {market.slug} пропущен: не хватило ликвидности даже после "
-                        f"снижения размера до {retry_size:.2f} USDC ({exc2})."
-                    )
-                    return
-            else:
-                await telegram_notify.notify(f"❌ Ошибка при выставлении ордера: {exc}")
-                return
-        order_id = polymarket_client.response_field(resp, "order_id") or polymarket_client.response_field(resp, "orderID") or str(resp)
-        status = polymarket_client.response_field(resp, "status") or "SUBMITTED"
+            order_id = polymarket_client.response_field(resp, "order_id") or polymarket_client.response_field(resp, "orderID") or str(resp)
+            status = polymarket_client.response_field(resp, "status") or "SUBMITTED"
+        except Exception as exc:  # noqa: BLE001 — любая ошибка биржи не должна ронять бота
+            await telegram_notify.notify(f"❌ Ошибка при выставлении ордера: {exc}")
+            return
 
     storage.log_trade(
         market_slug=market.slug,
