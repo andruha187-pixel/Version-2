@@ -70,7 +70,7 @@ class TimeframeProfile:
     poll_interval_seconds: int
 
 
-TIMEFRAMES: list[TimeframeProfile] = [
+_ALL_TIMEFRAMES: list[TimeframeProfile] = [
     TimeframeProfile(
         label="15m",
         interval_minutes=15,
@@ -102,3 +102,9 @@ TIMEFRAMES: list[TimeframeProfile] = [
         poll_interval_seconds=_i("TF_1H_POLL_SECONDS", 20),
     ),
 ]
+
+# Какие таймфреймы реально торгуются — через запятую в .env. По умолчанию
+# только 15m (часовую стратегию отключили по факту, но код для неё остаётся
+# на месте — можно вернуть без единой правки, просто дописав "1h" сюда).
+_enabled_labels = {s.strip() for s in os.getenv("ENABLED_TIMEFRAMES", "15m").split(",") if s.strip()}
+TIMEFRAMES: list[TimeframeProfile] = [tf for tf in _ALL_TIMEFRAMES if tf.label in _enabled_labels]
