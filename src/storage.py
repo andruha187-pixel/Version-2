@@ -228,13 +228,20 @@ def get_unsettled_trades():
         return cur.fetchall()
 
 
-def get_pnl_summary(since_ts: int = 0):
+def get_pnl_summary(since_ts: int = 0, live_only: bool = False):
     with _conn() as conn:
-        cur = conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(pnl_usdc), 0), "
-            "SUM(CASE WHEN pnl_usdc > 0 THEN 1 ELSE 0 END) "
-            "FROM trades WHERE outcome IS NOT NULL AND ts >= ?", (since_ts,),
-        )
+        if live_only:
+            cur = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(pnl_usdc), 0), "
+                "SUM(CASE WHEN pnl_usdc > 0 THEN 1 ELSE 0 END) "
+                "FROM trades WHERE outcome IS NOT NULL AND ts >= ? AND dry_run = 0", (since_ts,),
+            )
+        else:
+            cur = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(pnl_usdc), 0), "
+                "SUM(CASE WHEN pnl_usdc > 0 THEN 1 ELSE 0 END) "
+                "FROM trades WHERE outcome IS NOT NULL AND ts >= ?", (since_ts,),
+            )
         count, total_pnl, wins = cur.fetchone()
         return {"trades": count or 0, "pnl_usdc": total_pnl or 0.0, "wins": wins or 0}
 
