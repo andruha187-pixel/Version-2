@@ -159,7 +159,20 @@ def evaluate(
         reasons.append("недостаточно ликвидности в стакане")
 
     price_in_range = min_entry <= book.best_ask <= max_entry
-    should_enter = price_in_range and safety_score >= score_threshold
+    # ВРЕМЕННОЕ ОКНО И МИНИМАЛЬНАЯ ДИСТАНЦИЯ — ЖЁСТКИЕ ГРАНИЦЫ ДОПУСТИМОСТИ,
+    # не просто "предпочтения" внутри общего score. С весами ниже 0.35+0.25
+    # (distance+trend) достаточно, чтобы перевесить полностью нулевой
+    # time_score и пройти порог — это реально случилось в проде (см. отчёт
+    # от 2026-09-16: вход на btc с 12.1 минуты вместо разрешённых 2-9,
+    # score 80.6 при пороге 75). time_score==0 и distance_score==0 означают
+    # "физически вне заданных границ", а не просто "менее удачно" — поэтому
+    # это отдельные обязательные условия, а не только вклад в сумму.
+    should_enter = (
+        price_in_range
+        and safety_score >= score_threshold
+        and time_score > 0
+        and distance_score > 0
+    )
 
     return Decision(
         should_enter=should_enter,
