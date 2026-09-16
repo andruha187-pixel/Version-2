@@ -104,5 +104,9 @@ class Settings:
     REPORT_INTERVAL_HOURS: float = _get_float("REPORT_INTERVAL_HOURS", 4.0)
     REPORTS_DIR: str = os.getenv("REPORTS_DIR", "data/reports")
 
+    # --- Отслеживание чужого кошелька (уведомления + опциональный копитрейдинг) ---
+    WALLET_TRACK_ADDRESS: str = os.getenv("WALLET_TRACK_ADDRESS", "0x4707b735acce66b2ccb5600086de2329685cd1ce")
+    WALLET_TRACK_POLL_SECONDS: int = _get_int("WALLET_TRACK_POLL_SECONDS", 3)
+
 
 settings = Settings()
