@@ -55,7 +55,7 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
         # параллельных потоках несколько сигналов могут совпасть по времени.
         return
 
-    base_size = runtime_state.get("trade_size_usdc")
+    base_size = runtime_state.compute_trade_size()
     score_threshold = runtime_state.get("safety_score_threshold")
     if runtime_state.get("size_scaling_enabled"):
         trade_size = _scale_trade_size(base_size, decision.safety_score, score_threshold)
