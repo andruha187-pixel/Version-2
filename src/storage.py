@@ -73,6 +73,8 @@ _SIGNALS_MIGRATIONS = [
     ("outcome", "TEXT"),
     ("asset", "TEXT"),
     ("timeframe", "TEXT"),
+    ("macd_histogram", "REAL"),
+    ("macd_bullish", "INTEGER"),
 ]
 
 _TRADES_MIGRATIONS = [
@@ -121,8 +123,9 @@ def log_signal(market_slug: str, current_price: float, strike_price: float, deci
                 safety_score, minutes_left, distance_atr, should_enter, reasons,
                 atr, atr_ratio_to_avg, ema_fast, ema_slow, ema_fast_slope, trend_up,
                 time_score, distance_score, trend_score, vol_score, liq_score,
-                ask_liquidity_usdc, up_best_ask, down_best_ask, book_source, asset, timeframe)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ask_liquidity_usdc, up_best_ask, down_best_ask, book_source, asset, timeframe,
+                macd_histogram, macd_bullish)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 int(time.time()), market_slug, current_price, strike_price, decision.direction,
                 decision.entry_price, decision.safety_score, decision.minutes_left,
@@ -139,6 +142,8 @@ def log_signal(market_slug: str, current_price: float, strike_price: float, deci
                 (up_book.source if decision.direction == "UP" else down_book.source)
                 if (up_book and down_book) else None,
                 asset, timeframe_label,
+                indicators.get("macd_histogram"),
+                int(indicators.get("macd_bullish")) if indicators.get("macd_bullish") is not None else None,
             ),
         )
 
@@ -295,6 +300,7 @@ SIGNALS_COLUMNS = [
     "atr", "atr_ratio_to_avg", "ema_fast", "ema_slow", "ema_fast_slope", "trend_up",
     "time_score", "distance_score", "trend_score", "vol_score", "liq_score",
     "ask_liquidity_usdc", "up_best_ask", "down_best_ask", "book_source", "outcome",
+    "macd_histogram", "macd_bullish",
 ]
 
 TRADES_COLUMNS = [
