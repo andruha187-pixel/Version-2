@@ -55,7 +55,7 @@ class Settings:
     POLY_SIGNATURE_TYPE: int = _get_int("POLY_SIGNATURE_TYPE", 0)
 
     # --- Стратегия входа (общее для всех активов/таймфреймов) ---
-    MIN_ENTRY_PRICE: float = _get_float("MIN_ENTRY_PRICE", 0.80)
+    MIN_ENTRY_PRICE: float = _get_float("MIN_ENTRY_PRICE", 0.90)
     MAX_ENTRY_PRICE: float = _get_float("MAX_ENTRY_PRICE", 0.95)
     SAFETY_SCORE_THRESHOLD: float = _get_float("SAFETY_SCORE_THRESHOLD", 75.0)
     MIN_BOOK_LIQUIDITY_USDC: float = _get_float("MIN_BOOK_LIQUIDITY_USDC", 25.0)
@@ -81,6 +81,12 @@ class Settings:
     # пропускается (не считается ошибкой, просто рынок сейчас неликвиден).
     MIN_VIABLE_TRADE_USDC: float = _get_float("MIN_VIABLE_TRADE_USDC", 2.0)
     DAILY_LOSS_LIMIT_USDC: float = _get_float("DAILY_LOSS_LIMIT_USDC", 6.0)
+
+    # --- Исследовательский модуль (momentum_tracker) ---
+    # Не торгует — просто пишет, при каких условиях (RSI/MACD/дисбаланс
+    # стакана/и т.д.) цена стороны контракта проходит контрольные точки
+    # 0.70/0.75/.../0.95. См. src/momentum_tracker.py.
+    MOMENTUM_TRACKER_ENABLED: bool = _get_bool("MOMENTUM_TRACKER_ENABLED", True)
 
     # --- Масштабирование ставки по уверенности сигнала ---
     # Ставка = TRADE_SIZE_USDC только при score >= SIZE_SCALING_MAX_SCORE.
