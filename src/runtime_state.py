@@ -58,7 +58,7 @@ _DEFAULTS = {
     # несмотря на то, что сам хедж всегда безубыточен по построению —
     # разница в том, сколько сессий вообще НЕ доходит до точки хеджа и
     # остаётся неприкрытой позицией (см. обсуждение в чате).
-    "hedge_bot_enabled": True,
+    "hedge_bot_enabled": False,  # хедж живёт отдельным ботом (polymarket-hedge-bot)
     "hedge_entry_price": 0.70,
     "hedge_trigger_price": 0.90,
     "hedge_stake_usdc": 5.0,
@@ -121,6 +121,9 @@ def recommended() -> dict:
         "min_entry_price": 0.90,
         "max_entry_price": 0.95,
         "min_distance_pct": settings.MIN_DISTANCE_PCT,
+        # Хедж вынесен в отдельный бот; здесь он тратил бы тот же кошелёк
+        # и в LIVE покупал бы по $5 на каждом рынке, где цена прошла 0.70.
+        "hedge_bot_enabled": False,
     }
 
 
