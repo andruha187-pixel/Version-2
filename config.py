@@ -66,6 +66,14 @@ class Settings:
     # без фильтра −$17, с минимумом ~$60 (0.07% при BTC ~84k) — +$38, из 4
     # проигрышей остался 1. На 5m фильтр ничего не дал (там вход за 1.5-3 мин),
     # поэтому для 5m по умолчанию выключен. Меняется из Telegram (⚙️ Настройки).
+    # --- Стратегия «ранний импульс» (15m) — см. src/strategy.py ---
+    MOMENTUM_MIN_PRICE: float = _get_float("MOMENTUM_MIN_PRICE", 0.78)
+    MOMENTUM_MAX_PRICE: float = _get_float("MOMENTUM_MAX_PRICE", 0.88)
+    # Только первые 2.5 минуты окна: дальше перекос цены исчезает (см. strategy.py).
+    MOMENTUM_MIN_MINUTES_LEFT: float = _get_float("MOMENTUM_MIN_MINUTES_LEFT", 12.5)
+    # Спред = ask(UP) + ask(DOWN) − 1. Шире — цена «рваная», входы хуже.
+    MOMENTUM_MAX_SPREAD: float = _get_float("MOMENTUM_MAX_SPREAD", 0.015)
+
     MIN_DISTANCE_PCT: float = _get_float("MIN_DISTANCE_PCT", 0.07)
 
     # --- Латентность / исполнение (прогрев стакана и транспорта) ---
