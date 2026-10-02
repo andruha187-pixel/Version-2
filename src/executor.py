@@ -60,7 +60,7 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
 
     base_size = runtime_state.compute_trade_size()
     score_threshold = runtime_state.get("safety_score_threshold")
-    if runtime_state.get("size_scaling_enabled"):
+    if runtime_state.get("size_scaling_enabled") and runtime_state.get("strategy_mode") != "momentum":
         trade_size = _scale_trade_size(base_size, decision.safety_score, score_threshold)
     else:
         trade_size = base_size
@@ -164,10 +164,12 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
         token_id=token_id,
     )
 
+    is_momentum = runtime_state.get("strategy_mode") == "momentum"
+    why = "ранний импульс" if is_momentum else f"score {decision.safety_score}/{score_threshold:.0f}"
     await telegram_notify.notify(
         f"{'🧪 [DRY RUN] ' if dry_run else '✅ '}Вход {decision.direction} по {market.slug}\n"
         f"Ask на сигнале: {decision.entry_price:.3f} | Потолок исполнения: {execution_price:.3f} "
-        f"(тик {tick:g}) | Размер: {trade_size:.2f} из {base_size:.0f} USDC (score {decision.safety_score}/{score_threshold:.0f})\n"
+        f"(тик {tick:g}) | Размер: {trade_size:.2f} из {base_size:.0f} USDC ({why})\n"
         f"Расхождение: {decision.distance_atr} ATR | До конца рынка: {decision.minutes_left:.1f} мин"
     )
 

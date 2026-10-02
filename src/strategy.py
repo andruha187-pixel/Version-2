@@ -114,6 +114,8 @@ def evaluate(
     book = up_book if direction == "UP" else down_book
 
     if book.best_ask is None:
+        if runtime_state.get("strategy_mode") == "momentum":
+            return _momentum_decision(up_book, down_book, minutes_left, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         return Decision(False, direction, None, 0.0, minutes_left, 0.0, ["нет asks в стакане"])
 
     min_entry = runtime_state.get("min_entry_price")
@@ -203,10 +205,82 @@ def evaluate(
         and distance_ok
     )
 
+    if runtime_state.get("strategy_mode") == "momentum":
+        return _momentum_decision(
+            up_book, down_book, minutes_left, distance_atr,
+            time_score, distance_score, trend_score, vol_score, liq_score, safety_score,
+        )
+
     return Decision(
         should_enter=should_enter,
         direction=direction,
         entry_price=book.best_ask,
+        safety_score=round(safety_score, 1),
+        minutes_left=round(minutes_left, 2),
+        distance_atr=round(distance_atr, 2),
+        reasons=reasons,
+        time_score=round(time_score, 1),
+        distance_score=round(distance_score, 1),
+        trend_score=round(trend_score, 1),
+        vol_score=round(vol_score, 1),
+        liq_score=round(liq_score, 1),
+    )
+
+
+def _momentum_decision(up_book: OrderBookSnapshot, down_book: OrderBookSnapshot, minutes_left: float,
+                       distance_atr: float, time_score: float, distance_score: float, trend_score: float,
+                       vol_score: float, liq_score: float, safety_score: float) -> Decision:
+    """
+    «Ранний импульс» для 15-минутных рынков.
+
+    Покупаем ЛИДЕРА (сторону, которую рынок сам считает более вероятной — по
+    цене в стакане, а не по Binance), как только его ask впервые оказался в
+    [mom_min_price, mom_max_price], пока до конца окна ещё >= mom_min_minutes_left
+    (по умолчанию 12.5 — то есть только первые 2.5 минуты окна) и спред
+    ask(UP)+ask(DOWN)−1 не шире mom_max_spread. Держим до резолюции.
+
+    Откуда (все архивы 16.09–02.10: 1105 закрытых рынков 15m, BTC/ETH/SOL/XRP):
+    - В первой трети окна рынок систематически НЕДОоценивает лидера: наклон
+      калибровки logit(цены) 1.30/1.57/1.72 в трёх разных периодах (1.0 —
+      честная цена). Ближе к концу окна наклон ~1 — перекоса нет, поэтому
+      классический вход 0.90–0.95 ближе к концу даёт ноль минус комиссия.
+    - Чем раньше лидер дошёл до 0.78–0.88, тем лучше: при >= 12.5 мин — 234
+      сделки, 90.2% выигрышей при средней цене 0.795 (безубыток ~81.5%),
+      +$1.07 на $10 с комиссией и проскальзыванием 0.01; все 10 дней в плюсе.
+      При >= 10 мин (как было) — +$0.27, в 16–19.09 почти ноль.
+    - Параметры, выбранные только по 25.09–02.10, на 16–19.09 (отдельные данные)
+      дали +$0.62 на сделку. Расчёт перепроверен независимым пересчётом.
+    - На 5m такого перекоса нет (там вход лидера рано — в минусе).
+    - Предупреждение: по данным momentum-трекера 20–23.09 (более грязные,
+      с перебоями стакана) похожие входы были в минусе. Гонять на малой ставке.
+    """
+    lo = runtime_state.get("mom_min_price")
+    hi = runtime_state.get("mom_max_price")
+    min_left = runtime_state.get("mom_min_minutes_left")
+    max_spread = runtime_state.get("mom_max_spread")
+    up_ask, down_ask = up_book.best_ask, down_book.best_ask
+    if up_ask is None and down_ask is None:
+        return Decision(False, None, None, 0.0, minutes_left, 0.0, ["нет asks в стакане"])
+    if down_ask is None or (up_ask is not None and up_ask >= down_ask):
+        direction, ask = "UP", up_ask
+    else:
+        direction, ask = "DOWN", down_ask
+    reasons = []
+    if minutes_left < min_left:
+        reasons.append(f"импульс: поздно ({minutes_left:.1f} мин < {min_left:g})")
+    if not (lo <= ask <= hi):
+        reasons.append(f"цена {ask:.3f} вне диапазона [{lo}, {hi}]")
+    if max_spread is not None and max_spread < 1:
+        if up_ask is None or down_ask is None:
+            reasons.append("импульс: нет второй стороны стакана (спред неизвестен)")
+        else:
+            spread = up_ask + down_ask - 1
+            if spread > max_spread + 1e-9:
+                reasons.append(f"импульс: широкий спред {spread:.3f} > {max_spread:g}")
+    return Decision(
+        should_enter=not reasons,
+        direction=direction,
+        entry_price=ask,
         safety_score=round(safety_score, 1),
         minutes_left=round(minutes_left, 2),
         distance_atr=round(distance_atr, 2),

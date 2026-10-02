@@ -68,6 +68,59 @@ def _settings_text() -> str:
     )
 
 
+MOM_BANDS = [(0.75, 0.85), (0.78, 0.88), (0.80, 0.90)]
+MOM_MINUTES = [12.0, 12.5, 13.0]
+MOM_SPREADS = [0.015, 0.025, 1.0]
+
+
+def _strategy_summary() -> str:
+    if runtime_state.get("strategy_mode") == "momentum":
+        sp = runtime_state.get("mom_max_spread")
+        sp_txt = "без фильтра спреда" if sp is None or sp >= 1 else f"спред ≤ {sp:g}"
+        return (f"ранний импульс: лидер {runtime_state.get('mom_min_price'):.2f}–"
+                f"{runtime_state.get('mom_max_price'):.2f}, до конца ≥ {runtime_state.get('mom_min_minutes_left'):g} мин, {sp_txt}")
+    return "классика (score + диапазон входа)"
+
+
+def _strategy_text() -> str:
+    return (
+        f"🧭 Стратегия: {_strategy_summary()}\n\n"
+        "Ранний импульс: в первые ~2.5 минуты окна покупаем сторону-лидера, как только её цена "
+        "впервые попала в диапазон при узком спреде, и держим до конца.\n"
+        "Классика: старая логика (score, вход 0.90–0.95 ближе к концу)."
+    )
+
+
+def _strategy_menu_markup() -> InlineKeyboardMarkup:
+    mode = runtime_state.get("strategy_mode")
+    rows = [[
+        InlineKeyboardButton(("✅ " if mode == "momentum" else "") + "Ранний импульс", callback_data="strat_mode:momentum"),
+        InlineKeyboardButton(("✅ " if mode == "classic" else "") + "Классика", callback_data="strat_mode:classic"),
+    ]]
+    rows.append([InlineKeyboardButton("— Диапазон цены лидера —", callback_data="noop")])
+    lo, hi = runtime_state.get("mom_min_price"), runtime_state.get("mom_max_price")
+    rows.append([
+        InlineKeyboardButton(("✅ " if abs(a - lo) < 1e-6 and abs(b - hi) < 1e-6 else "") + f"{a:.2f}–{b:.2f}",
+                             callback_data=f"mom_band:{a}:{b}")
+        for a, b in MOM_BANDS
+    ])
+    rows.append([InlineKeyboardButton("— Минимум минут до конца —", callback_data="noop")])
+    ml = runtime_state.get("mom_min_minutes_left")
+    rows.append([
+        InlineKeyboardButton(("✅ " if abs(m - ml) < 1e-6 else "") + f"{m:g}", callback_data=f"mom_min:{m}")
+        for m in MOM_MINUTES
+    ])
+    rows.append([InlineKeyboardButton("— Макс. спред (ask UP + ask DOWN − 1) —", callback_data="noop")])
+    sp = runtime_state.get("mom_max_spread")
+    rows.append([
+        InlineKeyboardButton(("✅ " if abs(v - sp) < 1e-6 else "") + ("выкл" if v >= 1 else f"{v:g}"),
+                             callback_data=f"mom_spread:{v}")
+        for v in MOM_SPREADS
+    ])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
+    return InlineKeyboardMarkup(rows)
+
+
 def _main_menu_text() -> str:
     s = _state_ref  # dict: "asset:timeframe" -> instance state
     paused = runtime_state.get("paused")
@@ -82,6 +135,7 @@ def _main_menu_text() -> str:
         f"Размер позиции: {_size_summary()}",
         f"Стоп-лосс/день: {runtime_state.get('daily_loss_limit_usdc'):.0f} USDC",
         f"Стоп-лосс позиции: {'вкл ' + str(round(runtime_state.get('position_stop_loss_pct'))) + '%' if pos_sl_on else 'выкл'}",
+        f"Стратегия: {_strategy_summary()}",
         f"Safety score порог: {runtime_state.get('safety_score_threshold'):.0f}",
         f"Диапазон входа: {runtime_state.get('min_entry_price'):.2f}–{runtime_state.get('max_entry_price'):.2f}",
         f"Мин. расстояние от страйка: {_distance_summary()}",
@@ -112,6 +166,7 @@ def _main_menu_markup() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📉 Стоп-лосс позиции", callback_data="menu:possl"),
             InlineKeyboardButton("📈 Диапазон входа", callback_data="menu:range"),
         ],
+        [InlineKeyboardButton("🧭 Стратегия", callback_data="menu:strategy")],
         [InlineKeyboardButton("🐋 Слежка за кошельком", callback_data="menu:wallet")],
         [InlineKeyboardButton("🔒 Хедж-бот", callback_data="menu:hedge")],
         [
@@ -758,6 +813,27 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:range")]]),
         )
 
+    elif data == "menu:strategy":
+        await query.edit_message_text(_strategy_text(), reply_markup=_strategy_menu_markup())
+
+    elif data.startswith("strat_mode:"):
+        runtime_state.set("strategy_mode", data.split(":", 1)[1])
+        await query.edit_message_text("✅ " + _strategy_text(), reply_markup=_strategy_menu_markup())
+
+    elif data.startswith("mom_band:"):
+        _, a, b = data.split(":")
+        runtime_state.set("mom_min_price", float(a))
+        runtime_state.set("mom_max_price", float(b))
+        await query.edit_message_text("✅ " + _strategy_text(), reply_markup=_strategy_menu_markup())
+
+    elif data.startswith("mom_spread:"):
+        runtime_state.set("mom_max_spread", float(data.split(":", 1)[1]))
+        await query.edit_message_text("✅ " + _strategy_text(), reply_markup=_strategy_menu_markup())
+
+    elif data.startswith("mom_min:"):
+        runtime_state.set("mom_min_minutes_left", float(data.split(":", 1)[1]))
+        await query.edit_message_text("✅ " + _strategy_text(), reply_markup=_strategy_menu_markup())
+
     elif data == "menu:settings":
         await query.edit_message_text(_settings_text(), reply_markup=_settings_menu_markup())
 
@@ -776,7 +852,7 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "preset_apply":
         runtime_state.apply_recommended()
         await query.edit_message_text(
-            "⭐ Применены рекомендованные настройки: порог 88, диапазон "
+            f"⭐ Применены рекомендованные настройки. Стратегия: {_strategy_summary()}. Классика: порог 88, диапазон "
             f"{runtime_state.get('min_entry_price'):.2f}–{runtime_state.get('max_entry_price'):.2f}.\n\n"
             + _settings_text(),
             reply_markup=_settings_menu_markup(),
