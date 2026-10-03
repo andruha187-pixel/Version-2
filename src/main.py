@@ -103,6 +103,8 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
         max_minutes_left=timeframe.max_minutes_left,
         atr_distance_mult=timeframe.atr_distance_mult,
         atr_spike_mult=timeframe.atr_spike_mult,
+        market_start_ts=market.start_time,
+        market_end_ts=market.end_time,
     )
 
     storage.log_signal(market.slug, current_price, market.strike_price, decision,

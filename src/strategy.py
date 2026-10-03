@@ -15,7 +15,7 @@ src/timeframes.py) — у 15-минутного и часового рынка �
 from __future__ import annotations
 from dataclasses import dataclass, field
 
-from src import runtime_state
+from src import news_calendar, runtime_state
 from src.polymarket_client import OrderBookSnapshot
 
 
@@ -107,6 +107,8 @@ def evaluate(
     max_minutes_left: float,
     atr_distance_mult: float,
     atr_spike_mult: float,
+    market_start_ts: int | None = None,
+    market_end_ts: int | None = None,
 ) -> Decision:
     reasons = []
 
@@ -115,7 +117,8 @@ def evaluate(
 
     if book.best_ask is None:
         if runtime_state.get("strategy_mode") == "momentum":
-            return _momentum_decision(up_book, down_book, minutes_left, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            return _momentum_decision(up_book, down_book, minutes_left, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                      market_start_ts, market_end_ts)
         return Decision(False, direction, None, 0.0, minutes_left, 0.0, ["нет asks в стакане"])
 
     min_entry = runtime_state.get("min_entry_price")
@@ -209,6 +212,7 @@ def evaluate(
         return _momentum_decision(
             up_book, down_book, minutes_left, distance_atr,
             time_score, distance_score, trend_score, vol_score, liq_score, safety_score,
+            market_start_ts, market_end_ts,
         )
 
     return Decision(
@@ -229,7 +233,8 @@ def evaluate(
 
 def _momentum_decision(up_book: OrderBookSnapshot, down_book: OrderBookSnapshot, minutes_left: float,
                        distance_atr: float, time_score: float, distance_score: float, trend_score: float,
-                       vol_score: float, liq_score: float, safety_score: float) -> Decision:
+                       vol_score: float, liq_score: float, safety_score: float,
+                       market_start_ts: int | None = None, market_end_ts: int | None = None) -> Decision:
     """
     «Ранний импульс» для 15-минутных рынков.
 
@@ -253,6 +258,18 @@ def _momentum_decision(up_book: OrderBookSnapshot, down_book: OrderBookSnapshot,
     - На 5m такого перекоса нет (там вход лидера рано — в минусе).
     - Предупреждение: по данным momentum-трекера 20–23.09 (более грязные,
       с перебоями стакана) похожие входы были в минусе. Гонять на малой ставке.
+    - РЕАЛЬНЫЕ ДЕНЬГИ 02.10 (07:45–23:41 UTC): 17 входов, 12 побед (71%), −$4.29
+      на ставках ~$2. Бот входил ровно по правилу, все ордера исполнились по
+      цене сигнала +0.01, то есть проблема не в исполнении. Данные, которые НЕ
+      участвовали в подборе параметров (трекер 20–23.09: 110 рынков, 74.5%; живой
+      02.10: 71%), — ниже безубыточности. Перекос есть в одних периодах и
+      отсутствует в других; фильтра, отличающего одни от других (тренд EMA/MACD,
+      ATR, время суток, серия исходов), не нашлось. Поэтому v4-пресет переводит
+      бота в DRY RUN — LIVE только если 100 виртуальных сделок дадут ≤12 проигрышей.
+    - Пауза на новости (news_pause_enabled, src/news_calendar.py): рынок, в
+      окно которого попадает выход статистики США (08:30 NY) или решение ФРС,
+      пропускаем — 02.10 12:30 UTC вход на рывке после отчёта по рынку труда
+      развернулся в проигрыш, а в истории таких входов не было ни одного.
     """
     lo = runtime_state.get("mom_min_price")
     hi = runtime_state.get("mom_max_price")
@@ -277,6 +294,10 @@ def _momentum_decision(up_book: OrderBookSnapshot, down_book: OrderBookSnapshot,
             spread = up_ask + down_ask - 1
             if spread > max_spread + 1e-9:
                 reasons.append(f"импульс: широкий спред {spread:.3f} > {max_spread:g}")
+    if runtime_state.get("news_pause_enabled"):
+        news = news_calendar.pause_reason(market_start_ts, market_end_ts)
+        if news:
+            reasons.append(news)
     return Decision(
         should_enter=not reasons,
         direction=direction,

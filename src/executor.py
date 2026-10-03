@@ -14,8 +14,14 @@ from src.strategy import Decision
 
 
 def _daily_loss_exceeded() -> bool:
+    """Дневной стоп-лосс — только про РЕАЛЬНЫЕ деньги. Раньше сюда попадали и
+    виртуальные (DRY RUN) сделки: в режиме проверки стратегии виртуальные
+    проигрыши блокировали виртуальные же входы до конца дня, и набор данных
+    обрывался ровно тогда, когда он нужнее всего. В DRY RUN стопа нет."""
+    if runtime_state.get("dry_run"):
+        return False
     today_start = int(time.time() // 86400) * 86400
-    summary = storage.get_pnl_summary(today_start)
+    summary = storage.get_pnl_summary(today_start, live_only=True)
     limit = runtime_state.get("daily_loss_limit_usdc")
     return summary["pnl_usdc"] <= -abs(limit)
 
