@@ -73,6 +73,21 @@ class Settings:
     MOMENTUM_MIN_MINUTES_LEFT: float = _get_float("MOMENTUM_MIN_MINUTES_LEFT", 12.5)
     # Спред = ask(UP) + ask(DOWN) − 1. Шире — цена «рваная», входы хуже.
     MOMENTUM_MAX_SPREAD: float = _get_float("MOMENTUM_MAX_SPREAD", 0.015)
+    # Пауза на важную статистику США (см. src/news_calendar.py). Время — по
+    # Нью-Йорку, через запятую. 08:30 — NFP, CPI, PPI, заявки на пособие,
+    # розничные продажи, ВВП. Пропускается рынок, внутри окна которого
+    # выходит новость (для 15m — рынок, который в это время начинается).
+    NEWS_PAUSE_ET_TIMES: list = field(default_factory=lambda: [
+        x.strip() for x in os.getenv("NEWS_PAUSE_ET_TIMES", "08:30").split(",") if x.strip()
+    ])
+    # Разовые события по Нью-Йорку, "ГГГГ-ММ-ДД ЧЧ:ММ" через запятую: решения
+    # ФРС (14:00) и пресс-конференция (14:30). На 2027 год — дописать сюда же.
+    NEWS_PAUSE_ET_DATETIMES: list = field(default_factory=lambda: [
+        x.strip() for x in os.getenv(
+            "NEWS_PAUSE_ET_DATETIMES",
+            "2026-10-28 14:00,2026-10-28 14:30,2026-12-09 14:00,2026-12-09 14:30",
+        ).split(",") if x.strip()
+    ])
 
     MIN_DISTANCE_PCT: float = _get_float("MIN_DISTANCE_PCT", 0.07)
 
