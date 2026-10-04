@@ -119,6 +119,21 @@ class Settings:
     # 0.70/0.75/.../0.95. См. src/momentum_tracker.py.
     MOMENTUM_TRACKER_ENABLED: bool = _get_bool("MOMENTUM_TRACKER_ENABLED", True)
 
+    # --- Логгер стаканов «лестниц» (src/ladder_logger.py) — ничего не торгует ---
+    # Пишет реальные стаканы и все сделки рынков «Bitcoin above ___ on …»
+    # (часовые и дневные), чтобы проверить продажу «лотерейных билетов»
+    # лимитными ордерами. Отчёт — zip раз в REPORT_INTERVAL_HOURS.
+    LADDER_LOGGER_ENABLED: bool = _get_bool("LADDER_LOGGER_ENABLED", True)
+    LADDER_ASSETS: list = field(default_factory=lambda: [
+        a.strip().lower() for a in os.getenv("LADDER_ASSETS", "bitcoin").split(",") if a.strip()
+    ])
+    LADDER_POLL_SECONDS: int = _get_int("LADDER_POLL_SECONDS", 30)
+    LADDER_TRADES_POLL_SECONDS: int = _get_int("LADDER_TRADES_POLL_SECONDS", 60)
+    # Сколько последних часов жизни события пишем: часовые и дневные лестницы.
+    LADDER_TRACK_HOURS_HOURLY: float = _get_float("LADDER_TRACK_HOURS_HOURLY", 3.0)
+    LADDER_TRACK_HOURS_DAILY: float = _get_float("LADDER_TRACK_HOURS_DAILY", 24.0)
+    DATA_API_HOST: str = os.getenv("DATA_API_HOST", "https://data-api.polymarket.com")
+
     # --- Масштабирование ставки по уверенности сигнала ---
     # Ставка = TRADE_SIZE_USDC только при score >= SIZE_SCALING_MAX_SCORE.
     # На самом пороге (score == threshold) ставка = TRADE_SIZE_USDC * MIN_FRACTION.
