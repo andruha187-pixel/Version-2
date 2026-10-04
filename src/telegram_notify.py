@@ -175,6 +175,8 @@ def _main_menu_markup() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📈 Диапазон входа", callback_data="menu:range"),
         ],
         [InlineKeyboardButton("🧭 Стратегия", callback_data="menu:strategy")],
+        [InlineKeyboardButton("🔬 Архив «лестниц»", callback_data="ladder:menu"),
+         InlineKeyboardButton("📒 Логгер «лестниц»", callback_data="ladder_log:menu")],
         [InlineKeyboardButton("🐋 Слежка за кошельком", callback_data="menu:wallet")],
         [InlineKeyboardButton("🔒 Хедж-бот", callback_data="menu:hedge")],
         [
@@ -849,6 +851,54 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("mom_min:"):
         runtime_state.set("mom_min_minutes_left", float(data.split(":", 1)[1]))
         await query.edit_message_text("✅ " + _strategy_text(), reply_markup=_strategy_menu_markup())
+
+    elif data == "ladder:menu":
+        await query.edit_message_text(
+            "🔬 Исследование «лестниц» (ничего не покупает)\n\n"
+            "Выгружает историю рынков «Bitcoin/Ethereum above ___ on <дата>»: цены всех страйков за "
+            "3 суток до конца и исход по свече Binance. Займёт ~5–15 минут, бот при этом работает как обычно. "
+            "Готовый CSV придёт сюда — перешли его мне.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Выгрузить 60 дней", callback_data="ladder:run:60"),
+                 InlineKeyboardButton("120 дней", callback_data="ladder:run:120")],
+                [InlineKeyboardButton("◀️ Назад", callback_data="menu:main")],
+            ]),
+        )
+
+    elif data.startswith("ladder:run:"):
+        from src import ladder_research  # локальный импорт: модуль сам импортирует telegram_notify
+        if ladder_research.is_running():
+            await query.edit_message_text("🔬 Выгрузка уже идёт — дождись файла.",
+                                          reply_markup=_main_menu_markup())
+        else:
+            days = int(data.rsplit(":", 1)[1])
+            context.application.create_task(ladder_research.run(days=days))
+            await query.edit_message_text(f"🔬 Запустил выгрузку за {days} дней. Пришлю CSV сюда.",
+                                          reply_markup=_main_menu_markup())
+
+    elif data in ("ladder_log:menu", "ladder_log:toggle", "ladder_log:send"):
+        from src import ladder_logger  # локальный импорт, как у остальных модулей-исследований
+        note = ""
+        if data == "ladder_log:toggle":
+            runtime_state.set("ladder_logger_enabled", not runtime_state.get("ladder_logger_enabled"))
+            note = "✅ Готово.\n\n"
+        elif data == "ladder_log:send":
+            context.application.create_task(ladder_logger.send_report())
+            note = "📤 Собираю zip с тем, что накоплено, — пришлю отдельным сообщением.\n\n"
+        on = runtime_state.get("ladder_logger_enabled")
+        try:
+            await query.edit_message_text(
+                note + ladder_logger.status_text(),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏸ Выключить логгер" if on else "▶️ Включить логгер", callback_data="ladder_log:toggle")],
+                    [InlineKeyboardButton("📤 Выгрузить сейчас", callback_data="ladder_log:send"),
+                     InlineKeyboardButton("🔄 Обновить", callback_data="ladder_log:menu")],
+                    [InlineKeyboardButton("◀️ Назад", callback_data="menu:main")],
+                ]),
+            )
+        except Exception as exc:  # noqa: BLE001 — «Message is not modified» при повторном «Обновить»
+            if "not modified" not in str(exc).lower():
+                raise
 
     elif data == "news_pause:toggle":
         runtime_state.set("news_pause_enabled", not runtime_state.get("news_pause_enabled"))

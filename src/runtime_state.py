@@ -34,6 +34,8 @@ _DEFAULTS = {
     # Пропуск рынков, в окно которых попадает выход статистики США / решение
     # ФРС (только для «раннего импульса») — см. src/news_calendar.py.
     "news_pause_enabled": True,
+    # Логгер стаканов «лестниц» (src/ladder_logger.py) — только сбор данных.
+    "ladder_logger_enabled": settings.LADDER_LOGGER_ENABLED,
     # Версия применённого набора рекомендованных настроек (см. RECOMMENDED ниже).
     "preset_version": 0,
     # По умолчанию выключено: каждая прошедшая порог сделка идёт полным
@@ -92,6 +94,7 @@ _CASTERS = {
     "mom_min_minutes_left": float,
     "mom_max_spread": float,
     "news_pause_enabled": lambda v: str(v).lower() == "true",
+    "ladder_logger_enabled": lambda v: str(v).lower() == "true",
     "size_scaling_enabled": lambda v: str(v).lower() == "true",
     "position_stop_loss_enabled": lambda v: str(v).lower() == "true",
     "position_stop_loss_pct": float,

@@ -18,7 +18,7 @@ import time
 from config import settings
 from src import binance_feed, market_discovery, indicators, strategy
 from src.market_discovery import ActiveMarket
-from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting, wallet_tracker, momentum_tracker, hedge_bot
+from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting, wallet_tracker, momentum_tracker, hedge_bot, ladder_logger
 from src.timeframes import TIMEFRAMES, TimeframeProfile
 
 logging.basicConfig(
@@ -240,6 +240,7 @@ async def main():
         report_task = asyncio.create_task(reporting.report_loop())
         settlement_task = asyncio.create_task(settlement_loop())
         wallet_tracker_task = asyncio.create_task(wallet_tracker.wallet_tracker_loop())
+        ladder_logger_task = asyncio.create_task(ladder_logger.run_forever())
 
         instance_tasks = [
             asyncio.create_task(_instance_loop(asset, timeframe))
@@ -255,6 +256,7 @@ async def main():
             report_task.cancel()
             settlement_task.cancel()
             wallet_tracker_task.cancel()
+            ladder_logger_task.cancel()
             await app.updater.stop()
             await app.stop()
 
