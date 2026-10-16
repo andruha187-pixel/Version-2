@@ -225,6 +225,13 @@ _DEFAULTS = {
     "speed_lab_enabled": settings.SPEED_LAB_ENABLED,
     # 🔁 Тест серий на Polymarket (src/series_bot.py)
     "series_test_enabled": settings.SERIES_TEST_ENABLED,
+    # 🎲 Стратегия серий: вкл, реальные ставки, серия от k, потолок цены, ставка, дневной стоп
+    "series_trade_enabled": settings.SERIES_TRADE_ENABLED,
+    "series_trade_live": settings.SERIES_TRADE_LIVE,
+    "series_trade_k": max(1, settings.SERIES_TRADE_K),
+    "series_trade_cap": settings.SERIES_TRADE_CAP,
+    "series_trade_usdc": max(0.0, settings.SERIES_TRADE_USDC),
+    "series_trade_stop": max(0.0, settings.SERIES_TRADE_STOP_USDC),
 }
 
 # Типы приведения при чтении из SQLite (там всё хранится как TEXT)
@@ -279,6 +286,12 @@ _CASTERS = {
     "duo_a_remaining": _parse_counts,
     "speed_lab_enabled": lambda v: str(v).lower() == "true",
     "series_test_enabled": lambda v: str(v).lower() == "true",
+    "series_trade_enabled": lambda v: str(v).lower() == "true",
+    "series_trade_live": lambda v: str(v).lower() == "true",
+    "series_trade_k": lambda v: max(1, int(float(v))),
+    "series_trade_cap": float,
+    "series_trade_usdc": lambda v: max(0.0, float(v)),
+    "series_trade_stop": lambda v: max(0.0, float(v)),
 }
 
 _state: dict = dict(_DEFAULTS)

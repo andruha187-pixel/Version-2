@@ -278,21 +278,32 @@ async def _send_speed(base: str, from_label: str, to_label: str, since_ts: int, 
 
 async def _send_series(base: str, from_label: str, to_label: str, since_ts: int, rows_since: int) -> int:
     """🔁 Тест серий: окна с rows_since отдельным файлом (в отчёте — период и
-    30 мин прошлого, уже с исходом; повторы отличаются по id)."""
+    30 мин прошлого, уже с исходом; повторы отличаются по id), и ставки 🎲
+    стратегии серий — вторым файлом."""
     from src import series_bot
     rows = storage.series_export(rows_since)
-    if not rows:
+    trades = storage.series_trades_export(rows_since)
+    if not rows and not trades:
         return 0
-    path = f"{base}_series.csv"
-    _write_csv(path, storage.SERIES_COLUMNS, rows)
+    paths = []
     try:
-        await telegram_notify.send_document(path, _fit_caption(series_bot.report_caption(from_label, to_label,
-                                                                                         since_ts)))
+        if rows:
+            path = f"{base}_series.csv"
+            paths.append(path)
+            _write_csv(path, storage.SERIES_COLUMNS, rows)
+            await telegram_notify.send_document(path, _fit_caption(series_bot.report_caption(from_label, to_label,
+                                                                                             since_ts)))
+        if trades:
+            path = f"{base}_series_trades.csv"
+            paths.append(path)
+            _write_csv(path, storage.SERIES_TRADE_COLUMNS, trades)
+            await telegram_notify.send_document(path, _fit_caption("\n".join(series_bot.strategy_lines())))
     finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        for p in paths:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
     return len(rows)
 
 

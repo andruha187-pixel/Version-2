@@ -46,7 +46,7 @@ SETTLE_LAG_SEC = 120           # официальный исход спраши�
 SETTLE_MAX_AGE_SEC = 2 * 86400
 FLUSH_EVERY_SEC = 30
 DISCOVERY_RETRY_SEC = 20
-LIMITS = (0.48, 0.45, 0.42, 0.40)
+LIMITS = (0.50, 0.49, 0.48, 0.45, 0.42, 0.40)
 KS = (3, 4)
 REQUEST_PAUSE_SEC = 0.2
 
@@ -96,6 +96,9 @@ _stats = {"windows": 0, "priced": 0, "early": 0, "official": 0, "discovery_error
 
 
 def reset() -> None:
+    _qual.clear()
+    _traded.clear()
+    _trade_note["stop_day"] = None
     _cur.clear()
     _pending.clear()
     _retry_at.clear()
@@ -336,6 +339,313 @@ async def tick(active_markets: dict | None, now: float | None = None) -> None:
                     _spawn(_seed(asset, iv, start))
             _sample(w, now)
     resolve_pending(now)
+    await maybe_trade(now)
+
+
+# ---------------------------------------------------------- 🎲 стратегия ----
+#
+# После trade_k()+ одинаковых исходов подряд — ставка на разворот в первые
+# SERIES_TRADE_ENTRY_SEC секунд окна, если ask разворотной стороны не выше
+# trade_cap(). Тестовая ставка пишется всегда (по стакану: средняя цена по
+# уровням не дороже потолка, комиссия тейкера); реальная — если включён
+# 💵 режим. Окна, где серия была, а ставки нет (цена выше потолка, мало
+# объёма), тоже пишутся — со статусом SKIP_*, без итога.
+
+TRADE_K_PRESETS = (3, 4, 5)
+TRADE_CAP_PRESETS = (0.50, 0.51, 0.52)
+TRADE_USDC_PRESETS = (3.0, 5.0, 10.0, 20.0)
+TRADE_STOP_PRESETS = (0.0, 15.0, 30.0, 60.0)
+MIN_TRADE_USDC = 1.0
+_qual: dict[tuple[str, str, int], dict] = {}        # окно с серией, где ставки ещё нет: мин. ask и т.п.
+_traded: set = set()
+_trade_note = {"stop_day": None}
+
+
+def _rs(key: str, default):
+    return runtime_state._state.get(key, default)
+
+
+def trade_enabled() -> bool:
+    return bool(_rs("series_trade_enabled", settings.SERIES_TRADE_ENABLED))
+
+
+def trade_live() -> bool:
+    return bool(_rs("series_trade_live", settings.SERIES_TRADE_LIVE))
+
+
+def trade_k() -> int:
+    return max(1, int(_rs("series_trade_k", settings.SERIES_TRADE_K)))
+
+
+def trade_cap() -> float:
+    return float(_rs("series_trade_cap", settings.SERIES_TRADE_CAP))
+
+
+def trade_usdc() -> float:
+    return float(_rs("series_trade_usdc", settings.SERIES_TRADE_USDC))
+
+
+def trade_stop() -> float:
+    return float(_rs("series_trade_stop", settings.SERIES_TRADE_STOP_USDC))
+
+
+def trade_intervals() -> list[str]:
+    want = [iv.strip().lower() for iv in str(settings.SERIES_TRADE_INTERVALS or "").split(",")]
+    return [iv for iv in intervals() if iv in want]
+
+
+def dry_fill(token: str, cap: float, usdc: float) -> tuple[float | None, float]:
+    """(средняя цена, USDC) покупки на usdc по уровням asks не дороже cap."""
+    b = book_stream.get_book(token)
+    spent = shares = 0.0
+    for price, size in sorted((b or {}).get("asks", {}).items()):
+        if price > cap + 1e-9 or spent >= usdc - 1e-9:
+            break
+        take = min(price * size, usdc - spent)
+        spent += take
+        shares += take / price
+    return (round(spent / shares, 4), round(spent, 2)) if shares > 0 else (None, 0.0)
+
+
+def today_live_pnl(now: float | None = None) -> float:
+    now = time.time() if now is None else now
+    day = int(now // 86400) * 86400
+    return sum(t["pnl_usdc"] or 0.0 for t in storage.series_trades_since(day - 3600)
+               if not t["dry_run"] and t["settled_ts"] and t["settled_ts"] >= day)
+
+
+def live_blocked(now: float | None = None) -> str | None:
+    """Почему реальная ставка сейчас нельзя (None — можно)."""
+    if not settings.POLY_PRIVATE_KEY:
+        return "нет ключа POLY_PRIVATE_KEY"
+    if runtime_state.get("dry_run"):
+        return "бот в DRY RUN"
+    if runtime_state.get("paused"):
+        return "бот на паузе (⏸ Стоп)"
+    stop = trade_stop()
+    if stop > 0 and today_live_pnl(now) <= -stop:
+        return f"дневной стоп −${stop:g}"
+    return None
+
+
+async def _live_buy(token: str, cap: float, usdc: float) -> tuple[float, float, str, str] | None:
+    """Реальная покупка FAK-ордером по цене не выше cap: (USDC, акций, id ордера, статус) или None."""
+    from src import polymarket_client
+    tick = book_stream.tick_size(token)
+    cap = polymarket_client.round_price_for_buy(cap, tick)
+    try:
+        resp = await polymarket_client.place_buy_order(token, cap, usdc, tick, order_type="FAK")
+    except Exception as exc:  # noqa: BLE001
+        if polymarket_client.is_no_fill_error(exc):
+            return None
+        raise
+    oid = polymarket_client.response_field(resp, "order_id") or polymarket_client.response_field(resp, "orderID")
+    status = str(polymarket_client.response_field(resp, "status") or "matched")
+    amounts = polymarket_client.filled_amounts(resp)
+    if amounts is None or status.lower() == "delayed" or (amounts[0] <= 0 and status.lower() == "matched"):
+        spent, shares = usdc, usdc / cap
+    else:
+        spent, shares = amounts
+    if spent <= 0:
+        return None
+    return round(spent, 2), shares, str(oid or ""), status
+
+
+async def _notify(text: str) -> None:
+    try:
+        from src import telegram_notify
+        await telegram_notify.notify(text)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _log_skip(key, w: Win, d: str, k: int, side: str, status: str, ask: float | None) -> None:
+    asset, iv, start = key
+    storage.series_trade_log(ts=int(time.time()), asset=asset, interval=iv, start_ts=start, slug=w.slug,
+                             streak_dir=d, k=k, side=side, token_id=w.down if side == "DOWN" else w.up,
+                             ask=ask, dry_run=1, status=status)
+
+
+async def maybe_trade(now: float | None = None) -> int:
+    """Ставки стратегии в начале окон. Возвращает, сколько тестовых ставок записали."""
+    now = time.time() if now is None else now
+    if not trade_enabled():
+        return 0
+    done = 0
+    entry_sec = max(5, int(settings.SERIES_TRADE_ENTRY_SEC))
+    for key, q in list(_qual.items()):            # окно ушло без ставки — записать пропуск
+        asset, iv, start = key
+        if now - start > entry_sec and key not in _traded:
+            _qual.pop(key, None)
+            w = q["win"]
+            status = "SKIP_PRICE" if q.get("min_ask") is not None else "SKIP_BOOK"
+            _log_skip(key, w, q["dir"], q["k"], q["side"], status, q.get("min_ask"))
+    for iv in trade_intervals():
+        step = STEP[iv]
+        start = int(now // step) * step
+        if now - start > entry_sec:
+            continue
+        for asset in assets_for(iv):
+            key = (asset, iv, start)
+            if key in _traded:
+                continue
+            w = _cur.get((asset, iv))
+            if w is None or w.start != start:
+                continue
+            d, k = streak_before(asset, iv, start)
+            if d is None or k < trade_k():
+                continue
+            side = "DOWN" if d == "UP" else "UP"
+            token = w.down if side == "DOWN" else w.up
+            ask = book_stream.best_ask(token)
+            q = _qual.setdefault(key, {"win": w, "dir": d, "k": k, "side": side, "min_ask": None})
+            if ask is None:
+                continue
+            q["min_ask"] = ask if q["min_ask"] is None else min(q["min_ask"], ask)
+            cap = trade_cap()
+            if ask > cap + 1e-9:
+                continue                          # дорого — ждём до конца окна входа
+            price, spent = dry_fill(token, cap, trade_usdc())
+            if price is None or spent < MIN_TRADE_USDC:
+                continue
+            _traded.add(key)
+            if len(_traded) > 5000:
+                for old in [x for x in _traded if x[2] < now - 2 * 86400]:
+                    _traded.discard(old)
+            _qual.pop(key, None)
+            fee = round(spent * float(settings.FEE_RATE) * (1 - price), 4)
+            tid = storage.series_trade_log(
+                ts=int(now), asset=asset, interval=iv, start_ts=start, slug=w.slug, streak_dir=d, k=k, side=side,
+                token_id=token, ask=ask, price=price, size_usdc=spent, shares=round(spent / price, 4), fee_usdc=fee,
+                sec_after_start=round(now - start, 1), dry_run=1, status="DRY")
+            if tid:
+                done += 1
+            # Реальная ставка — одна на окно: после перезапуска бота в первую минуту
+            # окна тестовая строка уже есть, реальную не дублируем
+            if trade_live() and not storage.series_trade_exists(asset, iv, start, dry_run=False):
+                await _enter_live(w, key, d, k, side, token, ask, now)
+    return done
+
+
+async def _enter_live(w: Win, key, d: str, k: int, side: str, token: str, ask: float, now: float) -> None:
+    asset, iv, start = key
+    why = live_blocked(now)
+    if why:
+        day = int(now // 86400)
+        if why.startswith("дневной стоп") and _trade_note["stop_day"] != day:
+            _trade_note["stop_day"] = day
+            await _notify(f"🎲 Серии: реальные ставки остановлены до конца дня — {why}. Тестовые идут дальше.")
+        return
+    usdc = trade_usdc()
+    try:
+        res = await _live_buy(token, trade_cap(), usdc)
+    except Exception as exc:  # noqa: BLE001
+        await _notify(f"❌ 🎲 Серии {asset.upper()} {iv}: ошибка ордера — {exc}"[:400])
+        return
+    if res is None:
+        await _notify(f"⚠️ 🎲 Серии {asset.upper()} {iv}: ордер на {side} по ≤{trade_cap():.2f} не исполнился.")
+        return
+    spent, shares, oid, status = res
+    price = round(spent / shares, 4) if shares > 0 else trade_cap()
+    fee = round(spent * float(settings.FEE_RATE) * (1 - price), 4)
+    storage.series_trade_log(ts=int(now), asset=asset, interval=iv, start_ts=start, slug=w.slug, streak_dir=d, k=k,
+                             side=side, token_id=token, ask=ask, price=price, size_usdc=spent,
+                             shares=round(shares, 4), fee_usdc=fee, sec_after_start=round(now - start, 1),
+                             dry_run=0, status=status, order_id=oid)
+    await _notify(f"✅ 🎲 Серии {asset.upper()} {iv}: {k}×{d} подряд → ставка {side} ${spent:.2f} по {price:.3f}")
+
+
+async def settle_trades(now: float | None = None) -> int:
+    """Итог ставок стратегии по исходу окна (официальный, иначе — спросить Gamma)."""
+    now = time.time() if now is None else now
+    n = 0
+    for t in storage.series_trades_open(int(now - 60)):
+        if t["start_ts"] < now - SETTLE_MAX_AGE_SEC:
+            continue                                  # старше 2 суток — не спрашиваем
+        official = None
+        rows = [r for r in storage.series_rows(t["interval"], t["start_ts"])
+                if r["asset"] == t["asset"] and r["start_ts"] == t["start_ts"]]
+        if rows and rows[0]["outcome"]:
+            official = rows[0]["outcome"]
+        if official is None:
+            if now - (t["start_ts"] + STEP.get(t["interval"], 900)) < SETTLE_LAG_SEC:
+                continue
+            try:
+                official = await market_discovery.get_resolution(t["slug"])
+            except Exception:  # noqa: BLE001
+                official = None
+            await asyncio.sleep(REQUEST_PAUSE_SEC)
+        o = official
+        if o not in ("UP", "DOWN"):
+            continue
+        win = o == t["side"]
+        if t["status"] and str(t["status"]).startswith("SKIP"):
+            pnl = 0.0
+        else:
+            # И тестовые, и реальные — с комиссией тейкера (у реальных — оценка по
+            # FEE_RATE: суммы ордера могут её и не включать; точный итог — в кошельке)
+            pnl = (t["shares"] if win else 0.0) - t["size_usdc"] - (t["fee_usdc"] or 0.0)
+        if storage.series_trade_settle(t["id"], o, round(pnl, 4)):
+            n += 1
+            if not t["dry_run"]:
+                await _notify(f"🎲 {'🟢' if win else '🔴'} Серии {t['asset'].upper()} {t['interval']}: исход {o}, "
+                              f"ставка {t['side']} → {pnl:+.2f} USDC")
+    return n
+
+
+def trade_stats(since_ts: int = 0, live: bool = False) -> dict:
+    rows = [t for t in storage.series_trades_since(since_ts) if bool(t["dry_run"]) != live]
+    bets = [t for t in rows if not str(t["status"] or "").startswith("SKIP")]
+    settled = [t for t in bets if t["outcome"]]
+    skips = [t for t in rows if str(t["status"] or "").startswith("SKIP")]
+    wins = sum(1 for t in settled if t["outcome"] == t["side"])
+    return {
+        "bets": len(bets), "settled": len(settled), "wins": wins,
+        "pnl": sum(t["pnl_usdc"] or 0.0 for t in settled),
+        "staked": sum(t["size_usdc"] or 0.0 for t in settled),
+        "avg_price": (sum(t["price"] for t in bets if t["price"]) / len(bets)) if bets else None,
+        "skip_price": sum(1 for t in skips if t["status"] == "SKIP_PRICE"),
+        "skip_book": sum(1 for t in skips if t["status"] == "SKIP_BOOK"),
+        "skip_won": sum(1 for t in skips if t["outcome"] and t["outcome"] == t["side"]),
+        "skip_settled": sum(1 for t in skips if t["outcome"]),
+    }
+
+
+def _stats_line(name: str, st: dict) -> str:
+    if not st["bets"] and not st["skip_price"] and not st["skip_book"]:
+        return f"{name}: ставок пока нет"
+    s = f"{name}: ставок {st['bets']}"
+    if st["avg_price"]:
+        s += f" (средняя цена {st['avg_price']:.3f})"
+    if st["settled"]:
+        s += (f", с итогом {st['settled']}: выигрышей {st['wins'] / st['settled'] * 100:.1f}%, "
+              f"итог {st['pnl']:+.2f} USDC ({st['pnl'] / st['staked'] * 100:+.1f}% ставки)" if st["staked"] else "")
+    if st["skip_price"] or st["skip_book"]:
+        s += f"; пропущено: дороже {trade_cap():.2f} — {st['skip_price']}, нет стакана — {st['skip_book']}"
+        if st["skip_settled"]:
+            s += f" (из пропущенных выиграли бы {st['skip_won']}/{st['skip_settled']})"
+    return s
+
+
+def strategy_lines() -> list[str]:
+    mode = "💵 реальные ставки" if trade_live() else "🧪 тест (без денег)"
+    lines = [f"🎲 Стратегия: после {trade_k()}+ одинаковых исходов подряд — ставка на разворот в первые "
+             f"{int(settings.SERIES_TRADE_ENTRY_SEC)} с окна {', '.join(trade_intervals()) or '—'} по цене не выше "
+             f"{trade_cap():.2f}, ${trade_usdc():g} за ставку. "
+             + ("Сейчас: " + mode if trade_enabled() else "Сейчас: ⏸ выключена")]
+    day = int(time.time() // 86400) * 86400
+    lines.append("  " + _stats_line("Тест", trade_stats(0, live=False)))
+    lines.append("  " + _stats_line("Тест сегодня (UTC)", trade_stats(day, live=False)))
+    live = trade_stats(0, live=True)
+    if live["bets"] or trade_live():
+        lines.append("  " + _stats_line("Реальные", live))
+        stop = trade_stop()
+        lines.append(f"  Сегодня реальные: {today_live_pnl():+.2f} USDC"
+                     + (f" (дневной стоп −${stop:g})" if stop > 0 else " (без дневного стопа)"))
+        why = live_blocked() if trade_live() else None
+        if why:
+            lines.append(f"  ⚠️ Реальные ставки сейчас не уходят: {why}")
+    return lines
 
 
 async def run_forever(active_markets: dict | None = None) -> None:
@@ -343,11 +653,12 @@ async def run_forever(active_markets: dict | None = None) -> None:
     await asyncio.sleep(3)
     while True:
         try:
-            if enabled() and settings.USE_LIVE_BOOK_STREAM:
+            if (enabled() or trade_enabled()) and settings.USE_LIVE_BOOK_STREAM:
                 await tick(active_markets)
                 if time.monotonic() - last_settle >= SETTLE_EVERY_SEC:
                     last_settle = time.monotonic()
                     await settle()
+                    await settle_trades()
             else:
                 for w in list(_cur.values()):
                     _close(w)
@@ -484,7 +795,7 @@ def summary_lines(since_ts: int = 0) -> list[str]:
 
 
 def menu_text() -> str:
-    lines = [
+    lines = strategy_lines() + ["", ] + [
         "🔁 Серии — тест на Polymarket " + ("(запись идёт" if enabled() else "(запись выключена") +
         ", ничего не покупает)",
         "",

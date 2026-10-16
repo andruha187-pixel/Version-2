@@ -180,6 +180,35 @@ CREATE TABLE IF NOT EXISTS series_windows (
     UNIQUE(asset, interval, start_ts)
 );
 CREATE INDEX IF NOT EXISTS idx_series_windows_start ON series_windows(start_ts);
+
+-- 🎲 Стратегия серий (src/series_bot.py): ставка на разворот после серии.
+-- Отдельно от trades: свои ставки, комиссия и учёт, не трогает лимиты и стопы 5m-бота.
+CREATE TABLE IF NOT EXISTS series_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts INTEGER NOT NULL,
+    asset TEXT,
+    interval TEXT,
+    start_ts INTEGER,
+    slug TEXT,
+    streak_dir TEXT,
+    k INTEGER,
+    side TEXT,
+    token_id TEXT,
+    ask REAL,
+    price REAL,
+    size_usdc REAL,
+    shares REAL,
+    fee_usdc REAL,
+    sec_after_start REAL,
+    dry_run INTEGER,
+    status TEXT,
+    order_id TEXT,
+    outcome TEXT,
+    pnl_usdc REAL,
+    settled_ts INTEGER,
+    UNIQUE(asset, interval, start_ts, dry_run)
+);
+CREATE INDEX IF NOT EXISTS idx_series_trades_ts ON series_trades(ts);
 """
 
 SPEED_COLUMNS = [
@@ -281,6 +310,64 @@ def series_unresolved(ended_before: int, since_ts: int = 0, limit: int = 20) -> 
             "ORDER BY start_ts DESC LIMIT ?",
             (since_ts, ended_before, limit))
         return cur.fetchall()
+
+
+SERIES_TRADE_COLUMNS = [
+    "id", "ts", "asset", "interval", "start_ts", "slug", "streak_dir", "k", "side", "token_id", "ask", "price",
+    "size_usdc", "shares", "fee_usdc", "sec_after_start", "dry_run", "status", "order_id", "outcome", "pnl_usdc",
+    "settled_ts",
+]
+
+
+def series_trade_log(**f) -> int | None:
+    """Записать ставку стратегии серий. None — по этому окну ставка уже есть."""
+    cols = [c for c in SERIES_TRADE_COLUMNS if c in f and c != "id"]
+    with _conn() as conn:
+        cur = conn.execute(f"INSERT OR IGNORE INTO series_trades ({', '.join(cols)}) "
+                           f"VALUES ({', '.join('?' for _ in cols)})", [f[c] for c in cols])
+        return cur.lastrowid if cur.rowcount else None
+
+
+def series_trade_exists(asset: str, interval: str, start_ts: int, dry_run: bool | None = None) -> bool:
+    """Есть ли строка стратегии по окну (dry_run=None — любая, иначе только тестовая/реальная)."""
+    q = "SELECT 1 FROM series_trades WHERE asset = ? AND interval = ? AND start_ts = ?"
+    args: list = [asset, interval, int(start_ts)]
+    if dry_run is not None:
+        q += " AND dry_run = ?"
+        args.append(int(bool(dry_run)))
+    with _conn() as conn:
+        return conn.execute(q + " LIMIT 1", args).fetchone() is not None
+
+
+def series_trades_open(ended_before: int) -> list[dict]:
+    cols = SERIES_TRADE_COLUMNS
+    with _conn() as conn:
+        rows = conn.execute(
+            f"SELECT {', '.join(cols)} FROM series_trades WHERE outcome IS NULL "
+            "AND start_ts + CASE interval WHEN '15m' THEN 900 ELSE 300 END < ? ORDER BY start_ts",
+            (ended_before,)).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def series_trade_settle(trade_id: int, outcome: str, pnl_usdc: float) -> bool:
+    with _conn() as conn:
+        cur = conn.execute("UPDATE series_trades SET outcome = ?, pnl_usdc = ?, settled_ts = ? "
+                           "WHERE id = ? AND outcome IS NULL", (outcome, pnl_usdc, int(time.time()), trade_id))
+        return cur.rowcount > 0
+
+
+def series_trades_since(since_ts: int) -> list[dict]:
+    cols = SERIES_TRADE_COLUMNS
+    with _conn() as conn:
+        rows = conn.execute(f"SELECT {', '.join(cols)} FROM series_trades WHERE ts >= ? ORDER BY ts",
+                            (since_ts,)).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def series_trades_export(since_ts: int) -> list[tuple]:
+    with _conn() as conn:
+        return conn.execute(f"SELECT {', '.join(SERIES_TRADE_COLUMNS)} FROM series_trades WHERE ts >= ? ORDER BY ts",
+                            (since_ts,)).fetchall()
 
 
 def series_export(since_ts: int) -> list[tuple]:

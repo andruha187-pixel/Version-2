@@ -210,12 +210,44 @@ def speed_markup() -> InlineKeyboardMarkup:
 def series_markup() -> InlineKeyboardMarkup:
     on = series_bot.enabled()
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏸ Выключить тест" if on else "▶️ Включить тест", callback_data="duo:sert"),
+        [InlineKeyboardButton("🎲 Стратегия: настройки", callback_data="duo:st")],
+        [InlineKeyboardButton("⏸ Выключить запись окон" if on else "▶️ Включить запись окон", callback_data="duo:sert"),
          InlineKeyboardButton("📤 Файл теста", callback_data="duo:serx")],
         [InlineKeyboardButton("🧾 Сверить с исходами Polymarket (15m)", callback_data="duo:off")],
         [InlineKeyboardButton("📚 Год свечей Binance (5m и 15m)", callback_data="duo:hist")],
         [InlineKeyboardButton("🔄 Обновить", callback_data="duo:ser")],
         [InlineKeyboardButton("◀️ Назад", callback_data="duo:menu")],
+    ])
+
+
+def strategy_text() -> str:
+    lines = series_bot.strategy_lines() + [
+        "",
+        "Тестовая ставка пишется по каждому окну с серией — по стакану (средняя цена по уровням не дороже "
+        "потолка, с комиссией тейкера). В режиме 💵 вдобавок уходит реальный ордер на выбранную сумму. "
+        "Реальные ставки — только 15m, свой дневной стоп, ⏸ Стоп бота их тоже останавливает.",
+        "Окна записываются, пока включена стратегия или запись окон.",
+    ]
+    return "\n".join(lines)
+
+
+def strategy_markup() -> InlineKeyboardMarkup:
+    on, live = series_bot.trade_enabled(), series_bot.trade_live()
+    k, cap, usdc, stop = series_bot.trade_k(), series_bot.trade_cap(), series_bot.trade_usdc(), series_bot.trade_stop()
+    mark = lambda ok: "✅ " if ok else ""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎲 ✅ вкл" if on else "🎲 ⏸ выкл", callback_data="duo:stt"),
+         InlineKeyboardButton("💵 реально" if live else "🧪 тест", callback_data="duo:stl")],
+        [InlineKeyboardButton(mark(k == v) + f"серия от {v}", callback_data=f"duo:stk:{v}")
+         for v in series_bot.TRADE_K_PRESETS],
+        [InlineKeyboardButton(mark(abs(cap - v) < 1e-9) + f"цена до {v:.2f}", callback_data=f"duo:stc:{v:.2f}")
+         for v in series_bot.TRADE_CAP_PRESETS],
+        [InlineKeyboardButton(mark(abs(usdc - v) < 1e-9) + f"${v:g}", callback_data=f"duo:stu:{v:g}")
+         for v in series_bot.TRADE_USDC_PRESETS],
+        [InlineKeyboardButton(mark(abs(stop - v) < 1e-9) + (f"стоп ${v:g}" if v else "без стопа"),
+                              callback_data=f"duo:sts:{v:g}") for v in series_bot.TRADE_STOP_PRESETS],
+        [InlineKeyboardButton("🔄 Обновить", callback_data="duo:st")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="duo:ser")],
     ])
 
 
@@ -330,6 +362,32 @@ def handle(data: str):
         return speed_lab.menu_text(), speed_markup(), None
     if cmd == "ser":
         return series_bot.menu_text(), series_markup(), None
+    if cmd == "st":
+        return strategy_text(), strategy_markup(), None
+    if cmd == "stt":
+        runtime_state.set("series_trade_enabled", not series_bot.trade_enabled())
+        return strategy_text(), strategy_markup(), None
+    if cmd == "stl":
+        runtime_state.set("series_trade_live", not series_bot.trade_live())
+        head = ""
+        if series_bot.trade_live():
+            head = (f"✅ 🎲 Реальные ставки включены: ${series_bot.trade_usdc():g} на окно 15m после "
+                    f"{series_bot.trade_k()}+ одинаковых подряд, по цене не выше {series_bot.trade_cap():.2f}"
+                    + (f", дневной стоп −${series_bot.trade_stop():g}" if series_bot.trade_stop() > 0 else "")
+                    + ". Тестовые ставки пишутся дальше — для сравнения.\n\n")
+        return head + strategy_text(), strategy_markup(), None
+    if cmd in ("stk", "stc", "stu", "sts") and len(parts) == 3:
+        try:
+            value = float(parts[2])
+        except ValueError:
+            return strategy_text(), strategy_markup(), None
+        key, presets = {"stk": ("series_trade_k", series_bot.TRADE_K_PRESETS),
+                        "stc": ("series_trade_cap", series_bot.TRADE_CAP_PRESETS),
+                        "stu": ("series_trade_usdc", series_bot.TRADE_USDC_PRESETS),
+                        "sts": ("series_trade_stop", series_bot.TRADE_STOP_PRESETS)}[cmd]
+        if any(abs(value - v) < 1e-9 for v in presets):
+            runtime_state.set(key, int(value) if cmd == "stk" else value)
+        return strategy_text(), strategy_markup(), None
     if cmd == "sert":
         series_bot.set_enabled(not series_bot.enabled())
         return series_bot.menu_text(), series_markup(), None
