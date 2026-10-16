@@ -278,12 +278,13 @@ async def _send_speed(base: str, from_label: str, to_label: str, since_ts: int, 
 
 async def _send_series(base: str, from_label: str, to_label: str, since_ts: int, rows_since: int) -> int:
     """🔁 Тест серий: окна с rows_since отдельным файлом (в отчёте — период и
-    30 мин прошлого, уже с исходом; повторы отличаются по id), и ставки 🎲
-    стратегии серий — вторым файлом."""
+    30 мин прошлого, уже с исходом; повторы отличаются по id), ставки 🎲
+    стратегии серий — вторым файлом, виртуальные ставки вариантов входа — третьим."""
     from src import series_bot
     rows = storage.series_export(rows_since)
     trades = storage.series_trades_export(rows_since)
-    if not rows and not trades:
+    variants = storage.series_variants_export(rows_since)
+    if not rows and not trades and not variants:
         return 0
     paths = []
     try:
@@ -298,6 +299,11 @@ async def _send_series(base: str, from_label: str, to_label: str, since_ts: int,
             paths.append(path)
             _write_csv(path, storage.SERIES_TRADE_COLUMNS, trades)
             await telegram_notify.send_document(path, _fit_caption("\n".join(series_bot.strategy_lines())))
+        if variants:
+            path = f"{base}_series_variants.csv"
+            paths.append(path)
+            _write_csv(path, storage.SERIES_VARIANT_COLUMNS, variants)
+            await telegram_notify.send_document(path, _fit_caption("🎲 " + "\n".join(series_bot.variant_lines())))
     finally:
         for p in paths:
             try:

@@ -42,6 +42,10 @@ _ws_ready = asyncio.Event()
 # Когда токен добавлен в подписку — чтобы сторож мог понять, что данные по
 # нему так и не пришли (см. _watchdog).
 _subscribed_at: dict[str, int] = {}
+# Рынок, который ещё не начался (🔁 серии подписывают следующее окно 15m
+# заранее): стакана по нему может не быть до старта — сторож до этого момента
+# (мс) на такие токены не смотрит, иначе рвал бы сокет всем каждые 30 с.
+_watch_after: dict[str, int] = {}
 _last_forced_reconnect_ms = 0
 WATCHDOG_NO_DATA_MS = 8000        # подписаны столько, а стакана так и нет — переподключаемся
 WATCHDOG_MIN_INTERVAL_MS = 30000  # не чаще раза в 30 с
@@ -124,9 +128,15 @@ def _apply_delta(msg: dict) -> list[str]:
     return touched
 
 
-def subscribe(asset_ids: list[str]) -> None:
+def subscribe(asset_ids: list[str], watch_after_ms: int | None = None) -> None:
     """Идемпотентно добавляем токены в подписку. Реально уходит в сокет,
-    когда соединение поднято — если сокета ещё нет, он подхватит при коннекте."""
+    когда соединение поднято — если сокета ещё нет, он подхватит при коннекте.
+    watch_after_ms — не ждать стакан по этим токенам раньше этого момента
+    (рынок следующего окна, подписанный заранее; см. _watchdog)."""
+    if watch_after_ms:
+        for a in asset_ids:
+            if a:
+                _watch_after[a] = int(watch_after_ms)
     new_ids = [a for a in asset_ids if a and a not in _subscribed]
     if not new_ids:
         return
@@ -158,6 +168,7 @@ def unsubscribe(asset_ids: list[str]) -> None:
     for a in removed:
         _subscribed.discard(a)
         _subscribed_at.pop(a, None)
+        _watch_after.pop(a, None)
         _books.pop(a, None)
     try:
         _send_queue.put_nowait({"operation": "unsubscribe", "assets_ids": removed})
@@ -239,6 +250,13 @@ async def _sender(ws) -> None:
         await ws.send(json.dumps(payload))
 
 
+def _missing_books(ts: int) -> list[str]:
+    """Подписанные токены без стакана дольше WATCHDOG_NO_DATA_MS — считая от
+    подписки, а у рынка следующего окна — от его старта (_watch_after)."""
+    return [a for a in _subscribed if a not in _books
+            and ts - max(_subscribed_at.get(a, ts), _watch_after.get(a, 0)) > WATCHDOG_NO_DATA_MS]
+
+
 async def _watchdog(ws) -> None:
     """Страховка на случай, если сервер всё равно не прислал стакан по новому
     токену: переподключаемся — при коннекте уходит стартовое сообщение с
@@ -247,8 +265,7 @@ async def _watchdog(ws) -> None:
     while True:
         await asyncio.sleep(3)
         ts = now_ms()
-        missing = [a for a in _subscribed
-                   if a not in _books and ts - _subscribed_at.get(a, ts) > WATCHDOG_NO_DATA_MS]
+        missing = _missing_books(ts)
         if missing and ts - _last_forced_reconnect_ms > WATCHDOG_MIN_INTERVAL_MS:
             _last_forced_reconnect_ms = ts
             log.warning("Нет стакана по %d токенам после подписки — переподключаю WS", len(missing))

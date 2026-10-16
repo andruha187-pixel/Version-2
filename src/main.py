@@ -319,7 +319,8 @@ async def main():
                 fast_note += (f"\n🎲 Стратегия серий: {'💵 реальные ставки' if series_bot.trade_live() else '🧪 тест'}"
                               f" — после {series_bot.trade_k()}+ одинаковых исходов подряд ставка на разворот в "
                               f"начале окна {', '.join(series_bot.trade_intervals())} по цене до "
-                              f"{series_bot.trade_cap():.2f}, ${series_bot.trade_usdc():g} (🎯 → 📚 → 🎲).")
+                              f"{series_bot.trade_cap():.2f}, ${series_bot.trade_usdc():g}; рядом — сравнение "
+                              f"правил входа на тех же сигналах (🎯 → 📚 → 🎲).")
             if speed_lab.enabled() and settings.USE_LIVE_BOOK_STREAM:
                 fast_note += ("\n⚡ Скорость рынка: запись идёт — рывки Binance, стакан Polymarket до/после "
                               "и цены других бирж (ничего не покупает; 🎯 Стратегии → ⚡).")

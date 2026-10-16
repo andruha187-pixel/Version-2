@@ -1088,9 +1088,15 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------------------------------------------------- кнопки -----
 
+TG_TEXT_LIMIT = 4096
+
+
 async def _safe_edit(query, text: str, markup=None) -> None:
     """edit_message_text, который не падает на «message is not modified»
-    (повторное нажатие той же кнопки)."""
+    (повторное нажатие той же кнопки) и на слишком длинном тексте (обрезаем
+    до лимита Telegram, а не теряем весь экран)."""
+    if len(text) > TG_TEXT_LIMIT:
+        text = text[:TG_TEXT_LIMIT - 2].rstrip() + "\n…"
     try:
         await query.edit_message_text(text, reply_markup=markup)
     except Exception as exc:  # noqa: BLE001

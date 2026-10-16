@@ -9,7 +9,11 @@
 
 Что пишем по каждому окну (таблица series_windows):
   - ask и bid обеих сторон, когда впервые увидели рынок (в первую минуту);
-  - путь ask обеих сторон каждые SERIES_PATH_STEP_SEC секунд;
+  - путь ask обеих сторон каждые SERIES_PATH_STEP_SEC секунд; у окон стратегии
+    (SERIES_TRADE_INTERVALS) ещё с 30 с до старта и всю первую минуту — каждые
+    SERIES_FINE_STEP_SEC секунд (точки до старта — с отрицательным временем);
+  - снимки стакана (лучшие уровни asks обеих сторон) за 5 с до старта, на
+    старте и на 15/30/45/60-й секунде — колонка depth (у окон стратегии);
   - минимум ask каждой стороны до минуты до конца — исполнилась бы лимитка;
   - исход: ранний (стакан в последние секунды, иначе Chainlink) и официальный.
 Серию считаем по исходам прошлых окон (до запуска бота — официальные исходы
@@ -17,8 +21,11 @@
 итогов: на старте по ask (тейкер, с комиссией) и лимиткой 0.48/0.45/0.42/0.40
 (мейкер, без комиссии). Ничего не покупает.
 
-Рынки 5m берём у основного цикла (main._active_markets), 15m — ищем сами по
-слагу {монета}-updown-15m-{начало} и подписываем их токены на живой стакан.
+Рынки 5m берём у основного цикла (main._active_markets). Рынок 15m ищем сами
+по точному слагу {монета}-updown-15m-{начало} — заранее, за PREFETCH_SEC до
+начала окна, — и сразу подписываем его токены на живой стакан: цена видна с
+нулевой секунды. (До 16.10 рынок искали в момент старта, по очереди для всех
+монет, и каждое шестое окно находилось только на 22-й секунде.)
 """
 from __future__ import annotations
 import asyncio
@@ -45,17 +52,19 @@ SETTLE_EVERY_SEC = 60
 SETTLE_LAG_SEC = 120           # официальный исход спрашиваем не раньше чем через 2 мин после конца
 SETTLE_MAX_AGE_SEC = 2 * 86400
 FLUSH_EVERY_SEC = 30
-DISCOVERY_RETRY_SEC = 20
+DISCOVERY_RETRY_SEC = 5        # рынок окна не нашёлся на старте — снова через 5 с
+LATE_RETRY_SEC = 30            # …а после первой минуты (нужен только исход) — через 30 с
+PREFETCH_SEC = 90              # рынок следующего окна 15m ищем за 1.5 мин до начала…
+PREFETCH_RETRY_SEC = 10        # …и снова каждые 10 с, если его ещё нет
+PRE_PATH_SEC = 30              # у окон стратегии путь цены пишем с 30 с до начала
+FINE_SEC = 60                  # …и всю первую минуту — каждые SERIES_FINE_STEP_SEC с
+DEPTH_AT = (-5, 0, 15, 30, 45, 60)   # снимки стакана: секунды от начала окна…
+DEPTH_TOL_SEC = 5              # …снимок — в первые 5 с после отметки, иначе пропуск
+DEPTH_LEVELS = 8               # уровней asks каждой стороны в снимке
+TRIM_EVERY_SEC = 3600          # раз в час стираем путь и снимки старых окон
 LIMITS = (0.50, 0.49, 0.48, 0.45, 0.42, 0.40)
 KS = (3, 4)
 REQUEST_PAUSE_SEC = 0.2
-
-
-@dataclass
-class _Tf:
-    """Минимальный профиль для market_discovery.get_active_market."""
-    label: str
-    interval_minutes: int
 
 
 @dataclass
@@ -78,9 +87,15 @@ class Win:
     last_flush: float = 0.0
     book_res: str | None = None
     book_res_t: float = 0.0
+    depth: list = field(default_factory=list)          # [[t, asks UP, asks DOWN], …]
+    depth_done: set = field(default_factory=set)       # отметки DEPTH_AT, по которым снимок уже есть
+    early_set: bool = False                            # ранний исход уже записан (по стакану)
 
 
 _cur: dict[tuple[str, str], Win] = {}
+_next: dict[tuple[str, str], Win] = {}      # рынок следующего окна 15m, найденный заранее
+_prefetch_at: dict[tuple[str, str, int], float] = {}   # когда снова искать рынок следующего окна
+_prefetching: set = set()
 _pending: list[Win] = []
 _retry_at: dict[tuple[str, str, int], float] = {}
 _outcomes: dict[tuple[str, str], dict[int, str]] = defaultdict(dict)   # (монета, интервал) -> {старт: исход}
@@ -92,14 +107,19 @@ _last_start: dict[tuple[str, str], int] = {}
 _tasks: set = set()
 UNSUPPORTED_AFTER = 3          # рынка нет 3 окна подряд (с первого запуска) — монету пропускаем…
 UNSUPPORTED_SKIP_SEC = 6 * 3600  # …на 6 часов
-_stats = {"windows": 0, "priced": 0, "early": 0, "official": 0, "discovery_errors": 0, "last_error": ""}
+_stats = {"windows": 0, "priced": 0, "early": 0, "official": 0, "prefetched": 0, "discovery_errors": 0,
+          "last_error": ""}
 
 
 def reset() -> None:
     _qual.clear()
     _traded.clear()
+    _vars.clear()
     _trade_note["stop_day"] = None
     _cur.clear()
+    _next.clear()
+    _prefetch_at.clear()
+    _prefetching.clear()
     _pending.clear()
     _retry_at.clear()
     _outcomes.clear()
@@ -133,6 +153,20 @@ def path_step() -> int:
     return max(1, int(settings.SERIES_PATH_STEP_SEC))
 
 
+def fine_step() -> int:
+    """Шаг пути до старта и в первую минуту у окон стратегии (0 — как остальное окно)."""
+    return max(0, int(settings.SERIES_FINE_STEP_SEC))
+
+
+def _fine(w: Win) -> bool:
+    """Окно стратегии: подробный путь в начале и снимки стакана."""
+    return bool(fine_step()) and w.interval in trade_intervals()
+
+
+def _step_for(w: Win, t: float) -> float:
+    return fine_step() if t < FINE_SEC and _fine(w) else path_step()
+
+
 def fee_per_dollar(price: float) -> float:
     return float(settings.FEE_RATE) * (1 - price)
 
@@ -153,54 +187,143 @@ def book_winner(up: str, down: str) -> str | None:
 
 # ------------------------------------------------------------- окна ----
 
+def _activate(w: Win) -> Win:
+    """Окно стало текущим: строка в базе, монету считаем поддерживаемой."""
+    storage.series_upsert(w.asset, w.interval, w.start, slug=w.slug)
+    _supported.add((w.asset, w.interval))
+    _fails[(w.asset, w.interval)] = 0
+    _stats["windows"] += 1
+    return w
+
+
+def _prune(d: dict, now: float) -> None:
+    """Не копить ключи (монета, интервал, старт) по старым окнам."""
+    if len(d) > 2000:
+        for old in [x for x in d if x[2] < now - 86400]:
+            d.pop(old, None)
+
+
+async def _fetch_win(asset: str, interval: str, start: int, now: float) -> Win | None:
+    """Рынок окна по точному слагу + подписка его токенов на стакан. None — рынка (пока) нет."""
+    try:
+        toks = await market_discovery.get_window_tokens(asset, interval, start)
+    except Exception as exc:  # noqa: BLE001 — Gamma недоступна или кривой ответ: попробуем позже
+        _stats["discovery_errors"] += 1
+        _stats["last_error"] = f"{asset} {interval}: {exc}"[:200]
+        return None
+    if not toks:
+        return None
+    up, down = toks
+    own = bool(settings.USE_LIVE_BOOK_STREAM)
+    if own and start > now:
+        # окно ещё не началось — стакана может не быть до старта: сторож сокета не ждёт его раньше
+        book_stream.subscribe([up, down], watch_after_ms=int(start * 1000))
+    elif own:
+        book_stream.subscribe([up, down])
+    return Win(asset, interval, start, start + STEP[interval], slug_for(asset, interval, start), up, down,
+               own_tokens=own)
+
+
 async def _open(asset: str, interval: str, start: int, active_markets: dict | None, now: float) -> Win | None:
+    """Открыть текущее окно, если заранее его рынок не нашёлся."""
     step = STEP[interval]
     if interval == "5m":
         m = (active_markets or {}).get(f"{asset}:5m")
         if m is None or int(m.start_time) != start:
             return None                      # основной цикл ещё не нашёл рынок
-        own = False
-    else:
-        key = (asset, interval, start)
-        if now < _retry_at.get(key, 0):
-            return None
-        try:
-            m = await market_discovery.get_active_market(asset, _Tf(interval, step // 60))
-        except Exception as exc:  # noqa: BLE001 — рынка нет или Gamma недоступна: попробуем позже
-            _retry_at[key] = now + DISCOVERY_RETRY_SEC
-            _stats["discovery_errors"] += 1
-            _stats["last_error"] = f"{asset} {interval}: {exc}"[:200]
-            return None
-        if int(m.start_time) != start:
-            _retry_at[key] = now + DISCOVERY_RETRY_SEC
-            return None
-        own = bool(settings.USE_LIVE_BOOK_STREAM)
-        if own:
-            book_stream.subscribe([m.up_token_id, m.down_token_id])
-    w = Win(asset, interval, start, start + step, m.slug, m.up_token_id, m.down_token_id, own_tokens=own)
-    storage.series_upsert(asset, interval, start, slug=m.slug)
-    _supported.add((asset, interval))
-    _fails[(asset, interval)] = 0
-    _stats["windows"] += 1
-    return w
+        return _activate(Win(asset, interval, start, start + step, m.slug, m.up_token_id, m.down_token_id))
+    key = (asset, interval, start)
+    if now < _retry_at.get(key, 0):
+        return None
+    w = await _fetch_win(asset, interval, start, now)
+    if w is None:
+        late = now - start > FIRST_OBS_MAX_SEC          # цену старта уже не застать — нужен только исход
+        _retry_at[key] = now + (LATE_RETRY_SEC if late else DISCOVERY_RETRY_SEC)
+        _prune(_retry_at, now)
+        return None
+    return _activate(w)
+
+
+def _release(w: Win) -> None:
+    """Отписать токены окна, которое так и не стало текущим (кроме нужных текущему окну)."""
+    if not w.own_tokens:
+        return
+    cur = _cur.get((w.asset, w.interval))
+    busy = {cur.up, cur.down} if cur is not None else set()
+    toks = [t for t in (w.up, w.down) if t not in busy]
+    if toks:
+        book_stream.unsubscribe(toks)
+
+
+def _maybe_prefetch(asset: str, interval: str, start: int, now: float) -> None:
+    key = (asset, interval, start)
+    if key in _prefetching or now < _prefetch_at.get(key, 0):
+        return
+    _prefetching.add(key)
+    _prefetch_at[key] = now + PREFETCH_RETRY_SEC
+    _prune(_prefetch_at, now)
+    _spawn(_prefetch(asset, interval, start, now))
+
+
+async def _prefetch(asset: str, interval: str, start: int, now: float) -> None:
+    """Найти рынок окна start заранее и подписать его стакан (в фоне, не держит тик)."""
+    try:
+        w = await _fetch_win(asset, interval, start, now)
+        if w is None:
+            return
+        key = (asset, interval)
+        old, cur = _next.get(key), _cur.get(key)
+        if (old is not None and old.start == start) or (cur is not None and cur.start == start):
+            return                           # уже есть (подписка у токенов та же — не трогаем)
+        if old is not None:
+            _release(old)
+        _next[key] = w
+        _stats["prefetched"] += 1
+    finally:
+        _prefetching.discard((asset, interval, start))
 
 
 def _flush(w: Win) -> None:
-    storage.series_upsert(w.asset, w.interval, w.start, path=json.dumps(w.path, separators=(",", ":")),
-                          up_min=w.up_min, up_min_t=w.up_min_t, down_min=w.down_min, down_min_t=w.down_min_t)
+    fields = dict(slug=w.slug, path=json.dumps(w.path, separators=(",", ":")), up_min=w.up_min,
+                  up_min_t=w.up_min_t, down_min=w.down_min, down_min_t=w.down_min_t)
+    if w.depth:
+        fields["depth"] = json.dumps(w.depth, separators=(",", ":"))
+    storage.series_upsert(w.asset, w.interval, w.start, **fields)
+
+
+def _levels(token: str) -> list:
+    """Лучшие уровни asks: [[цена, акций], …]."""
+    asks = (book_stream.get_book(token) or {}).get("asks") or {}
+    return [[p, round(s, 2)] for p, s in sorted(asks.items())[:DEPTH_LEVELS]]
+
+
+def _snap_depth(w: Win, t: float) -> None:
+    """Снимок стакана у ближайшей прошедшей отметки DEPTH_AT (не больше одного за тик)."""
+    for c in DEPTH_AT:
+        if c in w.depth_done or t < c or t - c > DEPTH_TOL_SEC:
+            continue
+        up, down = _levels(w.up), _levels(w.down)
+        if not up and not down:
+            return                           # стакана ещё нет — попробуем на следующем тике
+        w.depth.append([round(t, 1), up, down])
+        w.depth_done.add(c)
+        return
 
 
 def _sample(w: Win, now: float) -> None:
-    t = now - w.start
+    t = now - w.start                        # до начала окна (рынок найден заранее) — отрицательное
     ua, da = book_stream.best_ask(w.up), book_stream.best_ask(w.down)
-    if not w.first and t <= FIRST_OBS_MAX_SEC and ua is not None and da is not None:
+    if not w.first and 0 <= t <= FIRST_OBS_MAX_SEC and ua is not None and da is not None:
         w.first = True
         _stats["priced"] += 1
         storage.series_upsert(w.asset, w.interval, w.start, t_first=round(t, 1), up_ask0=ua, down_ask0=da,
                               up_bid0=book_stream.best_bid(w.up), down_bid0=book_stream.best_bid(w.down))
-    if t - w.last_path_t >= path_step() and (ua is not None or da is not None):
-        w.path.append([int(round(t)), ua, da])
+    # тик раз в ~секунду: допуск полсекунды, чтобы шаг 1 с не превращался в 2 с
+    if t - w.last_path_t >= _step_for(w, t) - 0.5 and (ua is not None or da is not None):
+        w.path.append([round(t, 1), ua, da])
         w.last_path_t = t
+    if _fine(w):
+        _snap_depth(w, t)
     if w.first and now <= w.end - END_GUARD_SEC:
         if ua is not None and (w.up_min is None or ua < w.up_min):
             w.up_min, w.up_min_t = ua, round(t, 1)
@@ -220,27 +343,38 @@ def _close(w: Win) -> None:
     _pending.append(w)
 
 
+def _set_early(w: Win, outcome: str, **fields) -> None:
+    w.early_set = True
+    storage.series_upsert(w.asset, w.interval, w.start, early_outcome=outcome, **fields)
+    _outcomes[(w.asset, w.interval)].setdefault(w.start, outcome)
+    _stats["early"] += 1
+
+
 def resolve_pending(now: float | None = None) -> int:
-    """Ранний исход закончившихся окон: стакан последних секунд, иначе Chainlink."""
+    """Ранний исход закончившихся окон. По стакану последних секунд — сразу после
+    конца окна (серия перед следующим окном известна с его первой секунды), иначе —
+    по Chainlink, когда придёт точка после конца. Точки Chainlink пишем в обоих случаях."""
     now = time.time() if now is None else now
     done = 0
     for w in list(_pending):
-        if now < w.end + 2:
+        if now < w.end:
             continue
-        cl_start = chainlink_feed.price_at(w.asset, w.start)
-        cl_end = chainlink_feed.price_after(w.asset, w.end)
         book = w.book_res if w.book_res_t >= w.end - BOOK_LAST_SEC else None
-        if book is None and cl_end is None and now < w.end + EARLY_WAIT_SEC:
-            continue
-        _pending.remove(w)
-        early = book
-        if early is None and cl_start and cl_end:
-            early = "UP" if cl_end >= cl_start else "DOWN"
-        storage.series_upsert(w.asset, w.interval, w.start, cl_start=cl_start, cl_end=cl_end, early_outcome=early)
-        if early:
-            _outcomes[(w.asset, w.interval)].setdefault(w.start, early)
-            _stats["early"] += 1
+        if book and not w.early_set:
+            _set_early(w, book)
             done += 1
+        cl_end = chainlink_feed.price_after(w.asset, w.end)
+        if cl_end is None and now < w.end + EARLY_WAIT_SEC:
+            continue                          # ждём точку Chainlink после конца окна
+        _pending.remove(w)
+        cl_start = chainlink_feed.price_at(w.asset, w.start)
+        if w.early_set:
+            storage.series_upsert(w.asset, w.interval, w.start, cl_start=cl_start, cl_end=cl_end)
+        elif cl_start and cl_end:
+            _set_early(w, "UP" if cl_end >= cl_start else "DOWN", cl_start=cl_start, cl_end=cl_end)
+            done += 1
+        else:
+            storage.series_upsert(w.asset, w.interval, w.start, cl_start=cl_start, cl_end=cl_end)
     return done
 
 
@@ -311,6 +445,46 @@ def _new_window(key: tuple[str, str], start: int, now: float) -> None:
             _fails[key] = 0
 
 
+async def _tick_current(key: tuple[str, str], start: int, active_markets: dict | None, now: float) -> None:
+    asset, iv = key
+    w = _cur.get(key)
+    if w is not None and w.start != start:
+        _close(w)
+        _cur.pop(key, None)
+        w = None
+    if w is None:
+        nw = _next.get(key)
+        if nw is not None and nw.start == start:
+            w = _activate(_next.pop(key))    # рынок нашли заранее — цена есть с нулевой секунды
+        else:
+            if nw is not None and nw.start < start:
+                _release(_next.pop(key))     # заранее найденное окно так и не стало текущим
+            # Окно, найденное позже первой минуты (бот только что запустился), тоже
+            # открываем — без цены старта, но с исходом по стакану в конце: иначе
+            # серия перед следующим окном неизвестна, и его сигнал после каждого
+            # перезапуска терялся бы.
+            w = await _open(asset, iv, start, active_markets, now)
+            if w is None:
+                return
+        _cur[key] = w
+        if key not in _seeded:
+            _seeded.add(key)
+            _spawn(_seed(asset, iv, start))
+    _sample(w, now)
+
+
+def _tick_next(key: tuple[str, str], nxt: int, now: float) -> None:
+    """Окно, которое начнётся в nxt: найти рынок заранее и (у окон стратегии) писать цену до старта."""
+    if nxt - now > PREFETCH_SEC:
+        return
+    nw = _next.get(key)
+    if nw is None or nw.start != nxt:
+        _maybe_prefetch(key[0], key[1], nxt, now)
+        return
+    if nxt - now <= PRE_PATH_SEC and _fine(nw):
+        _sample(nw, now)
+
+
 async def tick(active_markets: dict | None, now: float | None = None) -> None:
     now = time.time() if now is None else now
     for iv in intervals():
@@ -322,24 +496,12 @@ async def tick(active_markets: dict | None, now: float | None = None) -> None:
                 _new_window(key, start, now)
             if now < _skip_until.get(key, 0):
                 continue
-            w = _cur.get(key)
-            if w is not None and w.start != start:
-                _close(w)
-                _cur.pop(key, None)
-                w = None
-            if w is None:
-                if now - start > FIRST_OBS_MAX_SEC and iv != "5m":
-                    continue                 # цену старта уже не застать — ждём следующее окно
-                w = await _open(asset, iv, start, active_markets, now)
-                if w is None:
-                    continue
-                _cur[key] = w
-                if key not in _seeded:
-                    _seeded.add(key)
-                    _spawn(_seed(asset, iv, start))
-            _sample(w, now)
+            await _tick_current(key, start, active_markets, now)
+            if iv != "5m":
+                _tick_next(key, start + step, now)
     resolve_pending(now)
     await maybe_trade(now)
+    track_variants(now)
 
 
 # ---------------------------------------------------------- 🎲 стратегия ----
@@ -555,27 +717,32 @@ async def _enter_live(w: Win, key, d: str, k: int, side: str, token: str, ask: f
     await _notify(f"✅ 🎲 Серии {asset.upper()} {iv}: {k}×{d} подряд → ставка {side} ${spent:.2f} по {price:.3f}")
 
 
+async def _official(t: dict, now: float, cache: dict) -> str | None:
+    """Официальный исход окна строки t: из series_windows, иначе — спросить Gamma
+    (не раньше SETTLE_LAG_SEC после конца; одно окно — один запрос за проход)."""
+    key = (t["asset"], t["interval"], t["start_ts"])
+    if key in cache:
+        return cache[key]
+    o = storage.series_outcome(*key)
+    if o is None and now - (t["start_ts"] + STEP.get(t["interval"], 900)) >= SETTLE_LAG_SEC:
+        try:
+            o = await market_discovery.get_resolution(t["slug"])
+        except Exception:  # noqa: BLE001
+            o = None
+        await asyncio.sleep(REQUEST_PAUSE_SEC)
+    cache[key] = o
+    return o
+
+
 async def settle_trades(now: float | None = None) -> int:
     """Итог ставок стратегии по исходу окна (официальный, иначе — спросить Gamma)."""
     now = time.time() if now is None else now
     n = 0
+    cache: dict = {}
     for t in storage.series_trades_open(int(now - 60)):
         if t["start_ts"] < now - SETTLE_MAX_AGE_SEC:
             continue                                  # старше 2 суток — не спрашиваем
-        official = None
-        rows = [r for r in storage.series_rows(t["interval"], t["start_ts"])
-                if r["asset"] == t["asset"] and r["start_ts"] == t["start_ts"]]
-        if rows and rows[0]["outcome"]:
-            official = rows[0]["outcome"]
-        if official is None:
-            if now - (t["start_ts"] + STEP.get(t["interval"], 900)) < SETTLE_LAG_SEC:
-                continue
-            try:
-                official = await market_discovery.get_resolution(t["slug"])
-            except Exception:  # noqa: BLE001
-                official = None
-            await asyncio.sleep(REQUEST_PAUSE_SEC)
-        o = official
+        o = await _official(t, now, cache)
         if o not in ("UP", "DOWN"):
             continue
         win = o == t["side"]
@@ -648,8 +815,194 @@ def strategy_lines() -> list[str]:
     return lines
 
 
+# --------------------------------------------------- 🎲 варианты входа ----
+#
+# По тем же сигналам (trade_k()+ одинаковых исходов перед окном) — виртуальные
+# ставки по другим правилам входа, чтобы через несколько дней сравнить правила
+# на одних и тех же окнах. Основное правило — сама стратегия (тестовые ставки).
+# 16.10 пропущенные основным правилом окна (весь первую минуту дороже 0.51)
+# выиграли 9 из 9, а вошли только туда, где цена шла против разворота, — 5 из 9.
+
+VARIANTS = (
+    ("start51", "сразу на старте, если ≤0.51"),
+    ("start60", "сразу на старте, если ≤0.60"),
+    ("lead60", "на 60-й с, если разворот уже ведёт (0.52–0.80)"),
+)
+VAR_START_CAP = {"start51": 0.51, "start60": 0.60}
+VAR_START_MAX_SEC = 10         # «на старте» — первый взгляд после того, как серия известна, не позже 10-й с
+VAR_AT_SEC, VAR_AT_MAX_SEC = 60, 90   # «на 60-й с» — первый тик с 60-й по 90-ю секунду
+VAR_LEAD_LO, VAR_LEAD_HI = 0.52, 0.80
+_vars: dict[tuple[str, str, int], dict] = {}        # окно с сигналом -> состояние вариантов
+
+
+def _log_variant(key, st: dict, variant: str, status: str, now: float, ask: float | None = None,
+                 price: float | None = None, spent: float = 0.0) -> bool:
+    asset, iv, start = key
+    f = dict(ts=int(now), asset=asset, interval=iv, start_ts=start, slug=st["win"].slug, variant=variant,
+             streak_dir=st["dir"], k=st["k"], side=st["side"], ask=ask, status=status,
+             sec_after_start=round(now - start, 1))
+    if price is not None:
+        f.update(price=price, size_usdc=spent, shares=round(spent / price, 4),
+                 fee_usdc=round(spent * float(settings.FEE_RATE) * (1 - price), 4))
+    st["done"].add(variant)
+    return storage.series_variant_log(**f) is not None
+
+
+def _variant_buy(key, st: dict, variant: str, cap: float, ask: float, now: float) -> bool:
+    """Виртуальная покупка по стакану (средняя цена по уровням не дороже cap)."""
+    price, spent = dry_fill(st["token"], cap, trade_usdc())
+    if price is None or spent < MIN_TRADE_USDC:
+        _log_variant(key, st, variant, "SKIP_BOOK", now, ask=ask)
+        return False
+    return _log_variant(key, st, variant, "BET", now, ask=ask, price=price, spent=spent)
+
+
+def track_variants(now: float | None = None) -> int:
+    """Решения вариантов по окнам с сигналом. Возвращает, сколько виртуальных ставок записали."""
+    now = time.time() if now is None else now
+    if not trade_enabled():
+        return 0
+    n = 0
+    for iv in trade_intervals():
+        step = STEP[iv]
+        start = int(now // step) * step
+        t = now - start
+        for asset in assets_for(iv):
+            key = (asset, iv, start)
+            st = _vars.get(key)
+            if st is None:
+                w = _cur.get((asset, iv))
+                if t > VAR_AT_MAX_SEC or w is None or w.start != start:
+                    continue
+                d, k = streak_before(asset, iv, start)
+                if d is None or k < trade_k():
+                    continue
+                side = "DOWN" if d == "UP" else "UP"
+                st = _vars[key] = {"win": w, "dir": d, "k": k, "side": side,
+                                   "token": w.down if side == "DOWN" else w.up, "done": set()}
+            if len(st["done"]) == len(VARIANTS):
+                continue
+            ask = book_stream.best_ask(st["token"])
+            for v, cap in VAR_START_CAP.items():
+                if v in st["done"]:
+                    continue
+                if t > VAR_START_MAX_SEC:
+                    _log_variant(key, st, v, "SKIP_LATE", now, ask=ask)
+                elif ask is None:
+                    continue                          # стакана ещё нет — ждём до 10-й секунды
+                elif ask > cap + 1e-9:
+                    _log_variant(key, st, v, "SKIP_PRICE", now, ask=ask)
+                else:
+                    n += _variant_buy(key, st, v, cap, ask, now)
+            if "lead60" not in st["done"] and t >= VAR_AT_SEC:
+                if t > VAR_AT_MAX_SEC:
+                    _log_variant(key, st, "lead60", "SKIP_LATE", now, ask=ask)
+                elif ask is None:
+                    pass
+                elif VAR_LEAD_LO - 1e-9 <= ask <= VAR_LEAD_HI + 1e-9:
+                    n += _variant_buy(key, st, "lead60", VAR_LEAD_HI, ask, now)
+                else:
+                    _log_variant(key, st, "lead60", "SKIP_PRICE", now, ask=ask)
+    # окна, ушедшие без решения (бот стоял, нет стакана) — записать пропуск и забыть
+    for key, st in list(_vars.items()):
+        if now - key[2] > VAR_AT_MAX_SEC:
+            for v, _label in VARIANTS:
+                if v not in st["done"]:
+                    _log_variant(key, st, v, "SKIP_LATE", now)
+            _vars.pop(key, None)
+    return n
+
+
+async def settle_variants(now: float | None = None) -> int:
+    """Итог виртуальных ставок вариантов (как у тестовых: с комиссией тейкера)."""
+    now = time.time() if now is None else now
+    n = 0
+    cache: dict = {}
+    for v in storage.series_variants_open(int(now - 60)):
+        if v["start_ts"] < now - SETTLE_MAX_AGE_SEC:
+            continue
+        o = await _official(v, now, cache)
+        if o not in ("UP", "DOWN"):
+            continue
+        win = o == v["side"]
+        pnl = ((v["shares"] if win else 0.0) - v["size_usdc"] - (v["fee_usdc"] or 0.0)
+               if v["status"] == "BET" else 0.0)
+        if storage.series_variant_settle(v["id"], o, round(pnl, 4)):
+            n += 1
+    return n
+
+
+def variant_stats(since_ts: int = 0) -> dict[str, dict]:
+    out = {v: {"bets": 0, "settled": 0, "wins": 0, "pnl": 0.0, "staked": 0.0, "price_sum": 0.0,
+               "skips": 0, "skip_won": 0, "skip_settled": 0} for v, _label in VARIANTS}
+    for r in storage.series_variants_since(since_ts):
+        s = out.get(r["variant"])
+        if s is None:
+            continue
+        if r["status"] == "BET":
+            s["bets"] += 1
+            s["price_sum"] += r["price"] or 0.0
+            if r["outcome"]:
+                s["settled"] += 1
+                s["wins"] += r["outcome"] == r["side"]
+                s["pnl"] += r["pnl_usdc"] or 0.0
+                s["staked"] += r["size_usdc"] or 0.0
+        else:
+            s["skips"] += 1
+            if r["outcome"]:
+                s["skip_settled"] += 1
+                s["skip_won"] += r["outcome"] == r["side"]
+    return out
+
+
+def _cmp_line(label: str, bets: int, settled: int, wins: int, pnl: float, staked: float, avg: float | None,
+              skips: int, skip_won: int, skip_settled: int) -> str:
+    s = f"{label}: ставок {bets}"
+    if avg:
+        s += f" (ср. цена {avg:.3f})"
+    if settled and staked:
+        s += f", выигр. {wins}/{settled} = {wins / settled * 100:.0f}%, {pnl:+.2f} $ ({pnl / staked * 100:+.1f}%)"
+    if skips:
+        s += f"; без ставки {skips}" + (f" (выиграли бы {skip_won}/{skip_settled})" if skip_settled else "")
+    return s
+
+
+def variant_lines() -> list[str]:
+    """Сравнение правил входа на одних сигналах — с первой записи вариантов."""
+    since = storage.series_variants_first_ts()
+    if since is None:
+        return ["Сравнение входов на тех же сигналах: пока пусто — появится с первым сигналом."]
+    m = trade_stats(since, live=False)
+    lines = [f"Сравнение входов на тех же сигналах (тест, с {time.strftime('%d.%m %H:%M', time.gmtime(since))} UTC):",
+             "  · " + _cmp_line(f"основной — ≤{trade_cap():.2f} в первые {int(settings.SERIES_TRADE_ENTRY_SEC)} с",
+                                m["bets"], m["settled"], m["wins"], m["pnl"], m["staked"], m["avg_price"],
+                                m["skip_price"] + m["skip_book"], m["skip_won"], m["skip_settled"])]
+    st = variant_stats(since)
+    for v, label in VARIANTS:
+        s = st[v]
+        lines.append("  · " + _cmp_line(label, s["bets"], s["settled"], s["wins"], s["pnl"], s["staked"],
+                                        s["price_sum"] / s["bets"] if s["bets"] else None,
+                                        s["skips"], s["skip_won"], s["skip_settled"]))
+    return lines
+
+
+def trim_paths(now: float | None = None) -> int:
+    """Стереть путь и снимки стакана у окон старше SERIES_PATH_KEEP_DAYS дней."""
+    days = int(settings.SERIES_PATH_KEEP_DAYS)
+    if days <= 0:
+        return 0
+    now = time.time() if now is None else now
+    return storage.series_trim(int(now - days * 86400))
+
+
+async def _sleep_to_next_second() -> None:
+    """Тик — в начале каждой секунды: окно стартует на ровной секунде, и первый
+    взгляд на рынок приходится на её первые ~0.05 с, а не на случайный момент."""
+    await asyncio.sleep(1.0 - (time.time() % 1.0) + 0.05)
+
+
 async def run_forever(active_markets: dict | None = None) -> None:
-    last_settle = 0.0
+    last_settle = last_trim = 0.0
     await asyncio.sleep(3)
     while True:
         try:
@@ -659,13 +1012,20 @@ async def run_forever(active_markets: dict | None = None) -> None:
                     last_settle = time.monotonic()
                     await settle()
                     await settle_trades()
+                    await settle_variants()
+                if time.monotonic() - last_trim >= TRIM_EVERY_SEC:
+                    last_trim = time.monotonic()
+                    trim_paths()
             else:
                 for w in list(_cur.values()):
                     _close(w)
                 _cur.clear()
+                for w in list(_next.values()):
+                    _release(w)
+                _next.clear()
         except Exception as exc:  # noqa: BLE001 — тест не должен мешать боту
             log.warning("series_bot: %s", exc)
-        await asyncio.sleep(1.0)
+        await _sleep_to_next_second()
 
 
 # ------------------------------------------------------------- итоги ----
@@ -753,7 +1113,10 @@ def interval_lines(interval: str, since_ts: int = 0) -> list[str]:
              + " · ".join(f"{a.upper()} {n}" for a, n in sorted(per.items()))]
     if priced:
         avg_ask = sum(min(r["up_ask0"], r["down_ask0"]) + max(r["up_ask0"], r["down_ask0"]) for r in priced) / len(priced)
-        lines.append(f"  сумма ask сторон на старте в среднем {avg_ask:.3f}")
+        tf = sorted(r["t_first"] for r in priced if r["t_first"] is not None)
+        seen = (f"; рынок видим через {tf[len(tf) // 2]:.1f} с после начала (медиана), в первые 2 с — "
+                f"{sum(1 for x in tf if x <= 2)}/{len(tf)}") if tf else ""
+        lines.append(f"  сумма ask сторон на старте в среднем {avg_ask:.3f}{seen}")
     bs = bets(interval, since_ts)
     for k in KS:
         st = plan_stats(bs, k)
@@ -795,12 +1158,15 @@ def summary_lines(since_ts: int = 0) -> list[str]:
 
 
 def menu_text() -> str:
-    lines = strategy_lines() + ["", ] + [
+    fine = (f" Окна {', '.join(trade_intervals())}: рынок находим заранее, за {PREFETCH_SEC / 60:g} мин до "
+            f"начала; с {PRE_PATH_SEC} с до старта и всю первую минуту — цена каждые {fine_step()} с и снимки "
+            "стакана." if fine_step() and trade_intervals() else "")
+    lines = strategy_lines() + [""] + variant_lines() + ["", ] + [
         "🔁 Серии — тест на Polymarket " + ("(запись идёт" if enabled() else "(запись выключена") +
         ", ничего не покупает)",
         "",
         "По каждому окну пишем цены сторон на старте и каждые "
-        f"{path_step()} с, исход. Ставка — на разворот после серии одинаковых исходов: на старте по ask "
+        f"{path_step()} с, исход.{fine} Ставка — на разворот после серии одинаковых исходов: на старте по ask "
         "(с комиссией) и лимиткой дешевле (без комиссии, если цена дошла до неё до минуты до конца).",
         "",
     ]

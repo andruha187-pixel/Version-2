@@ -193,6 +193,20 @@ async def get_active_market(asset: str, timeframe: TimeframeProfile) -> ActiveMa
     )
 
 
+async def get_window_tokens(asset: str, label: str, start_ts: int) -> tuple[str, str] | None:
+    """Токены (UP, DOWN) окна по точному слагу {asset}-updown-{label}-{start_ts}.
+
+    None — такого рынка (пока) нет. Без запасного пути через серию и без цены
+    страйка с Binance: так можно найти рынок СЛЕДУЮЩЕГО окна заранее, до его
+    начала (🔁 тест серий подписывает его стакан за полторы минуты до старта).
+    """
+    event = await _fetch_event_by_slug(_expected_slug(asset.lower(), label, int(start_ts)))
+    if event is None:
+        return None
+    _cid, (up_token, down_token), _start, _end = _extract_market_fields(event)
+    return up_token, down_token
+
+
 async def get_resolution(slug: str) -> str | None:
     """
     Возвращает "UP" / "DOWN", если рынок уже зарезолвился, иначе None.
