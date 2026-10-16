@@ -257,6 +257,18 @@ class Settings:
     SERIES_TEST_ENABLED: bool = _get_bool("SERIES_TEST_ENABLED", True)
     SERIES_INTERVALS: str = os.getenv("SERIES_INTERVALS", "15m,5m")
     SERIES_PATH_STEP_SEC: int = _get_int("SERIES_PATH_STEP_SEC", 5)
+    # 🎲 Стратегия серий: после SERIES_TRADE_K+ одинаковых исходов подряд —
+    # ставка на разворот в первые SERIES_TRADE_ENTRY_SEC секунд окна по цене не
+    # выше SERIES_TRADE_CAP. По умолчанию — тест (без денег); реально — кнопкой.
+    # SERIES_TRADE_STOP_USDC — дневной стоп по реальным ставкам стратегии (0 — выкл).
+    SERIES_TRADE_ENABLED: bool = _get_bool("SERIES_TRADE_ENABLED", True)
+    SERIES_TRADE_LIVE: bool = _get_bool("SERIES_TRADE_LIVE", False)
+    SERIES_TRADE_INTERVALS: str = os.getenv("SERIES_TRADE_INTERVALS", "15m")
+    SERIES_TRADE_K: int = _get_int("SERIES_TRADE_K", 4)
+    SERIES_TRADE_CAP: float = _get_float("SERIES_TRADE_CAP", 0.51)
+    SERIES_TRADE_USDC: float = _get_float("SERIES_TRADE_USDC", 3.0)
+    SERIES_TRADE_STOP_USDC: float = _get_float("SERIES_TRADE_STOP_USDC", 30.0)
+    SERIES_TRADE_ENTRY_SEC: int = _get_int("SERIES_TRADE_ENTRY_SEC", 60)
 
     # --- Telegram ---
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
