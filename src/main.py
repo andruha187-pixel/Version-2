@@ -1,7 +1,12 @@
 """
 Точка входа. Архитектура: один независимый асинхронный поток на каждую
-пару (актив, таймфрейм) — например, "btc/15m", "sol/1h" и т.д. Все потоки
+пару (актив, таймфрейм) — например, "btc/5m", "sol/5m" и т.д. Все потоки
 делят общий book_stream (WS-стакан), общий Telegram-бот и общую БД.
+
+Плюс быстрая проверка сигнала (src/fast_signal.py): раз в ~0.3 с по всем
+монетам по данным в памяти — цена Binance из потока (src/price_stream.py),
+живой стакан и свечи последнего тика. Обычный тик раз в 3 с остаётся: он
+находит рынок, тянет свечи, пишет тики в базу и тоже может войти.
 
 Плюс две общие фоновые задачи, которые не привязаны к конкретному потоку:
 - settlement_loop: резолюция сделок и разметка исходов сигналов по ВСЕМ
@@ -18,7 +23,8 @@ import time
 from config import settings
 from src import binance_feed, market_discovery, indicators, strategy
 from src.market_discovery import ActiveMarket
-from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting, wallet_tracker, momentum_tracker, hedge_bot, ladder_logger
+from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting, wallet_tracker, momentum_tracker, hedge_bot
+from src import price_stream, fast_signal, entry_confirm, chainlink_feed, duo, speed_lab, venues, series_bot
 from src.timeframes import TIMEFRAMES, TimeframeProfile
 
 logging.basicConfig(
@@ -71,20 +77,30 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
         _active_markets[key] = market
         if settings.USE_LIVE_BOOK_STREAM:
             book_stream.subscribe([market.up_token_id, market.down_token_id])
+        # Новое окно — сразу прогреваем рынок в SDK (метаданные для ордера),
+        # чтобы в момент сигнала ордер уходил без лишнего запроса. Только для
+        # монет, по которым сейчас идут реальные сделки.
+        if not runtime_state.trade_is_dry(asset):
+            asyncio.create_task(polymarket_client.prewarm_market([market.up_token_id, market.down_token_id]))
 
     if not runtime_state.get("dry_run"):
         asyncio.create_task(polymarket_client.prewarm_transport())
 
     symbol = binance_feed.symbol_for(asset)
+    fetch_ms = int(time.time() * 1000)
     klines = await binance_feed.get_klines(
         symbol,
         limit=max(100, timeframe.atr_lookback_for_regime + timeframe.atr_period + 5),
         interval=timeframe.kline_interval,
     )
+    # Свечи и монету — быстрой проверке: между тиками она досчитывает
+    # последнюю свечу сделками из потока Binance (той же площадки, что свечи).
+    fast_signal.remember_klines(asset, klines, fetch_ms)
+    price_stream.watch(symbol, binance_feed.venue_for(symbol))
     ind = indicators.compute_indicator_snapshot(
         klines, timeframe.atr_period, timeframe.ema_fast, timeframe.ema_slow, timeframe.atr_lookback_for_regime,
     )
-    current_price = ind["close"]
+    binance_price = ind["close"]
 
     minutes_left = max(0.0, (market.end_time - time.time()) / 60)
 
@@ -92,23 +108,37 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
     up_book = await get_book(market.up_token_id)
     down_book = await get_book(market.down_token_id)
 
-    decision = strategy.evaluate(
-        current_price=current_price,
-        strike_price=market.strike_price,
-        minutes_left=minutes_left,
-        indicators=ind,
-        up_book=up_book,
-        down_book=down_book,
-        min_minutes_left=timeframe.min_minutes_left,
-        max_minutes_left=timeframe.max_minutes_left,
-        atr_distance_mult=timeframe.atr_distance_mult,
-        atr_spike_mult=timeframe.atr_spike_mult,
-        market_start_ts=market.start_time,
-        market_end_ts=market.end_time,
-    )
+    # Окно входа — из настроек (⚙️ → ⏱ Окно входа), а не зашитое в профиль
+    win_min, win_max = runtime_state.entry_window()
+    # Цена и страйк: Chainlink (как Polymarket при расчёте исхода) или Binance —
+    # по настройке; без свежей цены/страйка Chainlink сигнал не считается.
+    pv = chainlink_feed.view(asset, market, binance_price)
+    if pv.problem:
+        decision = strategy.Decision(False, None, None, 0.0, minutes_left, 0.0, reasons=[pv.problem])
+    else:
+        decision = strategy.evaluate(
+            current_price=pv.price,
+            strike_price=pv.strike,
+            minutes_left=minutes_left,
+            indicators=ind,
+            up_book=up_book,
+            down_book=down_book,
+            min_minutes_left=win_min,
+            max_minutes_left=win_max,
+            atr_distance_mult=timeframe.atr_distance_mult,
+            atr_spike_mult=timeframe.atr_spike_mult,
+            asset=asset,
+        )
+    current_price = pv.price if pv.price is not None else binance_price
+    strike_price = pv.strike if pv.strike is not None else market.strike_price
+    # Результат оценки — для подтверждения сигнала (вход, только если сигнал
+    # был и ~3 с назад, см. src/entry_confirm.py)
+    entry_confirm.record(market.slug, decision.direction, decision.should_enter)
 
-    storage.log_signal(market.slug, current_price, market.strike_price, decision,
-                        indicators=ind, up_book=up_book, down_book=down_book)
+    storage.log_signal(market.slug, current_price, strike_price, decision,
+                        indicators=ind, up_book=up_book, down_book=down_book,
+                        price_source=pv.log_source, binance_price=binance_price,
+                        binance_strike=market.strike_price)
 
     _instance_state[key] = {
         "market_slug": market.slug,
@@ -116,7 +146,7 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
         "timeframe": timeframe.label,
         "direction": decision.direction,
         "current_price": round(current_price, 2),
-        "strike_price": round(market.strike_price, 2),
+        "strike_price": round(strike_price, 2),
         "minutes_left": round(minutes_left, 2),
         "safety_score": decision.safety_score,
         "up_token_id": market.up_token_id,
@@ -126,8 +156,8 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
 
     active_book = up_book if decision.direction == "UP" else down_book
     log.info(
-        "%s | price=%.4f strike=%.4f dir=%s left=%.1fm score=%.1f enter=%s book=%s reasons=%s",
-        market.slug, current_price, market.strike_price, decision.direction,
+        "%s | %s price=%.4f strike=%.4f dir=%s left=%.1fm score=%.1f enter=%s book=%s reasons=%s",
+        market.slug, pv.log_source, current_price, strike_price, decision.direction,
         minutes_left, decision.safety_score, decision.should_enter, active_book.source, decision.reasons,
     )
 
@@ -181,12 +211,11 @@ async def _instance_loop(asset: str, timeframe: TimeframeProfile) -> None:
 
 async def settlement_loop() -> None:
     """Общая (не привязанная к конкретному активу) фоновая задача: резолюция
-    сделок, стоп-лосс открытых позиций и разметка исходов сигналов по всем
-    потокам разом."""
+    сделок и разметка исходов сигналов по всем потокам разом. Стоп-лосс
+    позиций — в отдельном быстром цикле stop_loss_loop."""
     while True:
         try:
             await executor.settle_resolved_trades()
-            await executor.check_position_stop_losses()
             active = set(_active_slugs.values())
             await executor.label_resolved_markets(exclude_slugs=active)
             if settings.MOMENTUM_TRACKER_ENABLED:
@@ -198,10 +227,33 @@ async def settlement_loop() -> None:
         await asyncio.sleep(10)
 
 
+STOP_LOSS_CHECK_SECONDS = 2
+
+
+async def stop_loss_loop() -> None:
+    """Стоп-лосс позиции (если включён в Telegram) — проверка раз в ~2 с.
+    Раньше он жил в settlement_loop и проверялся раз в 10 с: по отчётам
+    25.09–05.10 проигрышная позиция падает с ~0.9 до ~0.4 за секунды, и на
+    тех же сделках проверка раз в 10 с продавала заметно хуже, чем раз в 2–3 с.
+    Выключенный стоп ничего не стоит: функция сразу выходит, без запросов."""
+    while True:
+        try:
+            await executor.check_position_stop_losses()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Ошибка в stop_loss_loop: %s", exc)
+        await asyncio.sleep(STOP_LOSS_CHECK_SECONDS)
+
+
 async def main():
     # Инициализация БД и настроек — до старта любых фоновых задач.
     storage.init_db()
     runtime_state.init_from_db()
+    # Бот двух стратегий: виртуальные сделки, исходы и входы стратегий за
+    # последние часы — из базы (src/duo.py)
+    duo.init()
+    # Разовый переход на настройки 15.10: общая пауза 2️⃣, фильтр «≥ 2 мин до
+    # конца», обе стратегии в тесте (дальше — только кнопками)
+    duo_v3_applied = duo.enabled() and duo.apply_v3_defaults()
 
     # Защита от "тихого" LIVE без ключа: если в БД с прошлого раза сохранён
     # LIVE-режим, а сейчас POLY_PRIVATE_KEY не задан (новый хостинг, забыли
@@ -219,28 +271,92 @@ async def main():
 
         await telegram_notify.clear_legacy_keyboard()
         dry_run = runtime_state.get("dry_run")
-        assets_line = ", ".join(a.upper() for a in settings.ASSETS)
+        assets_line = telegram_notify._assets_modes_line() or "(нет включённых)"
         timeframes_line = ", ".join(tf.label for tf in TIMEFRAMES)
         forced_note = (
             "\n⚠️ Был сохранён LIVE-режим с прошлого раза, но POLY_PRIVATE_KEY сейчас не задан — "
             "принудительно откатил в DRY RUN, чтобы не пытаться торговать без ключа."
             if forced_back_to_dry_run else ""
         )
+        # Без постоянного тома каждый деплой начинается с пустой базы: режим
+        # возвращается в DRY RUN, ставка/банк — к значениям по умолчанию,
+        # статистика обнуляется. Говорим об этом сразу, а не когда заметят.
+        new_db_note = (
+            f"\n⚠️ База данных создана заново ({settings.DB_PATH}). Если бот уже работал раньше, "
+            "значит данные не сохраняются между деплоями: подключи в Coolify постоянный том "
+            "(Persistent Storage) на /app/data. Сейчас режим, ставка, банк и свои настройки "
+            "монет — по умолчанию, статистика пустая."
+            if storage.DB_WAS_NEW else ""
+        )
+        pending_note = telegram_notify._live_pending_note()
+        fast_note = (
+            f"⚡ Быстрый вход: вкл — сигнал проверяется раз в {max(0.1, settings.FAST_LOOP_INTERVAL_SEC):g} с "
+            "по цене Binance из потока (⚙️ Настройки)."
+            if runtime_state.get("fast_entry_enabled") and settings.USE_LIVE_BOOK_STREAM else
+            "⚡ Быстрый вход: выкл — сигнал проверяется раз в 3 с."
+        )
+        fast_note += "\n" + (
+            f"⏱ Подтверждение сигнала: вкл — вход, только если сигнал был и {settings.ENTRY_CONFIRM_SEC:g} с назад."
+            if entry_confirm.enabled() else
+            "⏱ Подтверждение сигнала: выкл — вход на первой проверке с сигналом."
+        )
+        fast_note += "\n" + (
+            "📡 Цена сигнала: Chainlink — как у Polymarket. Первое окно после запуска по каждой "
+            "монете бот пропустит: страйк Chainlink берётся из потока, а он начал писать только сейчас."
+            if chainlink_feed.mode() == "chainlink" else
+            "📡 Цена сигнала: Binance."
+        )
+        if not runtime_state.get("distance_filter_enabled"):
+            fast_note += "\n📏 Фильтр расстояния: выкл — логика «сломанного» бота (⚙️ Настройки)."
+        if duo.enabled():
+            fast_note += ("\n" + duo.summary_line() + "\nКаждый сигнал — виртуальная сделка, реальные "
+                          "входы делают стратегии (🎯 Стратегии в меню). 🔴 у монеты — стратегиям можно "
+                          "входить по ней реальными деньгами, 🧪 — только тест.")
+            if series_bot.enabled() and settings.USE_LIVE_BOOK_STREAM and series_bot.intervals():
+                fast_note += ("\n🔁 Серии: тест идёт — цены окон " + ", ".join(series_bot.intervals())
+                              + " и исходы, ставка на разворот после серии считается без денег (🎯 → 📚).")
+            if speed_lab.enabled() and settings.USE_LIVE_BOOK_STREAM:
+                fast_note += ("\n⚡ Скорость рынка: запись идёт — рывки Binance, стакан Polymarket до/после "
+                              "и цены других бирж (ничего не покупает; 🎯 Стратегии → ⚡).")
+            if duo_v3_applied:
+                fast_note += ("\n🆕 Настройки обновлены: пауза 2️⃣ — общая, 60 мин; фильтр входа — не позже "
+                              "чем за 2 мин до конца (спред — выкл, только пишется); обе стратегии в 🧪 тесте. "
+                              "Менять — 🎯 Стратегии.")
         await telegram_notify.notify(
             f"🤖 Бот запущен. Режим: {'DRY RUN (без реальных сделок)' if dry_run else 'LIVE — реальные сделки!'}\n"
-            f"Активы: {assets_line}\nТаймфреймы: {timeframes_line}\n"
-            f"Открой /menu для управления (старт/стоп, размер позиции, стоп-лосс, настройки)."
-            f"{forced_note}"
+            f"Активы: {assets_line} (🔴 реальные сделки, 🧪 DRY)\nТаймфреймы: {timeframes_line}\n"
+            + (f"{pending_note}\n" if pending_note else "")
+            + f"{fast_note}\n"
+            + "Открой /menu для управления (старт/стоп, размер позиции, стоп-лосс, настройки)."
+            f"{forced_note}{new_db_note}"
         )
 
         book_stream_task = None
         if settings.USE_LIVE_BOOK_STREAM:
             book_stream_task = asyncio.create_task(book_stream.run_forever())
+        # Цена Binance потоком и быстрая проверка сигнала (раз в ~0.3 с).
+        # Без живого стакана быстрой проверке не на что смотреть.
+        price_stream_task = asyncio.create_task(price_stream.run_forever())
+        # Цена Chainlink — потоки цен Polymarket (PolyBolt и старый RTDS)
+        chainlink_task = asyncio.create_task(chainlink_feed.run_forever())
+        # Исходы рынков для стратегий — по стакану в момент конца рынка (src/duo.py)
+        duo_task = asyncio.create_task(duo.run_forever())
+        fast_task = (asyncio.create_task(fast_signal.run_forever(_active_markets))
+                     if settings.USE_LIVE_BOOK_STREAM else None)
+        # ⚡ Лаборатория скорости: только запись — рывки Binance и стакан до/после
+        speed_task = (asyncio.create_task(speed_lab.run_forever(_active_markets))
+                      if settings.USE_LIVE_BOOK_STREAM else None)
+        # Другие биржи для лаборатории (только чтение; молчат, пока запись выключена)
+        venues_task = (asyncio.create_task(venues.run_forever(active=speed_lab.enabled))
+                       if settings.USE_LIVE_BOOK_STREAM and venues.enabled_venues() else None)
+        # 🔁 Тест серий на Polymarket: цены окон 15m/5m и исходы (ничего не покупает)
+        series_task = (asyncio.create_task(series_bot.run_forever(_active_markets))
+                       if settings.USE_LIVE_BOOK_STREAM and series_bot.intervals() else None)
 
         report_task = asyncio.create_task(reporting.report_loop())
         settlement_task = asyncio.create_task(settlement_loop())
+        stop_loss_task = asyncio.create_task(stop_loss_loop())
         wallet_tracker_task = asyncio.create_task(wallet_tracker.wallet_tracker_loop())
-        ladder_logger_task = asyncio.create_task(ladder_logger.run_forever())
 
         instance_tasks = [
             asyncio.create_task(_instance_loop(asset, timeframe))
@@ -253,10 +369,21 @@ async def main():
         finally:
             if book_stream_task:
                 book_stream_task.cancel()
+            price_stream_task.cancel()
+            chainlink_task.cancel()
+            duo_task.cancel()
+            if fast_task:
+                fast_task.cancel()
+            if speed_task:
+                speed_task.cancel()
+            if venues_task:
+                venues_task.cancel()
+            if series_task:
+                series_task.cancel()
             report_task.cancel()
             settlement_task.cancel()
+            stop_loss_task.cancel()
             wallet_tracker_task.cancel()
-            ladder_logger_task.cancel()
             await app.updater.stop()
             await app.stop()
 

@@ -15,7 +15,7 @@ src/timeframes.py) — у 15-минутного и часового рынка �
 from __future__ import annotations
 from dataclasses import dataclass, field
 
-from src import news_calendar, runtime_state
+from src import runtime_state
 from src.polymarket_client import OrderBookSnapshot
 
 
@@ -35,6 +35,12 @@ class Decision:
     trend_score: float = 0.0
     vol_score: float = 0.0
     liq_score: float = 0.0
+    # Для фильтров входа бота двух стратегий и разбора сделок потом:
+    # ask другой стороны (спред = entry_price + opp_ask − 1), запас до
+    # страйка в % и волатильность (ATR к среднему).
+    opp_ask: float | None = None
+    distance_pct: float | None = None
+    atr_ratio: float | None = None
 
 
 def _score_time_window(minutes_left: float, min_left: float, max_left: float) -> float:
@@ -107,8 +113,7 @@ def evaluate(
     max_minutes_left: float,
     atr_distance_mult: float,
     atr_spike_mult: float,
-    market_start_ts: int | None = None,
-    market_end_ts: int | None = None,
+    asset: str | None = None,
 ) -> Decision:
     reasons = []
 
@@ -116,24 +121,31 @@ def evaluate(
     book = up_book if direction == "UP" else down_book
 
     if book.best_ask is None:
-        if runtime_state.get("strategy_mode") == "momentum":
-            return _momentum_decision(up_book, down_book, minutes_left, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                                      market_start_ts, market_end_ts)
         return Decision(False, direction, None, 0.0, minutes_left, 0.0, ["нет asks в стакане"])
 
-    min_entry = runtime_state.get("min_entry_price")
-    max_entry = runtime_state.get("max_entry_price")
+    # Диапазон входа и ставка — свои у монеты, если заданы в ⚙️ (🪙 Активы),
+    # иначе общие из главного меню.
+    min_entry, max_entry = runtime_state.entry_range(asset)
     score_threshold = runtime_state.get("safety_score_threshold")
-    trade_size = runtime_state.get("trade_size_usdc")
+    # Ликвидность оцениваем под реальную ставку этой монеты. В режиме % банка
+    # банк берём из кэша (не старше 30 с), чтобы не ходить в базу на каждом
+    # тике каждой монеты.
+    trade_size = runtime_state.compute_trade_size(asset, max_bank_age=30)
 
     if not (min_entry <= book.best_ask <= max_entry):
-        reasons.append(f"цена {book.best_ask:.3f} вне диапазона [{min_entry}, {max_entry}]")
+        reasons.append(f"цена {book.best_ask:.3f} вне диапазона [{min_entry:.2f}, {max_entry:.2f}]")
 
     atr = indicators["atr"] or 1e-9
     distance_atr = abs(current_price - strike_price) / atr
 
     time_score = _score_time_window(minutes_left, min_minutes_left, max_minutes_left)
-    distance_score = _score_distance(distance_atr, atr_distance_mult)
+    # Фильтр расстояния выключен (⚙️ → 📏) — логика «сломанного» бота 12–14.10:
+    # тогда из-за единиц цены Chainlink расстояние в ATR было «бесконечным», и
+    # бот входил по фаворитам без проверки расстояния в ATR. Расстояние
+    # считаем полным (100); минимум в % (0.05%) сломанный бот проверял — и мы
+    # проверяем (его сигналы 13–15.10: ни одного входа ближе 0.05%).
+    distance_filter = runtime_state._state.get("distance_filter_enabled", True)
+    distance_score = _score_distance(distance_atr, atr_distance_mult) if distance_filter else 100.0
     trend_score = _score_trend_alignment(direction, indicators["ema_fast_slope"], indicators["trend_up"], indicators["macd_bullish"])
     vol_score = _score_volatility_regime(indicators["atr_ratio_to_avg"], atr_spike_mult)
     liq_score = _score_liquidity(book, trade_size)
@@ -208,13 +220,7 @@ def evaluate(
         and distance_ok
     )
 
-    if runtime_state.get("strategy_mode") == "momentum":
-        return _momentum_decision(
-            up_book, down_book, minutes_left, distance_atr,
-            time_score, distance_score, trend_score, vol_score, liq_score, safety_score,
-            market_start_ts, market_end_ts,
-        )
-
+    opp_book = down_book if direction == "UP" else up_book
     return Decision(
         should_enter=should_enter,
         direction=direction,
@@ -228,87 +234,7 @@ def evaluate(
         trend_score=round(trend_score, 1),
         vol_score=round(vol_score, 1),
         liq_score=round(liq_score, 1),
-    )
-
-
-def _momentum_decision(up_book: OrderBookSnapshot, down_book: OrderBookSnapshot, minutes_left: float,
-                       distance_atr: float, time_score: float, distance_score: float, trend_score: float,
-                       vol_score: float, liq_score: float, safety_score: float,
-                       market_start_ts: int | None = None, market_end_ts: int | None = None) -> Decision:
-    """
-    «Ранний импульс» для 15-минутных рынков.
-
-    Покупаем ЛИДЕРА (сторону, которую рынок сам считает более вероятной — по
-    цене в стакане, а не по Binance), как только его ask впервые оказался в
-    [mom_min_price, mom_max_price], пока до конца окна ещё >= mom_min_minutes_left
-    (по умолчанию 12.5 — то есть только первые 2.5 минуты окна) и спред
-    ask(UP)+ask(DOWN)−1 не шире mom_max_spread. Держим до резолюции.
-
-    Откуда (все архивы 16.09–02.10: 1105 закрытых рынков 15m, BTC/ETH/SOL/XRP):
-    - В первой трети окна рынок систематически НЕДОоценивает лидера: наклон
-      калибровки logit(цены) 1.30/1.57/1.72 в трёх разных периодах (1.0 —
-      честная цена). Ближе к концу окна наклон ~1 — перекоса нет, поэтому
-      классический вход 0.90–0.95 ближе к концу даёт ноль минус комиссия.
-    - Чем раньше лидер дошёл до 0.78–0.88, тем лучше: при >= 12.5 мин — 234
-      сделки, 90.2% выигрышей при средней цене 0.795 (безубыток ~81.5%),
-      +$1.07 на $10 с комиссией и проскальзыванием 0.01; все 10 дней в плюсе.
-      При >= 10 мин (как было) — +$0.27, в 16–19.09 почти ноль.
-    - Параметры, выбранные только по 25.09–02.10, на 16–19.09 (отдельные данные)
-      дали +$0.62 на сделку. Расчёт перепроверен независимым пересчётом.
-    - На 5m такого перекоса нет (там вход лидера рано — в минусе).
-    - Предупреждение: по данным momentum-трекера 20–23.09 (более грязные,
-      с перебоями стакана) похожие входы были в минусе. Гонять на малой ставке.
-    - РЕАЛЬНЫЕ ДЕНЬГИ 02.10 (07:45–23:41 UTC): 17 входов, 12 побед (71%), −$4.29
-      на ставках ~$2. Бот входил ровно по правилу, все ордера исполнились по
-      цене сигнала +0.01, то есть проблема не в исполнении. Данные, которые НЕ
-      участвовали в подборе параметров (трекер 20–23.09: 110 рынков, 74.5%; живой
-      02.10: 71%), — ниже безубыточности. Перекос есть в одних периодах и
-      отсутствует в других; фильтра, отличающего одни от других (тренд EMA/MACD,
-      ATR, время суток, серия исходов), не нашлось. Поэтому v4-пресет переводит
-      бота в DRY RUN — LIVE только если 100 виртуальных сделок дадут ≤12 проигрышей.
-    - Пауза на новости (news_pause_enabled, src/news_calendar.py): рынок, в
-      окно которого попадает выход статистики США (08:30 NY) или решение ФРС,
-      пропускаем — 02.10 12:30 UTC вход на рывке после отчёта по рынку труда
-      развернулся в проигрыш, а в истории таких входов не было ни одного.
-    """
-    lo = runtime_state.get("mom_min_price")
-    hi = runtime_state.get("mom_max_price")
-    min_left = runtime_state.get("mom_min_minutes_left")
-    max_spread = runtime_state.get("mom_max_spread")
-    up_ask, down_ask = up_book.best_ask, down_book.best_ask
-    if up_ask is None and down_ask is None:
-        return Decision(False, None, None, 0.0, minutes_left, 0.0, ["нет asks в стакане"])
-    if down_ask is None or (up_ask is not None and up_ask >= down_ask):
-        direction, ask = "UP", up_ask
-    else:
-        direction, ask = "DOWN", down_ask
-    reasons = []
-    if minutes_left < min_left:
-        reasons.append(f"импульс: поздно ({minutes_left:.1f} мин < {min_left:g})")
-    if not (lo <= ask <= hi):
-        reasons.append(f"цена {ask:.3f} вне диапазона [{lo}, {hi}]")
-    if max_spread is not None and max_spread < 1:
-        if up_ask is None or down_ask is None:
-            reasons.append("импульс: нет второй стороны стакана (спред неизвестен)")
-        else:
-            spread = up_ask + down_ask - 1
-            if spread > max_spread + 1e-9:
-                reasons.append(f"импульс: широкий спред {spread:.3f} > {max_spread:g}")
-    if runtime_state.get("news_pause_enabled"):
-        news = news_calendar.pause_reason(market_start_ts, market_end_ts)
-        if news:
-            reasons.append(news)
-    return Decision(
-        should_enter=not reasons,
-        direction=direction,
-        entry_price=ask,
-        safety_score=round(safety_score, 1),
-        minutes_left=round(minutes_left, 2),
-        distance_atr=round(distance_atr, 2),
-        reasons=reasons,
-        time_score=round(time_score, 1),
-        distance_score=round(distance_score, 1),
-        trend_score=round(trend_score, 1),
-        vol_score=round(vol_score, 1),
-        liq_score=round(liq_score, 1),
+        opp_ask=opp_book.best_ask if opp_book is not None else None,
+        distance_pct=round(distance_pct, 4),
+        atr_ratio=round(indicators["atr_ratio_to_avg"], 3) if indicators.get("atr_ratio_to_avg") is not None else None,
     )
