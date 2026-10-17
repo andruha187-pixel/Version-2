@@ -257,8 +257,8 @@ class Settings:
     SERIES_TEST_ENABLED: bool = _get_bool("SERIES_TEST_ENABLED", True)
     SERIES_INTERVALS: str = os.getenv("SERIES_INTERVALS", "15m,5m")
     SERIES_PATH_STEP_SEC: int = _get_int("SERIES_PATH_STEP_SEC", 5)
-    # Окна стратегии (SERIES_TRADE_INTERVALS): с 30 с до старта и всю первую
-    # минуту цена пишется каждые SERIES_FINE_STEP_SEC секунд (0 — как остальное
+    # Окна стратегии (SERIES_TRADE_INTERVALS): с 30 с до старта и первые 90 с
+    # цена пишется каждые SERIES_FINE_STEP_SEC секунд (0 — как остальное
     # окно), плюс снимки стакана. Путь и снимки старше SERIES_PATH_KEEP_DAYS
     # дней стираются (цены старта и исходы остаются; 0 — хранить всё).
     SERIES_FINE_STEP_SEC: int = _get_int("SERIES_FINE_STEP_SEC", 1)
@@ -267,6 +267,10 @@ class Settings:
     # ставка на разворот в первые SERIES_TRADE_ENTRY_SEC секунд окна по цене не
     # выше SERIES_TRADE_CAP. По умолчанию — тест (без денег); реально — кнопкой.
     # SERIES_TRADE_STOP_USDC — дневной стоп по реальным ставкам стратегии (0 — выкл).
+    # SERIES_TRADE_RULE — правило входа (и реальных ставок): lead60 — на 60-й
+    # секунде, если разворот уже ведёт (ask 0.52–0.80; так с v9, 17.10), cheap —
+    # по цене не выше SERIES_TRADE_CAP в первые SERIES_TRADE_ENTRY_SEC секунд.
+    SERIES_TRADE_RULE: str = os.getenv("SERIES_TRADE_RULE", "lead60").strip().lower()
     SERIES_TRADE_ENABLED: bool = _get_bool("SERIES_TRADE_ENABLED", True)
     SERIES_TRADE_LIVE: bool = _get_bool("SERIES_TRADE_LIVE", False)
     SERIES_TRADE_INTERVALS: str = os.getenv("SERIES_TRADE_INTERVALS", "15m")
