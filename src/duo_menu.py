@@ -224,11 +224,14 @@ def strategy_text() -> str:
     lines = series_bot.strategy_lines() + [""] + series_bot.variant_lines() + [
         "",
         "Тестовая ставка пишется по каждому окну с серией — по стакану (средняя цена по уровням не дороже "
-        "потолка, с комиссией тейкера). В режиме 💵 вдобавок уходит реальный ордер на выбранную сумму. "
-        "Реальные ставки — только 15m, свой дневной стоп, ⏸ Стоп бота их тоже останавливает.",
-        "Сравнение входов — виртуальные ставки по тем же сигналам и на ту же сумму, но по другим правилам: "
-        "сразу на старте окна (до 0.51 или до 0.60) и на 60-й секунде, если разворот уже ведёт. Реальных "
-        "ордеров по ним нет. Через несколько дней видно, какое правило лучше.",
+        "потолка, с комиссией тейкера). В режиме 💵 вдобавок уходит реальный FAK-ордер на выбранную сумму "
+        "(не меньше 5 акций — меньше биржа не берёт). Реальные ставки — только 15m, по выбранному правилу "
+        "входа, свой дневной стоп; ⏸ Стоп бота и DRY RUN их тоже останавливают.",
+        "Правило «на 60-й с»: на 60-й секунде окна смотрим цену стороны разворота — если она 0.52–0.80 "
+        "(разворот уже ведёт), покупаем по цене не выше ask + 1¢, иначе пропуск. «Дёшево»: первая цена не выше "
+        "потолка (кнопки «цена до …») в первую минуту — так было до v9.",
+        "Сравнение входов — виртуальные ставки по тем же сигналам, но по другим правилам. Реальных ордеров "
+        "по ним нет.",
         "Окна записываются, пока включена стратегия или запись окон.",
     ]
     return "\n".join(lines)
@@ -237,10 +240,13 @@ def strategy_text() -> str:
 def strategy_markup() -> InlineKeyboardMarkup:
     on, live = series_bot.trade_enabled(), series_bot.trade_live()
     k, cap, usdc, stop = series_bot.trade_k(), series_bot.trade_cap(), series_bot.trade_usdc(), series_bot.trade_stop()
+    rule = series_bot.trade_rule()
     mark = lambda ok: "✅ " if ok else ""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎲 ✅ вкл" if on else "🎲 ⏸ выкл", callback_data="duo:stt"),
          InlineKeyboardButton("💵 реально" if live else "🧪 тест", callback_data="duo:stl")],
+        [InlineKeyboardButton(mark(rule == "lead60") + "вход на 60-й с", callback_data="duo:str:lead60"),
+         InlineKeyboardButton(mark(rule == "cheap") + "вход дёшево", callback_data="duo:str:cheap")],
         [InlineKeyboardButton(mark(k == v) + f"серия от {v}", callback_data=f"duo:stk:{v}")
          for v in series_bot.TRADE_K_PRESETS],
         [InlineKeyboardButton(mark(abs(cap - v) < 1e-9) + f"цена до {v:.2f}", callback_data=f"duo:stc:{v:.2f}")
@@ -374,11 +380,21 @@ def handle(data: str):
         runtime_state.set("series_trade_live", not series_bot.trade_live())
         head = ""
         if series_bot.trade_live():
-            head = (f"✅ 🎲 Реальные ставки включены: ${series_bot.trade_usdc():g} на окно 15m после "
-                    f"{series_bot.trade_k()}+ одинаковых подряд, по цене не выше {series_bot.trade_cap():.2f}"
+            head = (f"✅ 🎲 Реальные ставки включены: ${series_bot.trade_usdc():g} (не меньше 5 акций) на окно 15m "
+                    f"после {series_bot.trade_k()}+ одинаковых подряд — {series_bot.rule_text()}"
                     + (f", дневной стоп −${series_bot.trade_stop():g}" if series_bot.trade_stop() > 0 else "")
-                    + ". Тестовые ставки пишутся дальше — для сравнения.\n\n")
+                    + ". Тестовые ставки пишутся дальше — для сравнения.\n")
+            why = series_bot.live_blocked()
+            if why:
+                head += (f"⚠️ Но ордера пока не уходят: {why}."
+                         + (" Включи 🔴 LIVE в главном меню — основной 5m-бот при этом останется в тесте по всем "
+                            "монетам без 🔴 и стратегиям в 🧪." if why == "бот в DRY RUN" else "") + "\n")
+            head += "\n"
         return head + strategy_text(), strategy_markup(), None
+    if cmd == "str" and len(parts) == 3:
+        if parts[2] in series_bot.RULES:
+            runtime_state.set("series_trade_rule", parts[2])
+        return strategy_text(), strategy_markup(), None
     if cmd in ("stk", "stc", "stu", "sts") and len(parts) == 3:
         try:
             value = float(parts[2])

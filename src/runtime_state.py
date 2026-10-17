@@ -232,6 +232,7 @@ _DEFAULTS = {
     "series_trade_cap": settings.SERIES_TRADE_CAP,
     "series_trade_usdc": max(0.0, settings.SERIES_TRADE_USDC),
     "series_trade_stop": max(0.0, settings.SERIES_TRADE_STOP_USDC),
+    "series_trade_rule": settings.SERIES_TRADE_RULE if settings.SERIES_TRADE_RULE in ("lead60", "cheap") else "lead60",
 }
 
 # Типы приведения при чтении из SQLite (там всё хранится как TEXT)
@@ -292,6 +293,7 @@ _CASTERS = {
     "series_trade_cap": float,
     "series_trade_usdc": lambda v: max(0.0, float(v)),
     "series_trade_stop": lambda v: max(0.0, float(v)),
+    "series_trade_rule": lambda v: str(v) if str(v) in ("lead60", "cheap") else "lead60",
 }
 
 _state: dict = dict(_DEFAULTS)

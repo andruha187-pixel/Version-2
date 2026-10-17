@@ -503,8 +503,16 @@ def _confirm_live_text() -> str:
             lines.append(f"Остальные ({', '.join(dry)}) останутся в DRY — виртуально.")
         lines += ["", "Проверь ставку: поменять её можно в ⚙️ монеты (🪙 Активы) или в 💰 Размер позиции."]
     else:
-        lines.append("Ни одна включённая монета не помечена 🔴 LIVE в 🪙 Активах — реальных сделок "
-                     "не будет, пока не пометишь.")
+        lines.append("Ни одна включённая монета не помечена 🔴 LIVE в 🪙 Активах — основной бот реальных "
+                     "сделок делать не будет, пока не пометишь.")
+    from src import series_bot
+    if series_bot.trade_enabled() and series_bot.trade_live():
+        stop = series_bot.trade_stop()
+        lines += ["", f"🎲 Серии: пойдут реальные ставки ${series_bot.trade_usdc():g} (не меньше 5 акций) — "
+                      f"{series_bot.rule_text()}"
+                      + (f", дневной стоп −${stop:g}." if stop > 0 else ", без дневного стопа.")]
+    else:
+        lines += ["", "🎲 Серии — в тесте: реальные ставки по ним включаются в 🎯 → 📚 → 🎲 (кнопка «🧪 тест»)."]
     return "\n".join(lines)
 
 
