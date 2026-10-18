@@ -1,31 +1,32 @@
 """
-🔁 Серии UP/DOWN — тест на Polymarket без денег (окна 15m и 5m).
+🎲 Стратегия серий на 15-минутных рынках Up/Down Polymarket и 🔁 запись окон.
 
-Зачем. По году свечей Binance (📚) после 3–4+ одинаковых исходов подряд
-следующее 15-минутное окно чаще разворачивается: 54–56%, устойчиво по всем
-монетам и месяцам. Ставка на разворот окупается, если разворот чаще ~52.7%
-(ask 0.51 + комиссия). Проверяем на самом Polymarket: настоящие исходы и
-настоящие цены, в том числе «подождать, пока цена пойдёт вниз».
+Идея. После 4+ одинаковых исходов подряд следующее 15-минутное окно чаще
+разворачивается: по году свечей Binance 55%, по официальным исходам Polymarket
+за 60 дней 54.5%. Вход (правило lead60, с 17.10): на 60-й секунде окна, если
+сторона разворота уже ведёт (ask 0.52–0.80) — по цене не выше ask + 1¢. За
+16 ч теста 16–17.10 так вышло 13 выигрышей из 14.
 
-Что пишем по каждому окну (таблица series_windows):
+Ставки — по включённым монетам (🪙): тестовая всегда, реальная — если монета
+🔴 и бот в 🔴 LIVE (общий выключатель), есть ключ и не достигнут дневной стоп.
+Рядом пишутся виртуальные ставки по другим правилам входа (варианты) — для
+сравнения на тех же сигналах.
+
+Что пишем по каждому окну (таблица series_windows), по всем монетам:
   - ask и bid обеих сторон, когда впервые увидели рынок (в первую минуту);
   - путь ask обеих сторон каждые SERIES_PATH_STEP_SEC секунд; у окон стратегии
-    (SERIES_TRADE_INTERVALS) ещё с 30 с до старта и первые 90 с — каждые
-    SERIES_FINE_STEP_SEC секунд (точки до старта — с отрицательным временем);
+    ещё с 30 с до старта и первые 90 с — каждые SERIES_FINE_STEP_SEC секунд
+    (точки до старта — с отрицательным временем);
   - снимки стакана (лучшие уровни asks обеих сторон) за 5 с до старта, на
-    старте и на 15/30/45/60-й секунде — колонка depth (у окон стратегии);
+    старте и на 15/30/45/60-й секунде — колонка depth;
   - минимум ask каждой стороны до минуты до конца — исполнилась бы лимитка;
   - исход: ранний (стакан в последние секунды, иначе Chainlink) и официальный.
 Серию считаем по исходам прошлых окон (до запуска бота — официальные исходы
-последних окон из Gamma API). Ставку на разворот считаем при подведении
-итогов: на старте по ask (тейкер, с комиссией) и лимиткой 0.48/0.45/0.42/0.40
-(мейкер, без комиссии). Ничего не покупает.
+последних 12 окон из Gamma API).
 
-Рынки 5m берём у основного цикла (main._active_markets). Рынок 15m ищем сами
-по точному слагу {монета}-updown-15m-{начало} — заранее, за PREFETCH_SEC до
-начала окна, — и сразу подписываем его токены на живой стакан: цена видна с
-нулевой секунды. (До 16.10 рынок искали в момент старта, по очереди для всех
-монет, и каждое шестое окно находилось только на 22-й секунде.)
+Рынок окна ищем по точному слагу {монета}-updown-15m-{начало} — заранее, за
+PREFETCH_SEC до начала, — и сразу подписываем его токены на живой стакан:
+цена видна с нулевой секунды.
 """
 from __future__ import annotations
 import asyncio
@@ -224,14 +225,8 @@ async def _fetch_win(asset: str, interval: str, start: int, now: float) -> Win |
                own_tokens=own)
 
 
-async def _open(asset: str, interval: str, start: int, active_markets: dict | None, now: float) -> Win | None:
+async def _open(asset: str, interval: str, start: int, now: float) -> Win | None:
     """Открыть текущее окно, если заранее его рынок не нашёлся."""
-    step = STEP[interval]
-    if interval == "5m":
-        m = (active_markets or {}).get(f"{asset}:5m")
-        if m is None or int(m.start_time) != start:
-            return None                      # основной цикл ещё не нашёл рынок
-        return _activate(Win(asset, interval, start, start + step, m.slug, m.up_token_id, m.down_token_id))
     key = (asset, interval, start)
     if now < _retry_at.get(key, 0):
         return None
@@ -414,9 +409,18 @@ async def settle(now: float | None = None) -> int:
 
 
 def assets_for(interval: str) -> list[str]:
-    if interval == "5m":
-        return [a for a in settings.ASSETS if runtime_state.is_asset_enabled(a)]
+    """Монеты, окна которых пишем: все (у выключенной тоже — чтобы знать серию, когда включат)."""
     return list(settings.ASSETS)
+
+
+def trade_assets() -> list[str]:
+    """Монеты, по которым ставит стратегия: включённые в 🪙 Монетах."""
+    return [a for a in settings.ASSETS if runtime_state.is_asset_enabled(a)]
+
+
+def coin_live(asset: str) -> bool:
+    """Монета помечена 🔴 — по ней идут реальные ставки (если бот в 🔴 LIVE)."""
+    return runtime_state.is_asset_live(asset)
 
 
 def _spawn(coro) -> None:
@@ -445,7 +449,7 @@ def _new_window(key: tuple[str, str], start: int, now: float) -> None:
             _fails[key] = 0
 
 
-async def _tick_current(key: tuple[str, str], start: int, active_markets: dict | None, now: float) -> None:
+async def _tick_current(key: tuple[str, str], start: int, now: float) -> None:
     asset, iv = key
     w = _cur.get(key)
     if w is not None and w.start != start:
@@ -463,14 +467,15 @@ async def _tick_current(key: tuple[str, str], start: int, active_markets: dict |
             # открываем — без цены старта, но с исходом по стакану в конце: иначе
             # серия перед следующим окном неизвестна, и его сигнал после каждого
             # перезапуска терялся бы.
-            w = await _open(asset, iv, start, active_markets, now)
+            w = await _open(asset, iv, start, now)
             if w is None:
                 return
         _cur[key] = w
         if key not in _seeded:
             _seeded.add(key)
             _spawn(_seed(asset, iv, start))
-        if iv in trade_intervals() and trade_enabled() and trade_live() and live_blocked(now) is None:
+        if (iv in trade_intervals() and trade_enabled() and runtime_state.is_asset_enabled(asset)
+                and coin_live(asset) and live_blocked(now) is None):
             # реальные ставки включены — прогреть рынок в SDK заранее, чтобы ордер ушёл без лишнего запроса
             from src import polymarket_client
             _spawn(polymarket_client.prewarm_market([w.up, w.down]))
@@ -489,7 +494,7 @@ def _tick_next(key: tuple[str, str], nxt: int, now: float) -> None:
         _sample(nw, now)
 
 
-async def tick(active_markets: dict | None, now: float | None = None) -> None:
+async def tick(now: float | None = None) -> None:
     now = time.time() if now is None else now
     for iv in intervals():
         step = STEP[iv]
@@ -500,9 +505,8 @@ async def tick(active_markets: dict | None, now: float | None = None) -> None:
                 _new_window(key, start, now)
             if now < _skip_until.get(key, 0):
                 continue
-            await _tick_current(key, start, active_markets, now)
-            if iv != "5m":
-                _tick_next(key, start + step, now)
+            await _tick_current(key, start, now)
+            _tick_next(key, start + step, now)
     resolve_pending(now)
     await maybe_trade(now)
     track_variants(now)
@@ -510,12 +514,14 @@ async def tick(active_markets: dict | None, now: float | None = None) -> None:
 
 # ---------------------------------------------------------- 🎲 стратегия ----
 #
-# После trade_k()+ одинаковых исходов подряд — ставка на разворот в первые
-# SERIES_TRADE_ENTRY_SEC секунд окна, если ask разворотной стороны не выше
-# trade_cap(). Тестовая ставка пишется всегда (по стакану: средняя цена по
-# уровням не дороже потолка, комиссия тейкера); реальная — если включён
-# 💵 режим. Окна, где серия была, а ставки нет (цена выше потолка, мало
-# объёма), тоже пишутся — со статусом SKIP_*, без итога.
+# После trade_k()+ одинаковых исходов подряд — ставка на разворот по правилу
+# trade_rule(): lead60 — на 60-й секунде окна, если разворот уже ведёт (ask
+# LEAD_LO…LEAD_HI), по цене не выше ask + 1¢; cheap — в первые
+# SERIES_TRADE_ENTRY_SEC секунд, если ask не выше trade_cap(). Тестовая ставка
+# пишется всегда (по стакану: средняя цена по уровням не дороже потолка,
+# комиссия тейкера); реальная — если монета 🔴 и бот в 🔴 LIVE. Окна, где
+# серия была, а ставки нет (цена не подошла, мало объёма), тоже пишутся — со
+# статусом SKIP_*: видно, выиграли бы они или нет.
 
 TRADE_K_PRESETS = (3, 4, 5)
 TRADE_CAP_PRESETS = (0.50, 0.51, 0.52)
@@ -541,10 +547,6 @@ def _rs(key: str, default):
 
 def trade_enabled() -> bool:
     return bool(_rs("series_trade_enabled", settings.SERIES_TRADE_ENABLED))
-
-
-def trade_live() -> bool:
-    return bool(_rs("series_trade_live", settings.SERIES_TRADE_LIVE))
 
 
 def trade_k() -> int:
@@ -609,8 +611,6 @@ def live_blocked(now: float | None = None) -> str | None:
         return "нет ключа POLY_PRIVATE_KEY"
     if runtime_state.get("dry_run"):
         return "бот в DRY RUN"
-    if runtime_state.get("paused"):
-        return "бот на паузе (⏸ Стоп)"
     stop = trade_stop()
     if stop > 0 and today_live_pnl(now) <= -stop:
         return f"дневной стоп −${stop:g}"
@@ -665,7 +665,7 @@ def _mark_traded(key, now: float) -> None:
 
 async def _record_and_enter(w: Win, key, d: str, k: int, side: str, token: str, ask: float, price: float,
                             spent: float, cap: float, usdc: float, now: float) -> int:
-    """Тестовая ставка (по стакану) и, в режиме 💵, реальная. 1 — тестовая записана."""
+    """Тестовая ставка (по стакану) и, если монета 🔴, реальная. 1 — тестовая записана."""
     asset, iv, start = key
     fee = round(spent * float(settings.FEE_RATE) * (1 - price), 4)
     tid = storage.series_trade_log(
@@ -674,7 +674,7 @@ async def _record_and_enter(w: Win, key, d: str, k: int, side: str, token: str, 
         sec_after_start=round(now - start, 1), dry_run=1, status="DRY")
     # Реальная ставка — одна на окно: после перезапуска бота в том же окне тестовая
     # строка уже есть, реальную не дублируем
-    if trade_live() and not storage.series_trade_exists(asset, iv, start, dry_run=False):
+    if coin_live(asset) and not storage.series_trade_exists(asset, iv, start, dry_run=False):
         await _enter_live(w, key, d, k, side, token, ask, now, cap, usdc)
     return 1 if tid else 0
 
@@ -698,7 +698,7 @@ async def _trade_lead(now: float) -> int:
         start = int(now // step) * step
         if not LEAD_AT_SEC <= now - start <= LEAD_MAX_SEC:
             continue
-        for asset in assets_for(iv):
+        for asset in trade_assets():
             key = (asset, iv, start)
             if key in _traded:
                 continue
@@ -743,7 +743,7 @@ async def _trade_cheap(now: float) -> int:
         start = int(now // step) * step
         if now - start > entry_sec:
             continue
-        for asset in assets_for(iv):
+        for asset in trade_assets():
             key = (asset, iv, start)
             if key in _traded:
                 continue
@@ -910,24 +910,64 @@ def rule_text() -> str:
     return f"в первые {int(settings.SERIES_TRADE_ENTRY_SEC)} с окна {ivs} по цене не выше {trade_cap():.2f}"
 
 
+def live_coins() -> list[str]:
+    """Включённые монеты с 🔴 — по ним идут реальные ставки, когда бот в 🔴 LIVE."""
+    return [a for a in trade_assets() if coin_live(a)]
+
+
+def mode_text() -> str:
+    """Режим реальных ставок словами."""
+    coins = live_coins()
+    if runtime_state.get("dry_run"):
+        return "🧪 DRY RUN — реальных ордеров нет" + (
+            f" (🔴 помечены {', '.join(a.upper() for a in coins)} — пойдут после «🔴 Включить LIVE»)" if coins else "")
+    if not coins:
+        return "🔴 LIVE, но ни одна включённая монета не 🔴 — реальных ставок нет"
+    return f"🔴 LIVE — реальные ставки по {', '.join(a.upper() for a in coins)}"
+
+
 def strategy_lines() -> list[str]:
-    mode = "💵 реальные ставки" if trade_live() else "🧪 тест (без денег)"
     lines = [f"🎲 Стратегия: после {trade_k()}+ одинаковых исходов подряд — ставка на разворот {rule_text()}, "
              f"${trade_usdc():g} за ставку (не меньше 5 акций). "
-             + ("Сейчас: " + mode if trade_enabled() else "Сейчас: ⏸ выключена")]
+             + ("Сейчас: ✅ включена" if trade_enabled() else "Сейчас: ⏸ выключена"),
+             "  Режим: " + mode_text()]
     day = int(time.time() // 86400) * 86400
     lines.append("  " + _stats_line("Тест", trade_stats(0, live=False)))
     lines.append("  " + _stats_line("Тест сегодня (UTC)", trade_stats(day, live=False)))
     live = trade_stats(0, live=True)
-    if live["bets"] or trade_live():
+    if live["bets"] or live_coins():
         lines.append("  " + _stats_line("Реальные", live))
         stop = trade_stop()
         lines.append(f"  Сегодня реальные: {today_live_pnl():+.2f} USDC"
                      + (f" (дневной стоп −${stop:g})" if stop > 0 else " (без дневного стопа)"))
-        why = live_blocked() if trade_live() else None
-        if why:
+        why = live_blocked() if live_coins() else None
+        if why and why != "бот в DRY RUN":
             lines.append(f"  ⚠️ Реальные ставки сейчас не уходят: {why}")
     return lines
+
+
+def _coin_stats(rows: list[dict]) -> str:
+    bets = [t for t in rows if not str(t["status"] or "").startswith("SKIP")]
+    settled = [t for t in bets if t["outcome"]]
+    if not bets:
+        return "—"
+    wins = sum(1 for t in settled if t["outcome"] == t["side"])
+    pnl = sum(t["pnl_usdc"] or 0.0 for t in settled)
+    return f"{len(bets)} ставок" + (f", выигр. {wins}/{len(settled)}, {pnl:+.2f} $" if settled else "")
+
+
+def coin_lines() -> list[str]:
+    """По монете: вкл/выкл, 🧪/🔴 и итог тестовых и реальных ставок (за всё время в базе)."""
+    rows = storage.series_trades_since(0)
+    out = []
+    for a in settings.ASSETS:
+        on = runtime_state.is_asset_enabled(a)
+        mine = [t for t in rows if t["asset"] == a]
+        test = _coin_stats([t for t in mine if t["dry_run"]])
+        real = _coin_stats([t for t in mine if not t["dry_run"]])
+        out.append(f"{a.upper()} {'✅' if on else '⏸'} {'🔴' if coin_live(a) else '🧪'} — тест: {test}"
+                   + (f"; реальные: {real}" if real != "—" or coin_live(a) else ""))
+    return out
 
 
 # --------------------------------------------------- 🎲 варианты входа ----
@@ -984,7 +1024,7 @@ def track_variants(now: float | None = None) -> int:
         step = STEP[iv]
         start = int(now // step) * step
         t = now - start
-        for asset in assets_for(iv):
+        for asset in trade_assets():
             key = (asset, iv, start)
             st = _vars.get(key)
             if st is None:
@@ -1130,13 +1170,13 @@ async def _sleep_to_next_second() -> None:
     await asyncio.sleep(1.0 - (time.time() % 1.0) + 0.05)
 
 
-async def run_forever(active_markets: dict | None = None) -> None:
+async def run_forever() -> None:
     last_settle = last_trim = 0.0
     await asyncio.sleep(3)
     while True:
         try:
             if (enabled() or trade_enabled()) and settings.USE_LIVE_BOOK_STREAM:
-                await tick(active_markets)
+                await tick()
                 if time.monotonic() - last_settle >= SETTLE_EVERY_SEC:
                     last_settle = time.monotonic()
                     await settle()
@@ -1286,29 +1326,28 @@ def summary_lines(since_ts: int = 0) -> list[str]:
     return lines
 
 
-def menu_text() -> str:
-    fine = (f" Окна {', '.join(trade_intervals())}: рынок находим заранее, за {PREFETCH_SEC / 60:g} мин до "
-            f"начала; с {PRE_PATH_SEC} с до старта и первые {FINE_SEC} с — цена каждые {fine_step()} с и снимки "
-            "стакана." if fine_step() and trade_intervals() else "")
-    lines = strategy_lines() + [""] + variant_lines() + ["", ] + [
-        "🔁 Серии — тест на Polymarket " + ("(запись идёт" if enabled() else "(запись выключена") +
-        ", ничего не покупает)",
-        "",
-        "По каждому окну пишем цены сторон на старте и каждые "
-        f"{path_step()} с, исход.{fine} Ставка — на разворот после серии одинаковых исходов: на старте по ask "
-        "(с комиссией) и лимиткой дешевле (без комиссии, если цена дошла до неё до минуты до конца).",
-        "",
-    ]
+def recorder_line() -> str:
+    every = "каждую секунду" if fine_step() == 1 else f"каждые {fine_step()} с"
+    fine = (f" С {PRE_PATH_SEC} с до старта и первые {FINE_SEC} с — цена {every} и снимки стакана."
+            if fine_step() and trade_intervals() else "")
+    return ("🔁 Запись окон " + ("идёт" if enabled() or trade_enabled() else "выключена")
+            + f" — по всем монетам: рынок находим за {PREFETCH_SEC / 60:g} мин до начала, цены сторон каждые "
+            f"{path_step()} с, исход.{fine}")
+
+
+def stats_text() -> str:
+    """📊 Статистика: стратегия, сравнение входов, записанные окна, текущие серии."""
+    lines = ["📊 Статистика", ""] + strategy_lines() + [""] + variant_lines() + ["", recorder_line(), ""]
     lines += summary_lines()
     cur = current_lines()
     if cur:
         lines += [""] + cur
-    lines += ["", "Для сравнения, год свечей Binance: после 4+ подряд разворот 15m — 55%, 5m — 53%; "
-              "окупается от ~52.7% при ask 0.51."]
+    lines += ["", "База идеи: после 4+ подряд разворот 15m — 55% по году свечей Binance и 54.5% по исходам "
+              "Polymarket за 60 дней. Вход lead60 по цене ~0.64 окупается от ~66% выигрышей."]
     if _stats["last_error"] and _stats["discovery_errors"]:
         lines.append(f"Поиск рынков: ошибок {_stats['discovery_errors']}, последняя: {_stats['last_error']}")
     return "\n".join(lines)
 
 
 def report_caption(from_label: str, to_label: str, since_ts: int) -> str:
-    return "\n".join([f"🔁 Серии — тест {from_label} → {to_label} (UTC)"] + summary_lines(since_ts))
+    return "\n".join([f"🔁 Окна {from_label} → {to_label} (UTC)"] + summary_lines(since_ts))

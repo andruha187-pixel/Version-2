@@ -1,11 +1,11 @@
 """
 📚 Серии UP/DOWN: что было после k одинаковых исходов подряд и чем кончилась бы
 ставка на разворот с удвоением после проигрыша — по свечам Binance за
-SERIES_HISTORY_DAYS дней, окна 5m и 15m. Только расчёт, ничего не покупает.
+SERIES_HISTORY_DAYS дней, окна 15m (5m — если попросить). Только расчёт, ничего не покупает.
 
 Исход окна — как у Polymarket: UP, если цена в конце не ниже, чем в начале;
 берём свечу Binance того же окна (закрытие ≥ открытия). С официальным исходом
-(Chainlink) это совпадает примерно в 87% окон 5m (архив 18.09–16.10):
+(Chainlink) это совпадает примерно в 94% окон 15m (сверка 16.10):
 расходятся окна, где цена почти не сдвинулась. На вопрос «зависит ли следующее
 окно от серии» этого хватает.
 
@@ -167,7 +167,7 @@ def _ktag(k: int) -> str:
     return f"{k}+" if k == KMAX else str(k)
 
 
-async def run_study(days: int | None = None, assets=None, intervals=("5m", "15m"), progress=None) -> dict:
+async def run_study(days: int | None = None, assets=None, intervals=("15m",), progress=None) -> dict:
     days = int(days or settings.SERIES_HISTORY_DAYS)
     assets = list(assets or settings.ASSETS)
     res = {"days": days, "assets": assets, "price": entry_price(), "intervals": {}, "raw": {}}
@@ -212,7 +212,7 @@ def summary_text(res: dict) -> str:
     be = breakeven(res["price"])
     lines = [f"📚 Серии UP/DOWN по свечам Binance за {res['days']} дн.",
              f"Ставка на разворот по ask {res['price']:.3f} с комиссией окупается, если разворот чаще "
-             f"{be * 100:.1f}%. Исход по Binance совпадает с официальным примерно в 87% окон 5m."]
+             f"{be * 100:.1f}%. Исход по Binance совпадает с официальным примерно в 94% окон 15m."]
     for iv, per in res["intervals"].items():
         if not per:
             lines += ["", f"{iv}: данных нет"]

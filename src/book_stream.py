@@ -1,18 +1,10 @@
 """
-Живой стакан по WebSocket вместо REST-поллинга.
+Живой стакан Polymarket по WebSocket.
 
-Раньше (v1) бот на каждом тике дёргал REST `GET /book` — это лишние
-100-300ms сетевого раунд-трипа именно в момент принятия решения о входе,
-и цена, на которую мы смотрим, могла на несколько сотен мс отставать от
-реальной. Плюс Polymarket сам по себе обновляет свою книгу с задержкой
-относительно бирж типа Binance — так что "прогретый" WS-стакан не убирает
-этот системный лаг, но убирает НАШУ собственную задержку поверх него.
-
-Идея "прогрева": подписываемся на токены рынка сразу, как только рынок
-обнаружен (за много минут до возможного входа), и держим соединение
-открытым. К моменту, когда strategy.evaluate() реально нужна цена аска,
-она уже лежит в памяти, обновлённая пушем с сервера, а не тем, что мы
-только что сходили и спросили.
+Токены рынка подписываем заранее — 🔁 запись окон находит рынок следующего
+окна за полторы минуты до старта, — и держим соединение открытым: к моменту
+входа цена уже лежит в памяти, обновлённая пушем с сервера, без REST-запроса
+в момент решения.
 
 Формат сообщений — по официальной документации Polymarket
 (wss://ws-subscriptions-clob.polymarket.com/ws/market):
@@ -26,8 +18,6 @@ import logging
 import time
 
 import websockets
-
-from config import settings
 
 log = logging.getLogger("book_stream")
 
@@ -51,7 +41,7 @@ WATCHDOG_NO_DATA_MS = 8000        # подписаны столько, а ста
 WATCHDOG_MIN_INTERVAL_MS = 30000  # не чаще раза в 30 с
 # Кому сообщать об изменении стакана токена: fn(asset_id, recv_ms, server_ms).
 # server_ms — поле timestamp сообщения Polymarket (их часы), может быть None.
-# Сейчас — ⚡ лаборатории скорости (src/speed_lab.py).
+# Сейчас слушателей нет — крючок оставлен для исследований.
 _listeners: list = []
 
 
@@ -209,27 +199,6 @@ def ask_liquidity_upto(asset: str, max_price: float) -> float:
     if not b or not b.get("asks"):
         return 0.0
     return sum(price * size for price, size in b["asks"].items() if price <= max_price + 1e-9)
-
-
-def book_imbalance(asset: str, depth_levels: int = 10) -> float | None:
-    """
-    Дисбаланс стакана: доля объёма на покупку (bid) от общего объёма
-    (bid+ask) в первых depth_levels уровнях. >0.5 — давление вверх
-    (больше желающих купить, чем продать по видимым ценам), <0.5 — вниз.
-    Используется в momentum_tracker как один из индикаторов возможного
-    продолжения движения цены — сырой сигнал давления, которого нет ни
-    в ATR/EMA (это про историю цены), ни в объёме свечи Binance (это
-    вообще про другой рынок, BTC/USDT, а не про сам контракт Polymarket).
-    """
-    b = _books.get(asset)
-    if not b or (not b.get("bids") and not b.get("asks")):
-        return None
-    bid_vol = sum(size for _, size in sorted(b.get("bids", {}).items(), reverse=True)[:depth_levels])
-    ask_vol = sum(size for _, size in sorted(b.get("asks", {}).items())[:depth_levels])
-    total = bid_vol + ask_vol
-    if total <= 0:
-        return None
-    return bid_vol / total
 
 
 def tick_size(asset: str) -> float:
