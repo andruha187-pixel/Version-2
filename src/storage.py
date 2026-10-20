@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS series_trades (
     outcome TEXT,
     pnl_usdc REAL,
     settled_ts INTEGER,
+    rule TEXT,
     UNIQUE(asset, interval, start_ts, dry_run)
 );
 CREATE INDEX IF NOT EXISTS idx_series_trades_ts ON series_trades(ts);
@@ -127,10 +128,11 @@ def init_db():
     DB_WAS_NEW = not os.path.exists(settings.DB_PATH)
     with _conn() as conn:
         conn.executescript(_SCHEMA)
-        existing_series = {row[1] for row in conn.execute("PRAGMA table_info(series_windows)")}
-        for col, sql_type in _SERIES_MIGRATIONS:
-            if col not in existing_series:
-                conn.execute(f"ALTER TABLE series_windows ADD COLUMN {col} {sql_type}")
+        for table, migrations in (("series_windows", _SERIES_MIGRATIONS), ("series_trades", _TRADE_MIGRATIONS)):
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for col, sql_type in migrations:
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {sql_type}")
 
 
 def get_all_settings() -> dict[str, str]:
@@ -231,8 +233,10 @@ def series_unresolved(ended_before: int, since_ts: int = 0, limit: int = 20) -> 
 SERIES_TRADE_COLUMNS = [
     "id", "ts", "asset", "interval", "start_ts", "slug", "streak_dir", "k", "side", "token_id", "ask", "price",
     "size_usdc", "shares", "fee_usdc", "sec_after_start", "dry_run", "status", "order_id", "outcome", "pnl_usdc",
-    "settled_ts",
+    "settled_ts", "rule",
 ]
+# rule (с v11, 20.10) — правило входа, по которому принято решение: «lead60≥0.58», «cheap≤0.51»
+_TRADE_MIGRATIONS = [("rule", "TEXT")]
 
 
 def series_trade_log(**f) -> int | None:

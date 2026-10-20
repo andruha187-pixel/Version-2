@@ -22,6 +22,8 @@ log = logging.getLogger("polymarket-series-bot")
 async def main():
     storage.init_db()
     runtime_state.init_from_db()
+    if not series_bot.rule_since():
+        series_bot.mark_rule_change()    # первый запуск этой версии: сравнение входов — с него
 
     # Защита от «тихого» LIVE без ключа: в базе сохранён LIVE, а ключа сейчас нет
     forced_dry = False

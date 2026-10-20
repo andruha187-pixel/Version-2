@@ -24,6 +24,12 @@ def _bool(v) -> bool:
 
 RULES = ("lead60", "cheap")
 
+
+def _lead_lo(v: float) -> float:
+    """Порог «разворот ведёт» — в разумных пределах (выше потолка 0.80 ставок не было бы вовсе)."""
+    return round(min(0.75, max(0.50, float(v))), 2)
+
+
 _DEFAULTS = {
     "dry_run": settings.DRY_RUN,
     # Ключи в базе — свои, не как у прежнего 5m-бота (enabled_assets/live_assets):
@@ -38,6 +44,9 @@ _DEFAULTS = {
     "series_trade_usdc": max(0.0, settings.SERIES_TRADE_USDC),
     "series_trade_stop": max(0.0, settings.SERIES_TRADE_STOP_USDC),
     "series_trade_rule": settings.SERIES_TRADE_RULE if settings.SERIES_TRADE_RULE in RULES else "lead60",
+    "series_lead_lo": _lead_lo(settings.SERIES_LEAD_MIN),
+    # с какого момента действуют нынешние правило и пороги (сравнение входов — с него)
+    "series_rule_since": 0,
 }
 
 _CASTERS = {
@@ -51,6 +60,8 @@ _CASTERS = {
     "series_trade_usdc": lambda v: max(0.0, float(v)),
     "series_trade_stop": lambda v: max(0.0, float(v)),
     "series_trade_rule": lambda v: str(v) if str(v) in RULES else "lead60",
+    "series_lead_lo": lambda v: _lead_lo(float(v)),
+    "series_rule_since": lambda v: int(float(v)),
 }
 
 _state: dict = dict(_DEFAULTS)

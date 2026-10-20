@@ -2,8 +2,8 @@
 Телеграм: кнопочное меню бота серий 15m и уведомления.
 
 /menu:
-  🎲 Стратегия — вкл/выкл, правило входа, серия от, цена до (для «дёшево»),
-                 ставка, дневной стоп
+  🎲 Стратегия — вкл/выкл, правило входа, серия от, порог «ведёт от» (для «на 60-й с»)
+                 или «цена до» (для «дёшево»), ставка, дневной стоп
   🪙 Монеты    — у каждой: ✅ вкл / ⏸ выкл и 🧪 тест / 🔴 реально
   📊 Статистика · 📤 Файлы · 📚 История и сверка
   🔴 Включить LIVE (с подтверждением) / 🧪 Выключить LIVE
@@ -71,7 +71,7 @@ def main_text() -> str:
         "",
         "Режим: " + series_bot.mode_text(),
         f"Стратегия: {'✅ включена' if series_bot.trade_enabled() else '⏸ выключена'} — после "
-        f"{series_bot.trade_k()}+ подряд, {series_bot.RULES[series_bot.trade_rule()]}; "
+        f"{series_bot.trade_k()}+ подряд, {series_bot.rule_short()}; "
         f"${series_bot.trade_usdc():g} (не меньше 5 акций)"
         + (f", дневной стоп −${stop:g}" if stop > 0 else ", без дневного стопа"),
         "Монеты: " + coins_line(),
@@ -119,17 +119,19 @@ def coins_markup() -> InlineKeyboardMarkup:
 
 # --------------------------------------------------------------- стратегия ----
 
-def strategy_text() -> str:
-    lines = series_bot.strategy_lines() + [""] + series_bot.variant_lines() + [
+def strategy_text(head: str = "") -> str:
+    lo = series_bot.lead_lo()
+    lines = ([head, ""] if head else []) + series_bot.strategy_lines() + [""] + series_bot.variant_lines() + [
         "",
         "Тестовая ставка пишется по каждому окну с серией у включённых монет — по стакану (средняя цена "
         "по уровням не дороже потолка, с комиссией тейкера). Реальная — FAK-ордер на ту же сумму (не меньше "
         "5 акций — меньше биржа не берёт) по монетам с 🔴 в 🪙 Монетах, когда бот в 🔴 LIVE; свой дневной стоп.",
-        "Правило «на 60-й с»: на 60-й секунде окна смотрим цену стороны разворота — 0.52–0.80 (разворот уже "
-        "ведёт): покупаем по цене не выше ask + 1¢, иначе пропуск. «Дёшево»: первая цена не выше потолка "
-        "(кнопки «цена до …») в первую минуту окна.",
+        f"Правило «на 60-й с»: на 60-й секунде окна смотрим цену стороны разворота — {lo:.2f}–0.80 (разворот уже "
+        "ведёт): покупаем по цене не выше ask + 1¢, иначе пропуск. Порог — кнопками «от …»: по 16–20.10 "
+        "входы по 0.52–0.56 дали 12 из 22 (около нуля), от 0.60 — 49 из 62.",
+        "«Дёшево»: первая цена не выше потолка (кнопки «до …») в первую минуту окна.",
         "Сравнение входов — виртуальные ставки по тем же сигналам, но по другим правилам; реальных ордеров "
-        "по ним нет.",
+        "по ним нет. Считается с последней смены правила, серии или порога.",
     ]
     return "\n".join(lines)
 
@@ -137,14 +139,19 @@ def strategy_text() -> str:
 def strategy_markup() -> InlineKeyboardMarkup:
     sb = series_bot
     k, cap, usdc, stop, rule = sb.trade_k(), sb.trade_cap(), sb.trade_usdc(), sb.trade_stop(), sb.trade_rule()
+    lo = sb.lead_lo()
     mark = lambda ok: "✅ " if ok else ""          # noqa: E731
+    # порог цены — только для выбранного правила: «ведёт от …» (на 60-й с) или «до …» (дёшево)
+    price_row = (tuple(Btn(mark(abs(lo - v) < 1e-9) + f"от {v:.2f}", callback_data=f"stl:{v:.2f}")
+                       for v in sb.LEAD_LO_PRESETS) if rule == "lead60"
+                 else tuple(Btn(mark(abs(cap - v) < 1e-9) + f"до {v:.2f}", callback_data=f"stc:{v:.2f}")
+                            for v in sb.TRADE_CAP_PRESETS))
     return _menu(
         (Btn("🎲 ✅ включена" if sb.trade_enabled() else "🎲 ⏸ выключена", callback_data="stt"),),
         (Btn(mark(rule == "lead60") + "вход на 60-й с", callback_data="str:lead60"),
          Btn(mark(rule == "cheap") + "вход дёшево", callback_data="str:cheap")),
         tuple(Btn(mark(k == v) + f"серия от {v}", callback_data=f"stk:{v}") for v in sb.TRADE_K_PRESETS),
-        tuple(Btn(mark(abs(cap - v) < 1e-9) + f"цена до {v:.2f}", callback_data=f"stc:{v:.2f}")
-              for v in sb.TRADE_CAP_PRESETS),
+        price_row,
         tuple(Btn(mark(abs(usdc - v) < 1e-9) + f"${v:g}", callback_data=f"stu:{v:g}") for v in sb.TRADE_USDC_PRESETS),
         tuple(Btn(mark(abs(stop - v) < 1e-9) + (f"стоп ${v:g}" if v else "без стопа"), callback_data=f"sts:{v:g}")
               for v in sb.TRADE_STOP_PRESETS),
@@ -247,21 +254,32 @@ async def handle(data: str) -> tuple[str, InlineKeyboardMarkup]:
         runtime_state.set("series_trade_enabled", not sb.trade_enabled())
         return strategy_text(), strategy_markup()
     if cmd == "str" and len(parts) == 2:
-        if parts[1] in sb.RULES:
+        head = ""
+        if parts[1] in sb.RULES and parts[1] != sb.trade_rule():
             runtime_state.set("series_trade_rule", parts[1])
-        return strategy_text(), strategy_markup()
-    if cmd in ("stk", "stc", "stu", "sts") and len(parts) == 2:
+            sb.mark_rule_change()
+            head = f"Правило входа: {sb.rule_short()}. Сравнение входов считается заново с этого момента."
+        return strategy_text(head), strategy_markup()
+    if cmd in ("stk", "stc", "stl", "stu", "sts") and len(parts) == 2:
         try:
             value = float(parts[1])
         except ValueError:
             return strategy_text(), strategy_markup()
-        key, presets = {"stk": ("series_trade_k", sb.TRADE_K_PRESETS),
-                        "stc": ("series_trade_cap", sb.TRADE_CAP_PRESETS),
-                        "stu": ("series_trade_usdc", sb.TRADE_USDC_PRESETS),
-                        "sts": ("series_trade_stop", sb.TRADE_STOP_PRESETS)}[cmd]
-        if any(abs(value - v) < 1e-9 for v in presets):
+        key, presets, current = {
+            "stk": ("series_trade_k", sb.TRADE_K_PRESETS, sb.trade_k()),
+            "stc": ("series_trade_cap", sb.TRADE_CAP_PRESETS, sb.trade_cap()),
+            "stl": ("series_lead_lo", sb.LEAD_LO_PRESETS, sb.lead_lo()),
+            "stu": ("series_trade_usdc", sb.TRADE_USDC_PRESETS, sb.trade_usdc()),
+            "sts": ("series_trade_stop", sb.TRADE_STOP_PRESETS, sb.trade_stop())}[cmd]
+        head = ""
+        if any(abs(value - v) < 1e-9 for v in presets) and abs(value - current) > 1e-9:
             runtime_state.set(key, int(value) if cmd == "stk" else value)
-        return strategy_text(), strategy_markup()
+            if cmd in ("stk", "stc", "stl"):        # меняют, в какие окна входим, — сравнение с нуля
+                sb.mark_rule_change()
+                head = ((f"Порог: разворот ведёт от {value:.2f}." if cmd == "stl"
+                         else f"Серия от {int(value)}." if cmd == "stk" else f"Цена до {value:.2f}.")
+                        + " Сравнение входов считается заново с этого момента.")
+        return strategy_text(head), strategy_markup()
     if cmd == "sta":
         return sb.stats_text(), _menu((Btn("🔄 Обновить", callback_data="sta"), BACK))
     if cmd == "fx":

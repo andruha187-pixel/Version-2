@@ -4,8 +4,9 @@
 Идея. После 4+ одинаковых исходов подряд следующее 15-минутное окно чаще
 разворачивается: по году свечей Binance 55%, по официальным исходам Polymarket
 за 60 дней 54.5%. Вход (правило lead60, с 17.10): на 60-й секунде окна, если
-сторона разворота уже ведёт (ask 0.52–0.80) — по цене не выше ask + 1¢. За
-16 ч теста 16–17.10 так вышло 13 выигрышей из 14.
+сторона разворота уже ведёт (ask от порога lead_lo() до 0.80; порог с v11 —
+кнопками, по умолчанию 0.58, до этого 0.52) — по цене не выше ask + 1¢. За
+16–20.10 так вышло 69 выигрышей из 97, от 0.60 — 49 из 62.
 
 Ставки — по включённым монетам (🪙): тестовая всегда, реальная — если монета
 🔴 и бот в 🔴 LIVE (общий выключатель), есть ключ и не достигнут дневной стоп.
@@ -516,7 +517,7 @@ async def tick(now: float | None = None) -> None:
 #
 # После trade_k()+ одинаковых исходов подряд — ставка на разворот по правилу
 # trade_rule(): lead60 — на 60-й секунде окна, если разворот уже ведёт (ask
-# LEAD_LO…LEAD_HI), по цене не выше ask + 1¢; cheap — в первые
+# от lead_lo() до LEAD_HI), по цене не выше ask + 1¢; cheap — в первые
 # SERIES_TRADE_ENTRY_SEC секунд, если ask не выше trade_cap(). Тестовая ставка
 # пишется всегда (по стакану: средняя цена по уровням не дороже потолка,
 # комиссия тейкера); реальная — если монета 🔴 и бот в 🔴 LIVE. Окна, где
@@ -532,7 +533,11 @@ MIN_TRADE_USDC = 1.0
 # «на 60-й с, если разворот уже ведёт» — 13 из 14, а «дёшево на старте» — 4 из 12.
 RULES = {"lead60": "на 60-й с, если разворот уже ведёт", "cheap": "дёшево в первую минуту"}
 LEAD_AT_SEC, LEAD_MAX_SEC = 60, 90      # «на 60-й с» — первый тик с 60-й по 90-ю секунду
-LEAD_LO, LEAD_HI = 0.52, 0.80           # разворот «ведёт»: ask стороны разворота в этих пределах
+LEAD_HI = 0.80                          # разворот «ведёт»: ask стороны разворота от lead_lo() до LEAD_HI
+# Нижний порог — кнопками в 🎲 (с v11, 20.10; до этого всегда 0.52). По 16–20.10 (97
+# ставок) входы по 0.52–0.56 — 12 из 22, около нуля; от 0.60 — 49 из 62, +14%. И в
+# 1767 обычных окнах фаворит по ~0.55 выигрывал лишь 48.5%: слабое лидерство переоценено.
+LEAD_LO_PRESETS = (0.52, 0.55, 0.58, 0.60)
 LEAD_SLIP = 0.01                        # потолок ордера — ask + 1 цент
 MIN_ORDER_SHARES = 5.0                  # меньше 5 акций биржа ордер не берёт
 LIVE_RETRY_SEC = 0.5                    # реальный ордер не исполнился — ещё раз через полсекунды
@@ -568,6 +573,27 @@ def trade_stop() -> float:
 def trade_rule() -> str:
     r = str(_rs("series_trade_rule", settings.SERIES_TRADE_RULE))
     return r if r in RULES else "lead60"
+
+
+def lead_lo() -> float:
+    """С какой цены сторона разворота считается ведущей (правило lead60)."""
+    return float(_rs("series_lead_lo", settings.SERIES_LEAD_MIN))
+
+
+def rule_tag() -> str:
+    """Правило входа коротко — пишется в каждую строку ставок (колонка rule)."""
+    if trade_rule() == "lead60":
+        return f"lead60>={lead_lo():.2f}"
+    return f"cheap<={trade_cap():.2f}"
+
+
+def rule_since() -> int:
+    """С какого момента действуют нынешние правило и пороги (сравнение входов — с него)."""
+    return int(_rs("series_rule_since", 0) or 0)
+
+
+def mark_rule_change(now: float | None = None) -> None:
+    runtime_state.set("series_rule_since", int(time.time() if now is None else now))
 
 
 def lead_cap(ask: float) -> float:
@@ -653,7 +679,8 @@ def _log_skip(key, w: Win, d: str, k: int, side: str, status: str, ask: float | 
     asset, iv, start = key
     storage.series_trade_log(ts=int(time.time() if now is None else now), asset=asset, interval=iv, start_ts=start,
                              slug=w.slug, streak_dir=d, k=k, side=side, token_id=w.down if side == "DOWN" else w.up,
-                             ask=ask, dry_run=1, status=status, sec_after_start=round((now or time.time()) - start, 1))
+                             ask=ask, dry_run=1, status=status, sec_after_start=round((now or time.time()) - start, 1),
+                             rule=rule_tag())
 
 
 def _mark_traded(key, now: float) -> None:
@@ -671,7 +698,7 @@ async def _record_and_enter(w: Win, key, d: str, k: int, side: str, token: str, 
     tid = storage.series_trade_log(
         ts=int(now), asset=asset, interval=iv, start_ts=start, slug=w.slug, streak_dir=d, k=k, side=side,
         token_id=token, ask=ask, price=price, size_usdc=spent, shares=round(spent / price, 4), fee_usdc=fee,
-        sec_after_start=round(now - start, 1), dry_run=1, status="DRY")
+        sec_after_start=round(now - start, 1), dry_run=1, status="DRY", rule=rule_tag())
     # Реальная ставка — одна на окно: после перезапуска бота в том же окне тестовая
     # строка уже есть, реальную не дублируем
     if coin_live(asset) and not storage.series_trade_exists(asset, iv, start, dry_run=False):
@@ -691,8 +718,9 @@ async def maybe_trade(now: float | None = None) -> int:
 
 async def _trade_lead(now: float) -> int:
     """lead60: на первом тике с 60-й по 90-ю секунду окна — если сторона разворота уже
-    ведёт (ask LEAD_LO…LEAD_HI), покупаем её по цене не выше ask + 1 цент; иначе пропуск."""
+    ведёт (ask от lead_lo() до LEAD_HI), покупаем её по цене не выше ask + 1 цент; иначе пропуск."""
     done = 0
+    lo = lead_lo()
     for iv in trade_intervals():
         step = STEP[iv]
         start = int(now // step) * step
@@ -714,7 +742,7 @@ async def _trade_lead(now: float) -> int:
             if ask is None:
                 continue                              # стакана нет — ждём до 90-й секунды
             _mark_traded(key, now)
-            if not LEAD_LO - 1e-9 <= ask <= LEAD_HI + 1e-9:
+            if not lo - 1e-9 <= ask <= LEAD_HI + 1e-9:
                 _log_skip(key, w, d, k, side, "SKIP_PRICE", ask, now)   # разворот не ведёт
                 continue
             cap = lead_cap(ask)
@@ -779,7 +807,7 @@ def _retry_cap(token: str) -> float | None:
     if ask is None:
         return None
     if trade_rule() == "lead60":
-        return lead_cap(ask) if LEAD_LO - 1e-9 <= ask <= LEAD_HI + 1e-9 else None
+        return lead_cap(ask) if lead_lo() - 1e-9 <= ask <= LEAD_HI + 1e-9 else None
     return trade_cap() if ask <= trade_cap() + 1e-9 else None
 
 
@@ -818,7 +846,7 @@ async def _enter_live(w: Win, key, d: str, k: int, side: str, token: str, ask: f
     storage.series_trade_log(ts=int(now), asset=asset, interval=iv, start_ts=start, slug=w.slug, streak_dir=d, k=k,
                              side=side, token_id=token, ask=ask, price=price, size_usdc=spent,
                              shares=round(shares, 4), fee_usdc=fee, sec_after_start=round(now - start, 1),
-                             dry_run=0, status=status, order_id=oid)
+                             dry_run=0, status=status, order_id=oid, rule=rule_tag())
     await _notify(f"✅ 🎲 Серии {asset.upper()} {iv}: {k}×{d} подряд → ставка {side} ${spent:.2f} по {price:.3f}")
 
 
@@ -893,7 +921,7 @@ def _stats_line(name: str, st: dict) -> str:
         s += (f", с итогом {st['settled']}: выигрышей {st['wins'] / st['settled'] * 100:.1f}%, "
               f"итог {st['pnl']:+.2f} USDC ({st['pnl'] / st['staked'] * 100:+.1f}% ставки)" if st["staked"] else "")
     if st["skip_price"] or st["skip_book"]:
-        why = (f"разворот не ведёт (цена вне {LEAD_LO:.2f}–{LEAD_HI:.2f})" if trade_rule() == "lead60"
+        why = (f"разворот не ведёт (цена вне {lead_lo():.2f}–{LEAD_HI:.2f})" if trade_rule() == "lead60"
                else f"дороже {trade_cap():.2f}")
         s += f"; пропущено: {why} — {st['skip_price']}, нет стакана — {st['skip_book']}"
         if st["skip_settled"]:
@@ -901,11 +929,18 @@ def _stats_line(name: str, st: dict) -> str:
     return s
 
 
+def rule_short() -> str:
+    """Правило входа в двух словах (главное меню)."""
+    if trade_rule() == "lead60":
+        return f"на {LEAD_AT_SEC}-й с, если разворот ведёт (от {lead_lo():.2f})"
+    return f"дёшево в первую минуту (до {trade_cap():.2f})"
+
+
 def rule_text() -> str:
     """Правило входа словами (для меню и уведомлений)."""
     ivs = ", ".join(trade_intervals()) or "—"
     if trade_rule() == "lead60":
-        return (f"на {LEAD_AT_SEC}-й секунде окна {ivs}, если разворот уже ведёт (цена {LEAD_LO:.2f}–{LEAD_HI:.2f}), "
+        return (f"на {LEAD_AT_SEC}-й секунде окна {ivs}, если разворот уже ведёт (цена {lead_lo():.2f}–{LEAD_HI:.2f}), "
                 "по цене не выше ask + 1¢")
     return f"в первые {int(settings.SERIES_TRADE_ENTRY_SEC)} с окна {ivs} по цене не выше {trade_cap():.2f}"
 
@@ -982,13 +1017,13 @@ VARIANTS = (
     ("min51", "≤0.51 в первую минуту (правило до v9)"),
     ("start51", "сразу на старте, если ≤0.51"),
     ("start60", "сразу на старте, если ≤0.60"),
-    ("lead60", "на 60-й с, если разворот уже ведёт (0.52–0.80)"),
+    ("lead60", "на 60-й с от 0.52 (порог до v11)"),
 )
 VAR_MIN_CAP, VAR_MIN_SEC = 0.51, 60   # min51 — первая цена ≤0.51 за первую минуту (как основное правило до v9)
 VAR_START_CAP = {"start51": 0.51, "start60": 0.60}
 VAR_START_MAX_SEC = 10         # «на старте» — первый взгляд после того, как серия известна, не позже 10-й с
 VAR_AT_SEC, VAR_AT_MAX_SEC = LEAD_AT_SEC, LEAD_MAX_SEC   # lead60 — те же пороги, что у правила lead60
-VAR_LEAD_LO, VAR_LEAD_HI = LEAD_LO, LEAD_HI
+VAR_LEAD_LO, VAR_LEAD_HI = 0.52, LEAD_HI   # вариант lead60 — прежний порог 0.52, для сравнения с нынешним
 _vars: dict[tuple[str, str, int], dict] = {}        # окно с сигналом -> состояние вариантов
 
 
@@ -1136,14 +1171,18 @@ def _cmp_line(label: str, bets: int, settled: int, wins: int, pnl: float, staked
 
 
 def variant_lines() -> list[str]:
-    """Сравнение правил входа на одних сигналах — с первой записи вариантов."""
-    since = storage.series_variants_first_ts()
-    if since is None:
-        return ["Сравнение входов на тех же сигналах: пока пусто — появится с первым сигналом."]
+    """Сравнение правил входа на одних сигналах — с последней смены правила или порогов
+    (иначе в «основном» смешались бы ставки по разным правилам)."""
+    first = storage.series_variants_first_ts()
+    since = max(first or 0, rule_since())
+    if first is None or not storage.series_variants_since(since):
+        return ["Сравнение входов на тех же сигналах: пока пусто — появится с первым сигналом"
+                + (" после смены правила." if first is not None else ".")]
     m = trade_stats(since, live=False)
-    main = (f"основной — на {LEAD_AT_SEC}-й с, если разворот ведёт" if trade_rule() == "lead60"
+    main = (f"основной — на {LEAD_AT_SEC}-й с от {lead_lo():.2f}" if trade_rule() == "lead60"
             else f"основной — ≤{trade_cap():.2f} в первые {int(settings.SERIES_TRADE_ENTRY_SEC)} с")
-    lines = [f"Сравнение входов на тех же сигналах (тест, с {time.strftime('%d.%m %H:%M', time.gmtime(since))} UTC):",
+    lines = [f"Сравнение входов на тех же сигналах (тест, с {time.strftime('%d.%m %H:%M', time.gmtime(since))} UTC"
+             + (" — с последней смены правила" if since > (first or 0) else "") + "):",
              "  · " + _cmp_line(main, m["bets"], m["settled"], m["wins"], m["pnl"], m["staked"], m["avg_price"],
                                 m["skip_price"] + m["skip_book"], m["skip_won"], m["skip_settled"])]
     st = variant_stats(since)
