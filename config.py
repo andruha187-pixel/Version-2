@@ -92,11 +92,14 @@ class Settings:
 
     # --- 🎲 Стратегия: после SERIES_TRADE_K+ одинаковых исходов — ставка на разворот ---
     # Правило входа: lead60 — на 60-й секунде окна, если разворот уже ведёт
-    # (ask 0.52–0.80), по цене не выше ask + 1¢; cheap — в первые
+    # (ask от SERIES_LEAD_MIN до 0.80), по цене не выше ask + 1¢; cheap — в первые
     # SERIES_TRADE_ENTRY_SEC секунд по цене не выше SERIES_TRADE_CAP.
     # Ставка — SERIES_TRADE_USDC, но не меньше 5 акций. SERIES_TRADE_STOP_USDC —
     # дневной стоп реальных ставок (0 — выкл). Всё меняется кнопками в 🎲.
     SERIES_TRADE_RULE: str = os.getenv("SERIES_TRADE_RULE", "lead60").strip().lower()
+    # Нижний порог «разворот ведёт» для lead60 (с v11; до этого 0.52): по 16–20.10
+    # входы по 0.52–0.56 — 12 из 22, около нуля; от 0.60 — 49 из 62
+    SERIES_LEAD_MIN: float = _get_float("SERIES_LEAD_MIN", 0.58)
     SERIES_TRADE_ENABLED: bool = _get_bool("SERIES_TRADE_ENABLED", True)
     SERIES_TRADE_INTERVALS: str = os.getenv("SERIES_TRADE_INTERVALS", "15m")
     SERIES_TRADE_K: int = _get_int("SERIES_TRADE_K", 4)
