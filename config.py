@@ -1,9 +1,12 @@
 """
-Конфигурация бота. Все настройки — из переменных окружения (.env), см.
-.env.example. Ключи не хардкодим.
+Конфигурация погодного бота. Все настройки — из переменных окружения (.env),
+см. .env.example. Ключей кошелька боту не нужно: он ничего не покупает.
 
-Бот один: 🎲 стратегия серий на 15-минутных рынках Up/Down Polymarket —
-после нескольких одинаковых исходов подряд ставка на разворот (src/series_bot.py).
+Бот: 📚 архив температурных рынков Polymarket («Highest/Lowest temperature in
+<город> on <дата>?»), 📊 поиск порогов цены, после которых сторона выигрывала,
+по городам и времени суток, и 🎯 кандидаты на открытых рынках с тестовыми
+ставками. Почти всё ниже — стартовые значения: дальше настройки меняются
+кнопками в Telegram и хранятся в базе.
 """
 import os
 from dataclasses import dataclass, field
@@ -29,93 +32,59 @@ def _get_int(name: str, default: int) -> int:
     return int(val) if val else default
 
 
-def _coins(raw: str) -> list:
-    return [a.strip().lower() for a in (raw or "").split(",") if a.strip()]
+def _floats(raw: str) -> list:
+    return sorted({round(float(x), 4) for x in (raw or "").replace(";", ",").split(",") if x.strip()})
 
 
 @dataclass
 class Settings:
-    # --- Монеты ---
-    # Рынки 15m есть у этих шести. SERIES_COINS — какие включены при старте
-    # (пусто — все), SERIES_LIVE_COINS — какие сразу 🔴 (реальные ставки при
-    # общем 🔴 LIVE; по умолчанию ни одной). Дальше — кнопками в 🪙 Монетах.
-    # Имена новые, не ENABLED_ASSETS/LIVE_ASSETS прежнего 5m-бота: оставшиеся
-    # от него переменные не включат реальные ставки серий.
-    ASSETS: list = field(default_factory=lambda: _coins(os.getenv("ASSETS", "btc,eth,sol,xrp,bnb,doge")))
-    SERIES_COINS: str = os.getenv("SERIES_COINS", "")
-    SERIES_LIVE_COINS: str = os.getenv("SERIES_LIVE_COINS", "")
-
-    # --- Режим ---
-    # true — ни одного реального ордера (общий выключатель, 🧪/🔴 в главном меню)
-    DRY_RUN: bool = _get_bool("DRY_RUN", True)
-
-    # --- Binance (только свечи для 📚 истории) ---
-    BINANCE_BASE_URL: str = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
-    BINANCE_FUTURES_URL: str = os.getenv("BINANCE_FUTURES_URL", "https://fapi.binance.com")
-
-    # --- Цена Chainlink (src/chainlink_feed.py) — исход окна, если стакан не решил ---
-    CHAINLINK_USE_POLYBOLT: bool = _get_bool("CHAINLINK_USE_POLYBOLT", True)
-    CHAINLINK_POLYBOLT_URL: str = os.getenv("CHAINLINK_POLYBOLT_URL", "wss://ws-live-v2.polymarket.com/ws")
-    CHAINLINK_USE_RTDS: bool = _get_bool("CHAINLINK_USE_RTDS", True)
-    CHAINLINK_RTDS_URL: str = os.getenv("CHAINLINK_RTDS_URL", "wss://ws-live-data.polymarket.com")
-    # API-ключи CLOB для PolyBolt. Не заданы — бот берёт их из SDK-клиента или
-    # выводит из POLY_PRIVATE_KEY (только чтение существующих).
-    POLY_API_KEY: str = os.getenv("POLY_API_KEY", "")
-    POLY_API_SECRET: str = os.getenv("POLY_API_SECRET", "")
-    POLY_API_PASSPHRASE: str = os.getenv("POLY_API_PASSPHRASE", "")
-
-    # --- Polymarket / CLOB ---
-    POLY_HOST: str = os.getenv("POLY_HOST", "https://clob.polymarket.com")
-    GAMMA_HOST: str = os.getenv("GAMMA_HOST", "https://gamma-api.polymarket.com")
-    POLY_CHAIN_ID: int = _get_int("POLY_CHAIN_ID", 137)
-    POLY_PRIVATE_KEY: str = os.getenv("POLY_PRIVATE_KEY", "")
-    POLY_FUNDER_ADDRESS: str = os.getenv("POLY_FUNDER_ADDRESS", "")
-    # Живой стакан по WebSocket — без него стратегия не работает
-    USE_LIVE_BOOK_STREAM: bool = _get_bool("USE_LIVE_BOOK_STREAM", True)
-    # Комиссия тейкера Polymarket: ставка × FEE_RATE × (1 − цена)
-    FEE_RATE: float = _get_float("FEE_RATE", 0.07)
-
-    # --- 📚 История: свечи Binance и официальные исходы Polymarket ---
-    SERIES_HISTORY_DAYS: int = _get_int("SERIES_HISTORY_DAYS", 365)
-    SERIES_ENTRY_PRICE: float = _get_float("SERIES_ENTRY_PRICE", 0.51)
-    SERIES_OFFICIAL_DAYS: int = _get_int("SERIES_OFFICIAL_DAYS", 60)
-
-    # --- 🔁 Запись окон (цены сторон, путь цены, стакан, исходы) ---
-    SERIES_TEST_ENABLED: bool = _get_bool("SERIES_TEST_ENABLED", True)
-    SERIES_INTERVALS: str = os.getenv("SERIES_INTERVALS", "15m")
-    SERIES_PATH_STEP_SEC: int = _get_int("SERIES_PATH_STEP_SEC", 5)
-    # с 30 с до старта и первые 90 с — цена каждые SERIES_FINE_STEP_SEC секунд
-    # (0 — как остальное окно), плюс снимки стакана; старше SERIES_PATH_KEEP_DAYS
-    # дней путь и снимки стираются (цены старта и исходы остаются; 0 — хранить всё)
-    SERIES_FINE_STEP_SEC: int = _get_int("SERIES_FINE_STEP_SEC", 1)
-    SERIES_PATH_KEEP_DAYS: int = _get_int("SERIES_PATH_KEEP_DAYS", 14)
-
-    # --- 🎲 Стратегия: после SERIES_TRADE_K+ одинаковых исходов — ставка на разворот ---
-    # Правило входа: lead60 — на 60-й секунде окна, если разворот уже ведёт
-    # (ask от SERIES_LEAD_MIN до 0.80), по цене не выше ask + 1¢; cheap — в первые
-    # SERIES_TRADE_ENTRY_SEC секунд по цене не выше SERIES_TRADE_CAP.
-    # Ставка — SERIES_TRADE_USDC, но не меньше 5 акций. SERIES_TRADE_STOP_USDC —
-    # дневной стоп реальных ставок (0 — выкл). Всё меняется кнопками в 🎲.
-    SERIES_TRADE_RULE: str = os.getenv("SERIES_TRADE_RULE", "lead60").strip().lower()
-    # Нижний порог «разворот ведёт» для lead60 (с v11; до этого 0.52): по 16–20.10
-    # входы по 0.52–0.56 — 12 из 22, около нуля; от 0.60 — 49 из 62
-    SERIES_LEAD_MIN: float = _get_float("SERIES_LEAD_MIN", 0.58)
-    SERIES_TRADE_ENABLED: bool = _get_bool("SERIES_TRADE_ENABLED", True)
-    SERIES_TRADE_INTERVALS: str = os.getenv("SERIES_TRADE_INTERVALS", "15m")
-    SERIES_TRADE_K: int = _get_int("SERIES_TRADE_K", 4)
-    SERIES_TRADE_CAP: float = _get_float("SERIES_TRADE_CAP", 0.51)
-    SERIES_TRADE_USDC: float = _get_float("SERIES_TRADE_USDC", 3.0)
-    SERIES_TRADE_STOP_USDC: float = _get_float("SERIES_TRADE_STOP_USDC", 30.0)
-    SERIES_TRADE_ENTRY_SEC: int = _get_int("SERIES_TRADE_ENTRY_SEC", 60)
-
     # --- Telegram ---
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
+    # --- API Polymarket (публичные, ключ не нужен) ---
+    GAMMA_HOST: str = os.getenv("GAMMA_HOST", "https://gamma-api.polymarket.com")
+    CLOB_HOST: str = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
+    # Не чаще стольких запросов в секунду на все API вместе
+    HTTP_RPS: float = _get_float("HTTP_RPS", 8.0)
+    # Как искать температурные события: keyset-поиск по названию и по тегам Gamma
+    DISCOVERY_TAGS: str = os.getenv("DISCOVERY_TAGS", "temperature,weather,daily-temperature")
+
+    # --- 📚 Архив закрытых рынков ---
+    ARCHIVE_DAYS: int = _get_int("ARCHIVE_DAYS", 120)           # глубина архива (кнопками 60/120/240/365)
+    ARCHIVE_REFRESH_HOURS: float = _get_float("ARCHIVE_REFRESH_HOURS", 6.0)
+    PATH_FIDELITY_MIN: int = _get_int("PATH_FIDELITY_MIN", 5)   # шаг истории цены, минут
+
+    # --- 📊 Пороги ---
+    # Уровни цены, на которых смотрим «цена впервые дошла до X → выиграла ли сторона»
+    STUDY_LEVELS: list = field(default_factory=lambda: _floats(
+        os.getenv("STUDY_LEVELS", "0.80,0.83,0.85,0.87,0.90,0.92,0.94,0.96")))
+    # Цена входа = цена в истории + столько (ask выше середины/последней сделки)
+    STUDY_SLIP: float = _get_float("STUDY_SLIP", 0.01)
+    # Цена перепрыгнула уровень больше чем на столько — считаем, что по уровню было не войти
+    STUDY_MAX_JUMP: float = _get_float("STUDY_MAX_JUMP", 0.05)
+    # Комиссия тейкера погодных рынков: сумма × FEE_RATE × (1 − цена)
+    FEE_RATE: float = _get_float("FEE_RATE", 0.05)
+    # Правило «проверено»: всего ставок не меньше RULE_MIN_N; на старой части архива (первые 60% дней)
+    # выигрышей значимо больше, чем нужно для окупаемости (биномиальный p ≤ RULE_MAX_P), и на новой
+    # части — в плюсе; в каждой части не меньше RULE_MIN_PART_N ставок
+    RULE_MIN_N: int = _get_int("RULE_MIN_N", 30)
+    RULE_MIN_PART_N: int = _get_int("RULE_MIN_PART_N", 10)
+    RULE_MAX_P: float = _get_float("RULE_MAX_P", 0.05)
+    # События с меньшим объёмом торгов, $ — в расчёт не берём (тонкие рынки)
+    MIN_EVENT_VOLUME: float = _get_float("MIN_EVENT_VOLUME", 5000.0)
+
+    # --- 🎯 Кандидаты на открытых рынках ---
+    LIVE_ENABLED: bool = _get_bool("LIVE_ENABLED", True)
+    LIVE_POLL_SEC: float = _get_float("LIVE_POLL_SEC", 60.0)
+    SNAPSHOT_EVERY_MIN: float = _get_float("SNAPSHOT_EVERY_MIN", 10.0)   # снимок цен открытых рынков в базу
+    ALERTS_ENABLED: bool = _get_bool("ALERTS_ENABLED", True)
+    PAPER_STAKE_USDC: float = _get_float("PAPER_STAKE_USDC", 10.0)       # тестовая ставка на кандидата
+
     # --- База и отчёты ---
-    DB_PATH: str = os.getenv("DB_PATH", "data/bot.db")
-    REPORT_INTERVAL_HOURS: float = _get_float("REPORT_INTERVAL_HOURS", 4.0)
+    DB_PATH: str = os.getenv("DB_PATH", "data/weather.db")
     REPORTS_DIR: str = os.getenv("REPORTS_DIR", "data/reports")
+    REPORT_HOUR_UTC: int = _get_int("REPORT_HOUR_UTC", 6)               # ежедневная сводка
 
 
 settings = Settings()
