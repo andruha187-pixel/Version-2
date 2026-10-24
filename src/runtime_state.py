@@ -24,9 +24,11 @@ _DEFAULTS = {
     "min_event_volume": float(settings.MIN_EVENT_VOLUME),
     "rule_min_n": int(settings.RULE_MIN_N),
     "alerts_enabled": bool(settings.ALERTS_ENABLED),
+    "alerts_hourly": bool(settings.ALERTS_HOURLY),   # кандидаты — сводкой раз в час (иначе — сразу)
     "alerts_city_only": False,          # только правила самого города (без «все города»)
     "cities_off": "",                   # города без кандидатов (ключи через запятую)
     "alerts_sides": "both",             # кандидаты по стороне: both / yes / no
+    "alert_min_ev": 2.0,                # кандидат — только если по цене покупки ожидаемо не меньше, % на ставку
     "paper_stake": float(settings.PAPER_STAKE_USDC),
 }
 
@@ -36,9 +38,11 @@ _CASTERS = {
     "min_event_volume": lambda v: max(0.0, float(v)),
     "rule_min_n": lambda v: max(5, min(500, int(float(v)))),
     "alerts_enabled": _bool,
+    "alerts_hourly": _bool,
     "alerts_city_only": _bool,
     "cities_off": _csv,
     "alerts_sides": lambda v: str(v) if str(v) in ("both", "yes", "no") else "both",
+    "alert_min_ev": lambda v: max(-50.0, min(50.0, float(v))),
     "paper_stake": lambda v: max(1.0, min(10000.0, float(v))),
 }
 

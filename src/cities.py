@@ -1,12 +1,14 @@
 """
 Часовые пояса городов: «день» температурного рынка — местные сутки города
-(Weather Underground показывает историю станции по местному времени), поэтому
-время входа считаем от местной полуночи даты рынка.
+(станция считает сутки по местному времени), поэтому время входа считаем от
+местной полуночи даты рынка.
 
 Город ищем по названию из заголовка события («Highest temperature in London on
 …»); не нашли — по стране из ссылки Weather Underground в правилах
-(…/history/daily/gb/london/EGLC). Не нашли и так — UTC с пометкой «tz?» в
-отчётах: такой город стоит дописать сюда.
+(…/history/daily/gb/london/EGLC). С конца августа 2026 у многих городов в
+правилах вместо ссылки — «recorded by NOAA at … Airport Station», страны там нет,
+поэтому города нужны здесь по названию. Не нашли — UTC с пометкой «пояс?» в
+🏙 Городах: такой город стоит дописать сюда.
 """
 from __future__ import annotations
 import re
@@ -35,6 +37,14 @@ CITY_TZ = {
     "mexico city": "America/Mexico_City", "buenos aires": "America/Argentina/Buenos_Aires",
     "sao paulo": "America/Sao_Paulo", "são paulo": "America/Sao_Paulo", "rio de janeiro": "America/Sao_Paulo",
     "lima": "America/Lima", "bogota": "America/Bogota", "bogotá": "America/Bogota", "santiago": "America/Santiago",
+    "panama city": "America/Panama", "panama": "America/Panama", "guatemala city": "America/Guatemala",
+    "havana": "America/Havana", "santo domingo": "America/Santo_Domingo",
+    "san juan": "America/Puerto_Rico", "caracas": "America/Caracas", "quito": "America/Guayaquil",
+    "montevideo": "America/Montevideo", "asuncion": "America/Asuncion", "la paz": "America/La_Paz",
+    "brasilia": "America/Sao_Paulo", "belo horizonte": "America/Sao_Paulo", "porto alegre": "America/Sao_Paulo",
+    "curitiba": "America/Sao_Paulo", "salvador": "America/Bahia", "recife": "America/Recife",
+    "fortaleza": "America/Fortaleza", "manaus": "America/Manaus", "monterrey": "America/Monterrey",
+    "guadalajara": "America/Mexico_City", "cancun": "America/Cancun", "medellin": "America/Bogota",
     # Европа
     "london": "Europe/London", "manchester": "Europe/London", "dublin": "Europe/Dublin",
     "paris": "Europe/Paris", "berlin": "Europe/Berlin", "munich": "Europe/Berlin", "frankfurt": "Europe/Berlin",
@@ -45,15 +55,42 @@ CITY_TZ = {
     "oslo": "Europe/Oslo", "copenhagen": "Europe/Copenhagen", "helsinki": "Europe/Helsinki",
     "athens": "Europe/Athens", "istanbul": "Europe/Istanbul", "ankara": "Europe/Istanbul",
     "moscow": "Europe/Moscow", "kyiv": "Europe/Kyiv", "kiev": "Europe/Kyiv", "bucharest": "Europe/Bucharest",
+    "st petersburg": "Europe/Moscow", "saint petersburg": "Europe/Moscow", "minsk": "Europe/Minsk",
+    "edinburgh": "Europe/London", "glasgow": "Europe/London",
+    "lyon": "Europe/Paris", "marseille": "Europe/Paris", "nice": "Europe/Paris", "toulouse": "Europe/Paris",
+    "seville": "Europe/Madrid", "valencia": "Europe/Madrid", "porto": "Europe/Lisbon", "naples": "Europe/Rome",
+    "turin": "Europe/Rome", "venice": "Europe/Rome", "florence": "Europe/Rome", "cologne": "Europe/Berlin",
+    "stuttgart": "Europe/Berlin", "dusseldorf": "Europe/Berlin", "rotterdam": "Europe/Amsterdam",
+    "krakow": "Europe/Warsaw", "belgrade": "Europe/Belgrade", "sofia": "Europe/Sofia", "zagreb": "Europe/Zagreb",
+    "riga": "Europe/Riga", "vilnius": "Europe/Vilnius", "tallinn": "Europe/Tallinn", "reykjavik": "Atlantic/Reykjavik",
+    "izmir": "Europe/Istanbul", "antalya": "Europe/Istanbul",
     # Ближний Восток и Африка
     "dubai": "Asia/Dubai", "abu dhabi": "Asia/Dubai", "doha": "Asia/Qatar", "riyadh": "Asia/Riyadh",
     "tel aviv": "Asia/Jerusalem", "jerusalem": "Asia/Jerusalem", "cairo": "Africa/Cairo",
     "johannesburg": "Africa/Johannesburg", "cape town": "Africa/Johannesburg", "lagos": "Africa/Lagos",
-    "nairobi": "Africa/Nairobi",
+    "nairobi": "Africa/Nairobi", "jeddah": "Asia/Riyadh", "mecca": "Asia/Riyadh", "medina": "Asia/Riyadh",
+    "dammam": "Asia/Riyadh", "kuwait city": "Asia/Kuwait", "kuwait": "Asia/Kuwait", "manama": "Asia/Bahrain",
+    "muscat": "Asia/Muscat", "amman": "Asia/Amman", "beirut": "Asia/Beirut", "baghdad": "Asia/Baghdad",
+    "tehran": "Asia/Tehran", "casablanca": "Africa/Casablanca", "algiers": "Africa/Algiers", "tunis": "Africa/Tunis",
+    "accra": "Africa/Accra", "addis ababa": "Africa/Addis_Ababa", "dar es salaam": "Africa/Dar_es_Salaam",
+    "kinshasa": "Africa/Kinshasa", "luanda": "Africa/Luanda", "durban": "Africa/Johannesburg",
     # Азия и Океания
     "seoul": "Asia/Seoul", "busan": "Asia/Seoul", "tokyo": "Asia/Tokyo", "osaka": "Asia/Tokyo",
     "beijing": "Asia/Shanghai", "shanghai": "Asia/Shanghai", "shenzhen": "Asia/Shanghai",
     "guangzhou": "Asia/Shanghai", "chengdu": "Asia/Shanghai", "wuhan": "Asia/Shanghai",
+    "chongqing": "Asia/Shanghai", "qingdao": "Asia/Shanghai", "zhengzhou": "Asia/Shanghai", "jinan": "Asia/Shanghai",
+    "tianjin": "Asia/Shanghai", "nanjing": "Asia/Shanghai", "hangzhou": "Asia/Shanghai", "xi'an": "Asia/Shanghai",
+    "xian": "Asia/Shanghai", "harbin": "Asia/Shanghai", "shenyang": "Asia/Shanghai", "dalian": "Asia/Shanghai",
+    "xiamen": "Asia/Shanghai", "kunming": "Asia/Shanghai", "changsha": "Asia/Shanghai", "hefei": "Asia/Shanghai",
+    "suzhou": "Asia/Shanghai", "fuzhou": "Asia/Shanghai", "nanning": "Asia/Shanghai", "urumqi": "Asia/Shanghai",
+    "macau": "Asia/Macau", "incheon": "Asia/Seoul", "daegu": "Asia/Seoul", "sapporo": "Asia/Tokyo",
+    "fukuoka": "Asia/Tokyo", "nagoya": "Asia/Tokyo", "kaohsiung": "Asia/Taipei", "ulaanbaatar": "Asia/Ulaanbaatar",
+    "phnom penh": "Asia/Phnom_Penh", "yangon": "Asia/Yangon", "colombo": "Asia/Colombo",
+    "kathmandu": "Asia/Kathmandu", "lahore": "Asia/Karachi", "islamabad": "Asia/Karachi",
+    "hyderabad": "Asia/Kolkata", "ahmedabad": "Asia/Kolkata", "pune": "Asia/Kolkata", "jaipur": "Asia/Kolkata",
+    "almaty": "Asia/Almaty", "tashkent": "Asia/Tashkent", "baku": "Asia/Baku", "tbilisi": "Asia/Tbilisi",
+    "yerevan": "Asia/Yerevan", "cebu": "Asia/Manila", "surabaya": "Asia/Jakarta", "bali": "Asia/Makassar",
+    "denpasar": "Asia/Makassar", "phuket": "Asia/Bangkok", "chiang mai": "Asia/Bangkok",
     "hong kong": "Asia/Hong_Kong", "taipei": "Asia/Taipei", "singapore": "Asia/Singapore",
     "jakarta": "Asia/Jakarta", "bangkok": "Asia/Bangkok", "manila": "Asia/Manila",
     "kuala lumpur": "Asia/Kuala_Lumpur", "hanoi": "Asia/Ho_Chi_Minh", "ho chi minh city": "Asia/Ho_Chi_Minh",
@@ -61,7 +98,8 @@ CITY_TZ = {
     "bangalore": "Asia/Kolkata", "bengaluru": "Asia/Kolkata", "chennai": "Asia/Kolkata", "kolkata": "Asia/Kolkata",
     "karachi": "Asia/Karachi", "dhaka": "Asia/Dhaka",
     "sydney": "Australia/Sydney", "melbourne": "Australia/Melbourne", "brisbane": "Australia/Brisbane",
-    "perth": "Australia/Perth", "adelaide": "Australia/Adelaide",
+    "perth": "Australia/Perth", "adelaide": "Australia/Adelaide", "canberra": "Australia/Sydney",
+    "hobart": "Australia/Hobart", "darwin": "Australia/Darwin", "gold coast": "Australia/Brisbane",
     "auckland": "Pacific/Auckland", "wellington": "Pacific/Auckland",
 }
 
@@ -80,13 +118,25 @@ COUNTRY_TZ = {
     "sa": "Asia/Riyadh", "il": "Asia/Jerusalem", "eg": "Africa/Cairo", "za": "Africa/Johannesburg",
     "ng": "Africa/Lagos", "ke": "Africa/Nairobi", "nz": "Pacific/Auckland", "ar": "America/Argentina/Buenos_Aires",
     "pe": "America/Lima", "co": "America/Bogota", "cl": "America/Santiago",
+    "pa": "America/Panama", "uy": "America/Montevideo", "py": "America/Asuncion", "bo": "America/La_Paz",
+    "ec": "America/Guayaquil", "ve": "America/Caracas", "cr": "America/Costa_Rica", "gt": "America/Guatemala",
+    "cu": "America/Havana", "do": "America/Santo_Domingo", "pr": "America/Puerto_Rico",
+    "kw": "Asia/Kuwait", "bh": "Asia/Bahrain", "om": "Asia/Muscat", "jo": "Asia/Amman", "lb": "Asia/Beirut",
+    "iq": "Asia/Baghdad", "ir": "Asia/Tehran", "ma": "Africa/Casablanca", "dz": "Africa/Algiers",
+    "tn": "Africa/Tunis", "gh": "Africa/Accra", "et": "Africa/Addis_Ababa", "tz": "Africa/Dar_es_Salaam",
+    "lk": "Asia/Colombo", "np": "Asia/Kathmandu", "mm": "Asia/Yangon", "kh": "Asia/Phnom_Penh",
+    "mn": "Asia/Ulaanbaatar", "uz": "Asia/Tashkent", "az": "Asia/Baku", "ge": "Asia/Tbilisi", "am": "Asia/Yerevan",
+    "by": "Europe/Minsk", "rs": "Europe/Belgrade", "bg": "Europe/Sofia", "hr": "Europe/Zagreb", "lv": "Europe/Riga",
+    "lt": "Europe/Vilnius", "ee": "Europe/Tallinn", "is": "Atlantic/Reykjavik", "mo": "Asia/Macau",
 }
 
 
 ALIASES = {"new york city": "nyc", "new york": "nyc", "la": "los angeles", "sf": "san francisco",
            "washington dc": "washington", "washington d.c.": "washington", "dc": "washington",
            "são paulo": "sao paulo", "bogotá": "bogota", "kiev": "kyiv", "st. louis": "st louis",
-           "bengaluru": "bangalore", "new delhi": "delhi"}
+           "bengaluru": "bangalore", "new delhi": "delhi",
+           # одна и та же станция (RKSI) — с конца июля рынок называется «Seoul (Incheon)»
+           "seoul incheon": "seoul", "seoul-incheon": "seoul"}
 
 
 # Штат/провинция из ссылки Weather Underground — для городов, которых нет в CITY_TZ.

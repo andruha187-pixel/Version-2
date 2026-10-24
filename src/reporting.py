@@ -198,6 +198,14 @@ def daily_text(now: float | None = None) -> str:
     lines = ["🌡 Сводка за сутки", tn.archive_line(), tn.study_line(),
              f"🎯 Кандидатов за сутки: {st['n']}" + (f", с итогом {st['settled']}: выигр. {st['wins']}, {st['pnl']:+.2f} $"
                                                    if st["settled"] else "")]
+    allt = live.paper_stats(0)
+    if allt["settled"]:
+        lines.append(f"Тестовые ставки за всё время: {allt['settled']} с итогом, выигр. {allt['wins']} "
+                     f"({100 * allt['wins'] / allt['settled']:.0f}%), {allt['pnl']:+.2f} $"
+                     + (f" ({100 * allt['pnl'] / allt['staked']:+.1f}% на ставку)" if allt["staked"] else ""))
+        for w, x in live.paper_by_window(0):
+            if x["settled"]:
+                lines.append(f"  {w}: {x['settled']}, выигр. {x['wins']}, {x['pnl']:+.2f} $")
     rules = study.top_rules(5, cities=True) or study.top_rules(5)
     if rules:
         lines += ["", "Лучшие правила:"] + [f"• {study.rule_text(r, short=True)}" for r in rules]

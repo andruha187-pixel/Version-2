@@ -74,3 +74,18 @@ async def book(token_id: str) -> dict:
 def depth_usdc(asks: list[tuple[float, float]], max_price: float) -> float:
     """Сколько $ можно купить по asks не дороже max_price."""
     return round(sum(p * s for p, s in asks if p <= max_price + 1e-9), 2)
+
+
+def fill_price(asks: list[tuple[float, float]], usdc: float, max_price: float) -> float | None:
+    """Средняя цена покупки на usdc по asks (по возрастанию), не дороже max_price.
+    Столько в стакане до max_price нет — None."""
+    left, shares = float(usdc), 0.0
+    for p, s in asks:
+        if p > max_price + 1e-9:
+            break
+        take = min(left, p * s)
+        shares += take / p
+        left -= take
+        if left <= 1e-9:
+            return round(float(usdc) / shares, 4)
+    return None

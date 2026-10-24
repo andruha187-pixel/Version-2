@@ -44,6 +44,22 @@ def duration(sec: float) -> str:
     return f"{h} ч {m} мин" if h else f"{max(1, m)} мин"
 
 
+def local_when(date_iso: str, hour: float) -> str:
+    """Местное время в городе: «14:09» в день рынка, иначе с датой — «24.10 14:09»."""
+    import datetime as _dt
+    day, rem = divmod(hour, 24.0)
+    h, m = int(rem), int(round((rem - int(rem)) * 60))
+    if m == 60:
+        h, m = h + 1, 0
+    if day == 0:
+        return f"{h:02d}:{m:02d}"
+    try:
+        d = _dt.date.fromisoformat(date_iso[:10]) + _dt.timedelta(days=int(day))
+    except ValueError:
+        return hhmm_local(hour)
+    return f"{d.day:02d}.{d.month:02d} {h:02d}:{m:02d}"
+
+
 def hhmm_local(hour: float) -> str:
     """Час от местной полуночи дня рынка → «16:40», «накануне 22:10», «+1 д 03:00»."""
     day, rem = divmod(hour, 24.0)

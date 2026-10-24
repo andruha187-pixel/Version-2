@@ -45,12 +45,14 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 
 -- 🎯 Кандидат: цена стороны впервые дошла до уровня, а правило для города/времени
--- прошло проверку на архиве. Тестовая ставка stake по entry, итог — по исходу.
+-- прошло проверку на архиве. Тестовая ставка stake по entry (средняя цена по стакану
+-- на всю ставку; best — лучшая цена покупки в этот момент), итог — по исходу.
 CREATE TABLE IF NOT EXISTS candidates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts INTEGER, event_id INTEGER, idx INTEGER, side TEXT, level REAL, price REAL, entry REAL,
     hour REAL, rule TEXT, rule_n INTEGER, rule_wins INTEGER, rule_ev REAL, depth_usdc REAL,
-    stake REAL, shares REAL, fee REAL, outcome INTEGER, pnl REAL, settled_ts INTEGER,
+    stake REAL, shares REAL, fee REAL, outcome INTEGER, pnl REAL, settled_ts INTEGER, ev_now REAL,
+    best REAL, window TEXT,
     UNIQUE (event_id, idx, side)
 );
 CREATE INDEX IF NOT EXISTS idx_candidates_ts ON candidates(ts);
@@ -76,6 +78,10 @@ def init_db() -> None:
     DB_WAS_NEW = not os.path.exists(settings.DB_PATH)
     with _conn() as conn:
         conn.executescript(_SCHEMA)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(candidates)").fetchall()}
+        for col, typ in (("ev_now", "REAL"), ("best", "REAL"), ("window", "TEXT")):
+            if col not in cols:                                # база прошлой версии
+                conn.execute(f"ALTER TABLE candidates ADD COLUMN {col} {typ}")
 
 
 # ------------------------------------------------------------ настройки ----
@@ -291,7 +297,8 @@ def snapshots_export(since_ts: int) -> list[tuple]:
 # ------------------------------------------------------------ кандидаты ----
 
 CANDIDATE_COLUMNS = ["id", "ts", "event_id", "idx", "side", "level", "price", "entry", "hour", "rule", "rule_n",
-                     "rule_wins", "rule_ev", "depth_usdc", "stake", "shares", "fee", "outcome", "pnl", "settled_ts"]
+                     "rule_wins", "rule_ev", "depth_usdc", "stake", "shares", "fee", "outcome", "pnl", "settled_ts",
+                     "ev_now", "best", "window"]
 
 
 def candidate_add(**f) -> int | None:

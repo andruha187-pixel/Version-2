@@ -4,7 +4,7 @@
 /menu:
   📊 Пороги     — лучшие проверенные правила; все города по уровням; пересчитать
   🏙 Города     — города архива: события, объём; у города — пороги и кандидаты вкл/выкл
-  🎯 Кандидаты  — последние кандидаты и итог тестовых ставок; вкл/выкл сообщения
+  🎯 Кандидаты  — последние кандидаты и итог тестовых ставок; сообщения: сразу / раз в час / выкл
   📚 Архив      — что скачано, ход докачки, способы поиска; глубина; докачать сейчас
   📤 Файлы      — события, расчётные ставки, ячейки, кандидаты, снимки; пути цены
   ⚙️ Настройки  — объём события, ставок для правила, тестовая ставка
@@ -32,6 +32,7 @@ VOLUME_PRESETS = (0.0, 2000.0, 5000.0, 20000.0)
 MIN_N_PRESETS = (20, 30, 50, 100)
 STAKE_PRESETS = (5.0, 10.0, 20.0, 50.0)
 DAYS_PRESETS = (60, 120, 240, 365)
+MIN_EV_PRESETS = (0.0, 1.0, 2.0, 3.0, 5.0)
 _tasks: set = set()
 
 
@@ -96,6 +97,8 @@ def candidates_line() -> str:
         s += f"; тестовые ставки: выигр. {st['wins']}/{st['settled']}, {st['pnl']:+.2f} $"
     if not runtime_state.get("alerts_enabled"):
         s += " (сообщения ⏸)"
+    elif runtime_state.get("alerts_hourly"):
+        s += " (сообщения — сводкой раз в час)"
     return s
 
 
@@ -136,14 +139,19 @@ def thresholds_text(head: str = "") -> str:
         f"+{sm['slip']:g} (ask), комиссия {sm['fee_rate']:g}×(1−цена). Время — местное в городе.",
         ""]
     rules = study.rules()
-    if rules:
+    active = [r for r in rules if r.get("active")]
+    if active:
         city_rules, all_rules = study.top_rules(TOP_CITY_RULES, cities=True), study.top_rules(TOP_ALL_RULES, cities=False)
-        lines.append(f"Проверенных правил: {len(rules)} (повторы — одни и те же ставки в соседних ячейках — скрыты). "
-                     "Лучшие по доходу в день:")
+        lines.append(f"Правил для кандидатов: {len(active)} из {len(rules)} проверенных — в окне времени, и только "
+                     "если то же правило проверено и по всем городам (у одного города «перевес» там, где у всех "
+                     "его нет, — скорее везение). Повторы скрыты. Лучшие по доходу в день:")
         if city_rules:
             lines += ["", "По городам:"] + [f"{i}. {study.rule_text(r)}" for i, r in enumerate(city_rules, 1)]
         if all_rules:
             lines += ["", "Все города вместе:"] + [f"{i}. {study.rule_text(r)}" for i, r in enumerate(all_rules, 1)]
+    elif rules:
+        lines.append(f"Проверенных ячеек: {len(rules)}, но правил для кандидатов нет: ни одно не подтверждено "
+                     "по всем городам в своём окне времени.")
     else:
         lines.append("Проверенных правил пока нет — архив мал или перевеса нет.")
     return "\n".join(lines)
@@ -157,7 +165,12 @@ def thresholds_markup() -> InlineKeyboardMarkup:
 def overview_text() -> str:
     if study.cells() is None:
         return "📋 Все города по уровням — таблица появится после расчёта в этом запуске (♻️ Пересчитать)."
-    return "\n".join(["📋 Все города, любое время — по уровням цены:"] + study.overview_lines())
+    sm = study.summary() or {}
+    head = ("📋 Все города — доход на ставку по времени касания: «за 2+ дня» — рынок только открылся "
+            "(события выставляют за ~1.5–2 суток), «накануне», «в день» рынка (местное время). Вход — цена "
+            f"касания + {sm.get('slip', settings.STUDY_SLIP):g}, с комиссией; в скобках — ставок; "
+            "✅ — по этому окну ищутся кандидаты.")
+    return "\n".join([head, ""] + study.overview_lines())
 
 
 def cities_text() -> str:
@@ -196,7 +209,8 @@ def city_text(key: str, head: str = "") -> str:
     else:
         cl = study.city_lines(key)
         lines += cl if cl else ["Расчётных ставок по городу нет (мало событий или объём меньше порога)."]
-        lines.append("✅ — правило проверено.")
+        lines.append("Доход на ставку: за 2+ дня / накануне / в день рынка; в скобках — ставок. ✅ — в этом окне "
+                     "по городу ищутся кандидаты (своё правило или правило всех городов, если у города не минус).")
     return "\n".join(lines)
 
 
@@ -208,17 +222,30 @@ def city_markup(key: str) -> InlineKeyboardMarkup:
 
 def candidates_text() -> str:
     st, week = live.paper_stats(0), live.paper_stats(int(time.time()) - 7 * 86400)
-    lines = ["🎯 Кандидаты — цена стороны впервые дошла до уровня из проверенного правила.",
-             f"Сообщения: {'✅ вкл' if runtime_state.get('alerts_enabled') else '⏸ выкл'}; правила: "
+    mode = ("⏸ выкл" if not runtime_state.get("alerts_enabled")
+            else ("🕐 сводкой раз в час" if runtime_state.get("alerts_hourly") else "⚡ сразу"))
+    lines = ["🎯 Кандидаты — цена стороны впервые дошла до уровня из правила для этого окна времени.",
+             f"Сообщения: {mode}; правила: "
              + ("только самого города" if runtime_state.get("alerts_city_only") else "города и «все города»")
              + "; стороны: " + {"yes": "только YES", "no": "только NO"}.get(str(runtime_state.get("alerts_sides")), "YES и NO")
-             + f"; тестовая ставка ${runtime_state.get('paper_stake'):g}.", ""]
+             + f"; тестовая ставка ${runtime_state.get('paper_stake'):g}.",
+             f"Кандидат — только если по цене покупки ожидаемо от {runtime_state.get('alert_min_ev'):+g}% на ставку "
+             "(по проценту выигрышей правила: правило «NO от 0.90» собрано из входов около 0.92, и по 0.99 те же "
+             "98% — уже минус). Цена покупки — средняя по стакану на всю тестовую ставку; в стакане не хватает до "
+             f"лучшей цены + {live.FILL_MAX_SLIP:g} — не кандидат."
+             + _skipped_text(), ""]
     for name, s in (("Всего", st), ("За 7 дней", week)):
         line = f"{name}: {s['n']} {text.plural(s['n'], 'кандидат', 'кандидата', 'кандидатов')}"
         if s["settled"]:
             line += (f", с итогом {s['settled']}: выигр. {s['wins']} ({100 * s['wins'] / s['settled']:.0f}%), "
                      f"{s['pnl']:+.2f} $" + (f" ({100 * s['pnl'] / s['staked']:+.1f}%)" if s["staked"] else ""))
         lines.append(line)
+    by_win = [(w, x) for w, x in live.paper_by_window(int(time.time()) - 7 * 86400) if x["settled"]]
+    if by_win:
+        lines += ["", "За 7 дней по окнам времени (с итогом):"]
+        for w, x in by_win:
+            lines.append(f"  {w}: {x['settled']}, выигр. {x['wins']} ({100 * x['wins'] / x['settled']:.0f}%), "
+                         f"{x['pnl']:+.2f} $" + (f" ({100 * x['pnl'] / x['staked']:+.1f}%)" if x["staked"] else ""))
     recent = storage.candidates(limit=10)
     if recent:
         lines += ["", "Последние:"]
@@ -231,14 +258,26 @@ def candidates_text() -> str:
     return "\n".join(lines)
 
 
+def _skipped_text() -> str:
+    st = live.stats()
+    parts = [f"слабых по цене {st['weak']}" if st["weak"] else "",
+             f"тонкий стакан {st['thin']}" if st["thin"] else ""]
+    parts = [p for p in parts if p]
+    return (" Отсеяно с запуска: " + ", ".join(parts) + ".") if parts else ""
+
+
 def candidates_markup() -> InlineKeyboardMarkup:
+    on, hourly = bool(runtime_state.get("alerts_enabled")), bool(runtime_state.get("alerts_hourly"))
     return _menu(
-        (Btn("💬 Сообщения: ✅ вкл" if runtime_state.get("alerts_enabled") else "💬 Сообщения: ⏸ выкл",
-             callback_data="cat"),),
+        (Btn(_mark(on and not hourly) + "⚡ сразу", callback_data="cam:now"),
+         Btn(_mark(on and hourly) + "🕐 раз в час", callback_data="cam:hour"),
+         Btn(_mark(not on) + "⏸ выкл", callback_data="cam:off")),
         (Btn(_mark(not runtime_state.get("alerts_city_only")) + "город + все города", callback_data="cac:0"),
          Btn(_mark(bool(runtime_state.get("alerts_city_only"))) + "только город", callback_data="cac:1")),
         tuple(Btn(_mark(runtime_state.get("alerts_sides") == k) + name, callback_data=f"cas:{k}")
               for k, name in (("both", "YES и NO"), ("yes", "только YES"), ("no", "только NO"))),
+        tuple(Btn(_mark(abs(float(runtime_state.get("alert_min_ev")) - v) < 1e-9) + f"от {v:+g}%", callback_data=f"cae:{v:g}")
+              for v in MIN_EV_PRESETS),
         (Btn("🔄 Обновить", callback_data="ca"), BACK))
 
 
@@ -350,8 +389,18 @@ async def handle(data: str) -> tuple[str, InlineKeyboardMarkup]:
     if cmd == "cat":
         runtime_state.set("alerts_enabled", not runtime_state.get("alerts_enabled"))
         return candidates_text(), candidates_markup()
+    if cmd == "cam" and arg in ("now", "hour", "off"):
+        runtime_state.set("alerts_enabled", arg != "off")
+        if arg != "off":
+            runtime_state.set("alerts_hourly", arg == "hour")
+        return candidates_text(), candidates_markup()
     if cmd == "cac" and arg in ("0", "1"):
         runtime_state.set("alerts_city_only", arg == "1")
+        return candidates_text(), candidates_markup()
+    if cmd == "cae":
+        v = _float(arg)
+        if v is not None and any(abs(v - x) < 1e-9 for x in MIN_EV_PRESETS):
+            runtime_state.set("alert_min_ev", v)
         return candidates_text(), candidates_markup()
     if cmd == "cas" and arg in ("both", "yes", "no"):
         runtime_state.set("alerts_sides", arg)

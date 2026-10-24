@@ -28,7 +28,7 @@ MAX_ERRORS_PER_EVENT = 3
 CHUNK_EVENTS = 1000                         # после каждой 1000 скачанных событий — пересчёт порогов
 # Версия разбора событий: поменялась (например, пояса городов США по штату) — один раз заново
 # просматриваем все окна, чтобы обновить пояс, станцию и границы дня у уже скачанных событий
-PARSE_VERSION = 2
+PARSE_VERSION = 3                            # 3: пояса городов без ссылки WU (NOAA), Seoul (Incheon) = Seoul
 PARSE_VERSION_KEY = "archive_parse_version"
 
 _progress = {"phase": "idle", "found": 0, "new": 0, "paths_total": 0, "paths_done": 0, "events_done": 0,
@@ -162,7 +162,8 @@ async def sync(now: float | None = None) -> dict:
         _progress[k] = 0
     _progress.update(phase="discover", started=int(time.time()), last_error="")
     try:
-        if storage.get_setting(PARSE_VERSION_KEY) != str(PARSE_VERSION):
+        reparse = storage.get_setting(PARSE_VERSION_KEY) != str(PARSE_VERSION)
+        if reparse:
             storage.set_setting(OLDEST_KEY, int(time.time() if now is None else now))   # всё заново, история остаётся
         new = await discover(now)
         storage.set_setting(PARSE_VERSION_KEY, PARSE_VERSION)
@@ -182,7 +183,8 @@ async def sync(now: float | None = None) -> dict:
                     await _notify_first(done)
             if queued < CHUNK_EVENTS:
                 break
-        return {"new": new, "done": done, "errors": _progress["errors"]}
+        return {"new": new, "done": done, "errors": _progress["errors"],
+                "reparsed": bool(reparse and storage.archive_counts()["status"].get("done"))}
     finally:
         _progress.update(phase="idle", finished=int(time.time()), window="")
         _running["on"] = False
@@ -212,8 +214,8 @@ def request_sync() -> None:
 
 
 async def _after_sync(res: dict) -> None:
-    """Скачали новое — пересчитать пороги и сообщить."""
-    if not res.get("done"):
+    """Скачали новое (или заново разобрали события: пояса, названия) — пересчитать пороги и сообщить."""
+    if not res.get("done") and not res.get("reparsed"):
         return
     from src import study, telegram_notify
     try:
