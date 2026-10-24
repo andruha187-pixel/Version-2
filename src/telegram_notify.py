@@ -1,18 +1,18 @@
 """
-Телеграм: кнопочное меню бота серий 15m и уведомления.
+Телеграм: меню погодного бота и уведомления.
 
 /menu:
-  🎲 Стратегия — вкл/выкл, правило входа, серия от, порог «ведёт от» (для «на 60-й с»)
-                 или «цена до» (для «дёшево»), ставка, дневной стоп
-  🪙 Монеты    — у каждой: ✅ вкл / ⏸ выкл и 🧪 тест / 🔴 реально
-  📊 Статистика · 📤 Файлы · 📚 История и сверка
-  🔴 Включить LIVE (с подтверждением) / 🧪 Выключить LIVE
+  📊 Пороги     — лучшие проверенные правила; все города по уровням; пересчитать
+  🏙 Города     — города архива: события, объём; у города — пороги и кандидаты вкл/выкл
+  🎯 Кандидаты  — последние кандидаты и итог тестовых ставок; вкл/выкл сообщения
+  📚 Архив      — что скачано, ход докачки, способы поиска; глубина; докачать сейчас
+  📤 Файлы      — события, расчётные ставки, ячейки, кандидаты, снимки; пути цены
+  ⚙️ Настройки  — объём события, ставок для правила, тестовая ставка
 
-Реальная ставка уходит, только если монета включена и 🔴, а бот в 🔴 LIVE.
-Изменения пишутся в runtime_state (SQLite) и переживают рестарт, если база
-на постоянном томе. Управлять может только чат из TELEGRAM_CHAT_ID.
+Управлять может только чат из TELEGRAM_CHAT_ID.
 """
 from __future__ import annotations
+import asyncio
 import logging
 import time
 
@@ -20,17 +20,23 @@ from telegram import Update, InlineKeyboardButton as Btn, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 from config import settings
-from src import runtime_state, series_bot, storage
+from src import archive, gamma, live, runtime_state, storage, study, text
 
 log = logging.getLogger("telegram")
 
 _app: Application | None = None
 TG_TEXT_LIMIT = 4096
+TOP_CITY_RULES = 8
+TOP_ALL_RULES = 4
+VOLUME_PRESETS = (0.0, 2000.0, 5000.0, 20000.0)
+MIN_N_PRESETS = (20, 30, 50, 100)
+STAKE_PRESETS = (5.0, 10.0, 20.0, 50.0)
+DAYS_PRESETS = (60, 120, 240, 365)
+_tasks: set = set()
 
 
-def _fit(text: str) -> str:
-    """Не длиннее лимита Telegram (иначе экран не откроется вовсе)."""
-    return text if len(text) <= TG_TEXT_LIMIT else text[:TG_TEXT_LIMIT - 2].rstrip() + "\n…"
+def _fit(s: str) -> str:
+    return s if len(s) <= TG_TEXT_LIMIT else s[:TG_TEXT_LIMIT - 2].rstrip() + "\n…"
 
 
 def _menu(*rows) -> InlineKeyboardMarkup:
@@ -40,286 +46,355 @@ def _menu(*rows) -> InlineKeyboardMarkup:
 BACK = Btn("◀️ Назад", callback_data="m")
 
 
-# ------------------------------------------------------------ главное меню ----
-
-def coins_line() -> str:
-    return " · ".join(f"{a.upper()} {'✅' if runtime_state.is_asset_enabled(a) else '⏸'}"
-                      f"{'🔴' if runtime_state.is_asset_live(a) else '🧪'}" for a in settings.ASSETS)
+def _mark(ok: bool) -> str:
+    return "✅ " if ok else ""
 
 
-def _day_line() -> str:
+def _spawn(coro) -> None:
+    t = asyncio.create_task(coro)
+    _tasks.add(t)
+    t.add_done_callback(_tasks.discard)
+
+
+# ------------------------------------------------------------- строки-сводки ----
+
+def archive_line() -> str:
+    c = storage.archive_counts()
+    done = c["status"].get("done", 0)
+    s = (f"📚 Архив: {text.n_events(done)} с историей цены ({text.n_cities(c['cities'])}; "
+         f"макс {c['kinds'].get('high', 0)}, мин {c['kinds'].get('low', 0)})")
+    if c["first"]:
+        s += f", {c['first'][8:10]}.{c['first'][5:7]} … {c['last'][8:10]}.{c['last'][5:7]}"
+    p = archive.progress()
+    if p["phase"] == "discover":
+        s += f"; ищу события ({p['window']})"
+    elif p["phase"] == "paths" and p["paths_total"]:
+        s += f"; качаю историю: {p['paths_done']}/{p['paths_total']} корзин"
+    elif not runtime_state.get("archive_enabled"):
+        s += "; докачка ⏸"
+    return s
+
+
+def study_line() -> str:
+    sm = study.summary()
+    if study.is_running():
+        return "📊 Пороги: считаю…"
+    if not sm:
+        return "📊 Пороги: ещё не считались — нужен архив"
+    return (f"📊 Пороги: {text.utc(sm['computed'])} UTC — {text.n_events(sm['events'])}, "
+            f"расчётных ставок: {text.thousands(sm['bets'])}; проверенных правил: {sm['rules']}")
+
+
+def candidates_line() -> str:
     day = int(time.time() // 86400) * 86400
+    st, today = live.paper_stats(0), live.paper_stats(day)
+    s = f"🎯 Кандидаты: сегодня {today['n']}, всего {st['n']}"
+    if st["settled"]:
+        s += f"; тестовые ставки: выигр. {st['wins']}/{st['settled']}, {st['pnl']:+.2f} $"
+    if not runtime_state.get("alerts_enabled"):
+        s += " (сообщения ⏸)"
+    return s
 
-    def part(st: dict) -> str:
-        if not st["bets"]:
-            return "ставок нет"
-        s = f"{st['bets']} ставок"
-        if st["settled"]:
-            s += f", выигр. {st['wins']}/{st['settled']}, {st['pnl']:+.2f} $"
-        return s
-    test, real = series_bot.trade_stats(day, live=False), series_bot.trade_stats(day, live=True)
-    line = f"Сегодня (UTC): тест — {part(test)}"
-    if real["bets"] or series_bot.live_coins():
-        line += f"; реальные — {part(real)}"
-    return line
 
+# ------------------------------------------------------------------ экраны ----
 
 def main_text() -> str:
-    stop = series_bot.trade_stop()
-    lines = [
-        "🎲 Серии 15m — ставка на разворот после серии одинаковых исходов",
-        "",
-        "Режим: " + series_bot.mode_text(),
-        f"Стратегия: {'✅ включена' if series_bot.trade_enabled() else '⏸ выключена'} — после "
-        f"{series_bot.trade_k()}+ подряд, {series_bot.rule_short()}; "
-        f"${series_bot.trade_usdc():g} (не меньше 5 акций)"
-        + (f", дневной стоп −${stop:g}" if stop > 0 else ", без дневного стопа"),
-        "Монеты: " + coins_line(),
-        _day_line(),
-    ]
-    why = series_bot.live_blocked() if series_bot.live_coins() and not runtime_state.get("dry_run") else None
-    if why:
-        lines.append(f"⚠️ Реальные ставки сейчас не уходят: {why}")
-    if not settings.USE_LIVE_BOOK_STREAM:
-        lines.append("⚠️ USE_LIVE_BOOK_STREAM=false — без живого стакана стратегия не работает.")
+    ls = live.stats()
+    lines = ["🌡 Погодный бот Polymarket — архив температурных рынков, пороги цены и кандидаты", "",
+             archive_line(), study_line(), candidates_line()]
+    if ls["last_poll"]:
+        lines.append(f"Открытых температурных событий: {ls['open_events']} (проверка {text.utc(ls['last_poll'], '%H:%M')} UTC)")
+    if ls["last_error"]:
+        lines.append(f"⚠️ Кандидаты: {ls['last_error']}")
     return "\n".join(lines)
 
 
 def main_markup() -> InlineKeyboardMarkup:
-    live_btn = (Btn("🔴 Включить LIVE", callback_data="lv") if runtime_state.get("dry_run")
-                else Btn("🧪 Выключить LIVE (в DRY RUN)", callback_data="lv"))
     return _menu(
-        (Btn("🎲 Стратегия", callback_data="st"), Btn("🪙 Монеты", callback_data="co")),
-        (Btn("📊 Статистика", callback_data="sta"), Btn("📤 Файлы", callback_data="fx")),
-        (Btn("📚 История и сверка", callback_data="hi"),),
-        (live_btn,),
+        (Btn("📊 Пороги", callback_data="th"), Btn("🏙 Города", callback_data="ci")),
+        (Btn("🎯 Кандидаты", callback_data="ca"), Btn("📚 Архив", callback_data="ar")),
+        (Btn("📤 Файлы", callback_data="fx"), Btn("⚙️ Настройки", callback_data="se")),
         (Btn("🔄 Обновить", callback_data="m"),),
     )
 
 
-# ----------------------------------------------------------------- монеты ----
-
-def coins_text() -> str:
-    lines = ["🪙 Монеты",
-             "✅ — стратегия ставит по монете, ⏸ — нет (окна всё равно пишутся, чтобы знать серию).",
-             "🧪 — только тестовые ставки, 🔴 — ещё и реальные, когда бот в 🔴 LIVE.",
-             ""] + series_bot.coin_lines() + ["", "Режим: " + series_bot.mode_text()]
-    return "\n".join(lines)
-
-
-def coins_markup() -> InlineKeyboardMarkup:
-    rows = []
-    for a in settings.ASSETS:
-        on, live = runtime_state.is_asset_enabled(a), runtime_state.is_asset_live(a)
-        rows.append((Btn(f"{a.upper()} {'✅ вкл' if on else '⏸ выкл'}", callback_data=f"c:on:{a}"),
-                     Btn(f"{a.upper()} {'🔴 реально' if live else '🧪 тест'}", callback_data=f"c:lv:{a}")))
-    rows.append((Btn("🔄 Обновить", callback_data="co"), BACK))
-    return _menu(*rows)
-
-
-# --------------------------------------------------------------- стратегия ----
-
-def strategy_text(head: str = "") -> str:
-    lo = series_bot.lead_lo()
-    lines = ([head, ""] if head else []) + series_bot.strategy_lines() + [""] + series_bot.variant_lines() + [
-        "",
-        "Тестовая ставка пишется по каждому окну с серией у включённых монет — по стакану (средняя цена "
-        "по уровням не дороже потолка, с комиссией тейкера). Реальная — FAK-ордер на ту же сумму (не меньше "
-        "5 акций — меньше биржа не берёт) по монетам с 🔴 в 🪙 Монетах, когда бот в 🔴 LIVE; свой дневной стоп.",
-        f"Правило «на 60-й с»: на 60-й секунде окна смотрим цену стороны разворота — {lo:.2f}–0.80 (разворот уже "
-        "ведёт): покупаем по цене не выше ask + 1¢, иначе пропуск. Порог — кнопками «от …»: по 16–20.10 "
-        "входы по 0.52–0.56 дали 12 из 22 (около нуля), от 0.60 — 49 из 62.",
-        "«Дёшево»: первая цена не выше потолка (кнопки «до …») в первую минуту окна.",
-        "Сравнение входов — виртуальные ставки по тем же сигналам, но по другим правилам; реальных ордеров "
-        "по ним нет. Считается с последней смены правила, серии или порога.",
-    ]
-    return "\n".join(lines)
-
-
-def strategy_markup() -> InlineKeyboardMarkup:
-    sb = series_bot
-    k, cap, usdc, stop, rule = sb.trade_k(), sb.trade_cap(), sb.trade_usdc(), sb.trade_stop(), sb.trade_rule()
-    lo = sb.lead_lo()
-    mark = lambda ok: "✅ " if ok else ""          # noqa: E731
-    # порог цены — только для выбранного правила: «ведёт от …» (на 60-й с) или «до …» (дёшево)
-    price_row = (tuple(Btn(mark(abs(lo - v) < 1e-9) + f"от {v:.2f}", callback_data=f"stl:{v:.2f}")
-                       for v in sb.LEAD_LO_PRESETS) if rule == "lead60"
-                 else tuple(Btn(mark(abs(cap - v) < 1e-9) + f"до {v:.2f}", callback_data=f"stc:{v:.2f}")
-                            for v in sb.TRADE_CAP_PRESETS))
-    return _menu(
-        (Btn("🎲 ✅ включена" if sb.trade_enabled() else "🎲 ⏸ выключена", callback_data="stt"),),
-        (Btn(mark(rule == "lead60") + "вход на 60-й с", callback_data="str:lead60"),
-         Btn(mark(rule == "cheap") + "вход дёшево", callback_data="str:cheap")),
-        tuple(Btn(mark(k == v) + f"серия от {v}", callback_data=f"stk:{v}") for v in sb.TRADE_K_PRESETS),
-        price_row,
-        tuple(Btn(mark(abs(usdc - v) < 1e-9) + f"${v:g}", callback_data=f"stu:{v:g}") for v in sb.TRADE_USDC_PRESETS),
-        tuple(Btn(mark(abs(stop - v) < 1e-9) + (f"стоп ${v:g}" if v else "без стопа"), callback_data=f"sts:{v:g}")
-              for v in sb.TRADE_STOP_PRESETS),
-        (Btn("🔄 Обновить", callback_data="st"), BACK),
-    )
-
-
-# ----------------------------------------------------- история и запись окон ----
-
-def history_text(head: str = "") -> str:
-    from src import history_study
-    coins = ", ".join(a.upper() for a in settings.ASSETS)
-    lines = ([head, ""] if head else []) + [
-        "📚 История и сверка — только расчёт, ничего не покупает; итог придёт сообщением с файлом.",
-        f"🧾 Сверить с исходами Polymarket: официальные исходы 15m за {settings.SERIES_OFFICIAL_DAYS} дн. "
-        f"({coins}) — разворот после серий на самих исходах Polymarket. 5–15 минут.",
-        f"📚 Год свечей Binance: окна 15m за {settings.SERIES_HISTORY_DAYS} дн. — развороты после серий "
-        "и планы с удвоением. Минут 5.",
-        "",
-        series_bot.recorder_line(),
-        "Пока 🎲 стратегия включена, окна пишутся всегда (по ним считается серия); кнопка «🔁 Запись окон» — "
-        "чтобы писать их и при выключенной стратегии.",
-    ]
-    status = history_study.status_text()
-    if status:
-        lines += ["", status]
-    return "\n".join(lines)
-
-
-def history_markup() -> InlineKeyboardMarkup:
-    on = series_bot.enabled()
-    return _menu(
-        (Btn("🧾 Сверить с исходами Polymarket (15m)", callback_data="hio"),),
-        (Btn("📚 Год свечей Binance (15m)", callback_data="hib"),),
-        (Btn("🔁 Запись окон: ✅ вкл" if on else "🔁 Запись окон: ⏸ выкл", callback_data="rec"),),
-        (Btn("🔄 Обновить", callback_data="hi"), BACK),
-    )
-
-
-# ---------------------------------------------------------------- режим LIVE ----
-
-def confirm_live_text() -> str:
-    sb = series_bot
-    coins = sb.live_coins()
-    lines = ["⚠️ Включить LIVE? Бот начнёт ставить реальные деньги на Polymarket.", ""]
-    if coins:
-        stop = sb.trade_stop()
-        lines.append(f"Реальные ставки пойдут по: {', '.join(a.upper() for a in coins)} — ${sb.trade_usdc():g} "
-                     f"(не меньше 5 акций), {sb.rule_text()}"
-                     + (f", дневной стоп −${stop:g}." if stop > 0 else ", без дневного стопа."))
-        test = [a.upper() for a in sb.trade_assets() if a not in coins]
-        if test:
-            lines.append(f"Остальные включённые монеты ({', '.join(test)}) — только тест.")
-        if not sb.trade_enabled():
-            lines.append("⚠️ Стратегия сейчас ⏸ выключена — ставок не будет, пока не включишь в 🎲.")
+def thresholds_text(head: str = "") -> str:
+    sm = study.summary()
+    lines = ([head, ""] if head else []) + ["📊 Пороги"]
+    if not sm:
+        lines.append("Ещё не считались: архив качается — пороги посчитаются сами по ходу (или «♻️ Пересчитать»).")
+        return "\n".join(lines)
+    lines += [
+        f"Расчёт {text.utc(sm['computed'])} UTC: {text.n_events(sm['events'])} ({text.n_cities(sm['cities'])}), "
+        f"{sm['first']} … {sm['last']}, объём события от {text.usd(sm['min_volume'])}.",
+        f"Проверено = не меньше {sm['min_n']} ставок; до {sm['split']} выигрышей значимо больше окупаемости "
+        f"(случайно — с вероятностью ≤ {sm.get('max_p', 0.05):g}), после — в плюсе.",
+        "«YES от 0.90» — цена корзины впервые дошла до 0.90 (побыв ниже); вход — цена "
+        f"+{sm['slip']:g} (ask), комиссия {sm['fee_rate']:g}×(1−цена). Время — местное в городе.",
+        ""]
+    rules = study.rules()
+    if rules:
+        city_rules, all_rules = study.top_rules(TOP_CITY_RULES, cities=True), study.top_rules(TOP_ALL_RULES, cities=False)
+        lines.append(f"Проверенных правил: {len(rules)} (повторы — одни и те же ставки в соседних ячейках — скрыты). "
+                     "Лучшие по доходу в день:")
+        if city_rules:
+            lines += ["", "По городам:"] + [f"{i}. {study.rule_text(r)}" for i, r in enumerate(city_rules, 1)]
+        if all_rules:
+            lines += ["", "Все города вместе:"] + [f"{i}. {study.rule_text(r)}" for i, r in enumerate(all_rules, 1)]
     else:
-        lines.append("Ни одна включённая монета не помечена 🔴 — реальных ставок не будет, пока не пометишь "
-                     "в 🪙 Монетах.")
+        lines.append("Проверенных правил пока нет — архив мал или перевеса нет.")
     return "\n".join(lines)
 
 
-def _confirm_live_markup() -> InlineKeyboardMarkup:
-    return _menu((Btn("✅ Да, включить LIVE", callback_data="lvy"), Btn("❌ Отмена", callback_data="m")))
+def thresholds_markup() -> InlineKeyboardMarkup:
+    return _menu((Btn("📋 Все города по уровням", callback_data="tho"), Btn("🏙 По городам", callback_data="ci")),
+                 (Btn("♻️ Пересчитать", callback_data="thr"), BACK))
 
 
-NO_KEY_TEXT = ("❌ Нельзя включить LIVE: POLY_PRIVATE_KEY не задан в переменных окружения. "
-               "Добавь ключ и передеплой бота.")
+def overview_text() -> str:
+    if study.cells() is None:
+        return "📋 Все города по уровням — таблица появится после расчёта в этом запуске (♻️ Пересчитать)."
+    return "\n".join(["📋 Все города, любое время — по уровням цены:"] + study.overview_lines())
 
 
-# -------------------------------------------------------------- обработка ----
+def cities_text() -> str:
+    rows = storage.city_stats(float(runtime_state.get("min_event_volume")))
+    if not rows:
+        return "🏙 Города — архив ещё пуст."
+    lines = ["🏙 Города архива (событий макс/мин, средний объём события). 🎯 — кандидаты по городу; "
+             "⏸ — выключены; ▫️ — объём меньше порога, в расчёт не входит.", ""]
+    for d in rows:
+        mark = ("🎯" if runtime_state.city_alerts_on(d["city_key"]) else "⏸") + ("" if d["in_study"] else "▫️")
+        vol = max(d["vol_high"], d["vol_low"])
+        tz = "" if d["tz_ok"] else " · пояс? (UTC)"
+        lines.append(f"{mark} {d['city']}: {d['high']}/{d['low']}, ~{text.usd(vol)}{tz}")
+    return "\n".join(lines)
+
+
+def cities_markup() -> InlineKeyboardMarkup:
+    rows = storage.city_stats(float(runtime_state.get("min_event_volume")))
+    btns = [Btn(d["city"], callback_data=f"cy:{d['city_key']}"[:64]) for d in rows[:60]]
+    grid = [tuple(btns[i:i + 3]) for i in range(0, len(btns), 3)]
+    return _menu(*grid, (Btn("🔄 Обновить", callback_data="ci"), BACK))
+
+
+def city_text(key: str, head: str = "") -> str:
+    rows = [d for d in storage.city_stats() if d["city_key"] == key]
+    if not rows:
+        return "Нет такого города в архиве."
+    d = rows[0]
+    lines = ([head, ""] if head else []) + [
+        f"🏙 {d['city']} — станция {d['station'] or '?'}, пояс {d['tz']}" + ("" if d["tz_ok"] else " (не знаю пояс — UTC)"),
+        "Событий: " + ", ".join(f"{name} {d[k]} (~{text.usd(d['vol_' + k])})" for k, name in
+                                (("high", "макс"), ("low", "мин")) if d[k]) + ".",
+        f"Кандидаты: {'🎯 вкл' if runtime_state.city_alerts_on(key) else '⏸ выкл'}.", ""]
+    if study.cells() is None:
+        lines.append("Пороги по городу появятся после расчёта в этом запуске (📊 → ♻️ Пересчитать).")
+    else:
+        cl = study.city_lines(key)
+        lines += cl if cl else ["Расчётных ставок по городу нет (мало событий или объём меньше порога)."]
+        lines.append("✅ — правило проверено.")
+    return "\n".join(lines)
+
+
+def city_markup(key: str) -> InlineKeyboardMarkup:
+    on = runtime_state.city_alerts_on(key)
+    return _menu((Btn("🎯 Кандидаты: ✅ вкл" if on else "🎯 Кандидаты: ⏸ выкл", callback_data=f"ct:{key}"[:64]),),
+                 (Btn("◀️ Города", callback_data="ci"), BACK))
+
+
+def candidates_text() -> str:
+    st, week = live.paper_stats(0), live.paper_stats(int(time.time()) - 7 * 86400)
+    lines = ["🎯 Кандидаты — цена стороны впервые дошла до уровня из проверенного правила.",
+             f"Сообщения: {'✅ вкл' if runtime_state.get('alerts_enabled') else '⏸ выкл'}; правила: "
+             + ("только самого города" if runtime_state.get("alerts_city_only") else "города и «все города»")
+             + "; стороны: " + {"yes": "только YES", "no": "только NO"}.get(str(runtime_state.get("alerts_sides")), "YES и NO")
+             + f"; тестовая ставка ${runtime_state.get('paper_stake'):g}.", ""]
+    for name, s in (("Всего", st), ("За 7 дней", week)):
+        line = f"{name}: {s['n']} {text.plural(s['n'], 'кандидат', 'кандидата', 'кандидатов')}"
+        if s["settled"]:
+            line += (f", с итогом {s['settled']}: выигр. {s['wins']} ({100 * s['wins'] / s['settled']:.0f}%), "
+                     f"{s['pnl']:+.2f} $" + (f" ({100 * s['pnl'] / s['staked']:+.1f}%)" if s["staked"] else ""))
+        lines.append(line)
+    recent = storage.candidates(limit=10)
+    if recent:
+        lines += ["", "Последние:"]
+        for c in recent:
+            res = "⏳" if c["outcome"] is None else ("🟢" if (c["outcome"] == 1) == (c["side"] == "YES") else "🔴")
+            pnl = f" {c['pnl']:+.2f} $" if c["pnl"] is not None else ""
+            lines.append(f"{res} {text.utc(c['ts'])} {c['city'] or '?'} {study.KIND_RU.get(c['kind'], '')} "
+                         f"{(c['date'] or '')[8:10]}.{(c['date'] or '')[5:7]} «{c['bucket'] or c['idx']}» {c['side']} "
+                         f"по {c['entry']:.3f}{pnl}")
+    return "\n".join(lines)
+
+
+def candidates_markup() -> InlineKeyboardMarkup:
+    return _menu(
+        (Btn("💬 Сообщения: ✅ вкл" if runtime_state.get("alerts_enabled") else "💬 Сообщения: ⏸ выкл",
+             callback_data="cat"),),
+        (Btn(_mark(not runtime_state.get("alerts_city_only")) + "город + все города", callback_data="cac:0"),
+         Btn(_mark(bool(runtime_state.get("alerts_city_only"))) + "только город", callback_data="cac:1")),
+        tuple(Btn(_mark(runtime_state.get("alerts_sides") == k) + name, callback_data=f"cas:{k}")
+              for k, name in (("both", "YES и NO"), ("yes", "только YES"), ("no", "только NO"))),
+        (Btn("🔄 Обновить", callback_data="ca"), BACK))
+
+
+def archive_text(head: str = "") -> str:
+    c = storage.archive_counts()
+    p = archive.progress()
+    lines = ([head, ""] if head else []) + [
+        archive_line(),
+        f"Глубина: {runtime_state.get('archive_days')} дн.; докачка {'✅ вкл' if runtime_state.get('archive_enabled') else '⏸ выкл'}, "
+        f"раз в {settings.ARCHIVE_REFRESH_HOURS:g} ч.",
+        f"Закрытых событий найдено: {c['events']} (без истории: {c['status'].get('new', 0)}, ошибок: "
+        f"{c['status'].get('error', 0)}); открытых в базе: {c['open']}."]
+    if c["fidelity"]:
+        tot = sum(c["fidelity"].values())
+        parts = ", ".join(f"{k} мин — {100 * v / tot:.0f}%" for k, v in sorted(c["fidelity"].items()))
+        lines.append(f"Шаг истории цены: {parts}; корзин без истории: {c['no_path']}.")
+    if p["started"]:
+        lines.append(f"Последний проход: начат {text.utc(p['started'])} UTC"
+                     + (f", закончен {text.utc(p['finished'])}" if p["finished"] and p["phase"] == "idle" else "")
+                     + f"; найдено {p['found']}, новых {p['new']}, скачано {p['events_done']}, ошибок {p['errors']}.")
+    if p["last_error"]:
+        lines.append(f"Последняя ошибка: {p['last_error']}")
+    st = gamma.strategy_stats()
+    if st:
+        lines.append("Поиск событий: " + "; ".join(
+            f"{k} — {v['events']}" + (f" (ошибка: {v['error'][:60]})" if v["error"] else "") for k, v in st.items()))
+    from src import http_api
+    hs = http_api.stats()
+    lines.append(f"Запросов к API: {hs['requests']}, повторов {hs['retries']}, ошибок {hs['errors']}.")
+    return "\n".join(lines)
+
+
+def archive_markup() -> InlineKeyboardMarkup:
+    days = int(runtime_state.get("archive_days"))
+    return _menu(
+        (Btn("🔄 Докачать сейчас", callback_data="ars"),
+         Btn("⏸ Пауза докачки" if runtime_state.get("archive_enabled") else "▶️ Включить докачку", callback_data="are")),
+        tuple(Btn(_mark(days == d) + f"{d} дн.", callback_data=f"ard:{d}") for d in DAYS_PRESETS),
+        (Btn("🔄 Обновить", callback_data="ar"), BACK))
+
+
+def settings_text(head: str = "") -> str:
+    return "\n".join(([head, ""] if head else []) + [
+        "⚙️ Настройки",
+        f"• Объём события от {text.usd(runtime_state.get('min_event_volume'))} — события поменьше в расчёт порогов "
+        "не входят (тонкий стакан, цена мало что значит).",
+        f"• Правило проверено, если ставок не меньше {runtime_state.get('rule_min_n')}, на старой части архива "
+        f"(60% дней) выигрышей значимо больше окупаемости (p ≤ {settings.RULE_MAX_P:g}), на новой — в плюсе.",
+        f"• Тестовая ставка на кандидата: ${runtime_state.get('paper_stake'):g}.",
+        "Смена объёма или числа ставок — пороги пересчитаются сразу."])
+
+
+def settings_markup() -> InlineKeyboardMarkup:
+    vol, mn, stake = (float(runtime_state.get("min_event_volume")), int(runtime_state.get("rule_min_n")),
+                      float(runtime_state.get("paper_stake")))
+    return _menu(
+        tuple(Btn(_mark(abs(vol - v) < 1e-9) + ("любой объём" if not v else f"от {text.usd(v)}"),
+                  callback_data=f"sv:{v:g}") for v in VOLUME_PRESETS),
+        tuple(Btn(_mark(mn == v) + f"≥{v} ставок", callback_data=f"sn:{v}") for v in MIN_N_PRESETS),
+        tuple(Btn(_mark(abs(stake - v) < 1e-9) + f"${v:g}", callback_data=f"sp:{v:g}") for v in STAKE_PRESETS),
+        (Btn("🔄 Обновить", callback_data="se"), BACK))
+
+
+# ----------------------------------------------------------------- действия ----
+
+async def _recompute(reason: str) -> None:
+    try:
+        sm = await asyncio.to_thread(study.run)
+        await notify(f"📊 Пороги пересчитаны ({reason}): {text.n_bets(sm['bets'])} по {text.n_events(sm['events'])}, "
+                     f"проверенных правил: {sm['rules']}.")
+    except Exception as exc:  # noqa: BLE001
+        await notify(f"⚠️ Пороги не пересчитались: {exc}"[:300])
+
+
+def _float(s: str) -> float | None:
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
 
 async def handle(data: str) -> tuple[str, InlineKeyboardMarkup]:
-    """Нажатие кнопки → (текст, кнопки) экрана, который показать."""
-    sb = series_bot
-    parts = data.split(":")
-    cmd = parts[0]
-    if cmd == "co":
-        return coins_text(), coins_markup()
-    if cmd == "c" and len(parts) == 3 and parts[2] in settings.ASSETS:
-        asset, head = parts[2], ""
-        if parts[1] == "on":
-            on = runtime_state.toggle_asset(asset)
-            head = f"{asset.upper()}: {'✅ включена' if on else '⏸ выключена — ставок по ней не будет'}.\n\n"
-        elif parts[1] == "lv":
-            live = not runtime_state.is_asset_live(asset)
-            runtime_state.set_asset_live(asset, live)
-            if live:
-                head = f"{asset.upper()}: 🔴 реальные ставки"
-                if runtime_state.get("dry_run"):
-                    head += " — пойдут после «🔴 Включить LIVE» в главном меню"
-                if not runtime_state.is_asset_enabled(asset):
-                    head += "; монета ⏸ выключена — сначала включи"
-                head += ".\n\n"
-            else:
-                head = f"{asset.upper()}: 🧪 только тест.\n\n"
-        return head + coins_text(), coins_markup()
-    if cmd == "st":
-        return strategy_text(), strategy_markup()
-    if cmd == "stt":
-        runtime_state.set("series_trade_enabled", not sb.trade_enabled())
-        return strategy_text(), strategy_markup()
-    if cmd == "str" and len(parts) == 2:
+    """Нажатие кнопки → (текст, кнопки) экрана."""
+    parts = data.split(":", 1)
+    cmd, arg = parts[0], (parts[1] if len(parts) > 1 else "")
+    if cmd == "th":
+        return thresholds_text(), thresholds_markup()
+    if cmd == "tho":
+        return overview_text(), thresholds_markup()
+    if cmd == "thr":
+        if study.is_running():
+            return thresholds_text("Уже считаю — пришлю итог."), thresholds_markup()
+        _spawn(_recompute("по кнопке"))
+        return thresholds_text("♻️ Пересчитываю — пришлю итог сообщением."), thresholds_markup()
+    if cmd == "ci":
+        return cities_text(), cities_markup()
+    if cmd == "cy" and arg:
+        return city_text(arg), city_markup(arg)
+    if cmd == "ct" and arg:
+        on = runtime_state.toggle_city(arg)
+        return city_text(arg, "🎯 Кандидаты по городу " + ("✅ включены." if on else "⏸ выключены.")), city_markup(arg)
+    if cmd == "ca":
+        return candidates_text(), candidates_markup()
+    if cmd == "cat":
+        runtime_state.set("alerts_enabled", not runtime_state.get("alerts_enabled"))
+        return candidates_text(), candidates_markup()
+    if cmd == "cac" and arg in ("0", "1"):
+        runtime_state.set("alerts_city_only", arg == "1")
+        return candidates_text(), candidates_markup()
+    if cmd == "cas" and arg in ("both", "yes", "no"):
+        runtime_state.set("alerts_sides", arg)
+        return candidates_text(), candidates_markup()
+    if cmd == "ar":
+        return archive_text(), archive_markup()
+    if cmd == "ars":
+        if archive.is_running():
+            return archive_text("Докачка уже идёт."), archive_markup()
+        if not runtime_state.get("archive_enabled"):
+            runtime_state.set("archive_enabled", True)
+        archive.request_sync()
+        return archive_text("🔄 Запустил докачку."), archive_markup()
+    if cmd == "are":
+        runtime_state.set("archive_enabled", not runtime_state.get("archive_enabled"))
+        if runtime_state.get("archive_enabled"):
+            archive.request_sync()
+        return archive_text(), archive_markup()
+    if cmd == "ard" and arg.isdigit() and int(arg) in DAYS_PRESETS:
         head = ""
-        if parts[1] in sb.RULES and parts[1] != sb.trade_rule():
-            runtime_state.set("series_trade_rule", parts[1])
-            sb.mark_rule_change()
-            head = f"Правило входа: {sb.rule_short()}. Сравнение входов считается заново с этого момента."
-        return strategy_text(head), strategy_markup()
-    if cmd in ("stk", "stc", "stl", "stu", "sts") and len(parts) == 2:
-        try:
-            value = float(parts[1])
-        except ValueError:
-            return strategy_text(), strategy_markup()
-        key, presets, current = {
-            "stk": ("series_trade_k", sb.TRADE_K_PRESETS, sb.trade_k()),
-            "stc": ("series_trade_cap", sb.TRADE_CAP_PRESETS, sb.trade_cap()),
-            "stl": ("series_lead_lo", sb.LEAD_LO_PRESETS, sb.lead_lo()),
-            "stu": ("series_trade_usdc", sb.TRADE_USDC_PRESETS, sb.trade_usdc()),
-            "sts": ("series_trade_stop", sb.TRADE_STOP_PRESETS, sb.trade_stop())}[cmd]
+        if int(arg) != int(runtime_state.get("archive_days")):
+            runtime_state.set("archive_days", int(arg))
+            archive.request_sync()
+            head = f"Глубина архива: {arg} дн. — докачиваю недостающее."
+        return archive_text(head), archive_markup()
+    if cmd == "se":
+        return settings_text(), settings_markup()
+    if cmd in ("sv", "sn", "sp"):
+        v = _float(arg)
         head = ""
-        if any(abs(value - v) < 1e-9 for v in presets) and abs(value - current) > 1e-9:
-            runtime_state.set(key, int(value) if cmd == "stk" else value)
-            if cmd in ("stk", "stc", "stl"):        # меняют, в какие окна входим, — сравнение с нуля
-                sb.mark_rule_change()
-                head = ((f"Порог: разворот ведёт от {value:.2f}." if cmd == "stl"
-                         else f"Серия от {int(value)}." if cmd == "stk" else f"Цена до {value:.2f}.")
-                        + " Сравнение входов считается заново с этого момента.")
-        return strategy_text(head), strategy_markup()
-    if cmd == "sta":
-        return sb.stats_text(), _menu((Btn("🔄 Обновить", callback_data="sta"), BACK))
+        if cmd == "sv" and v is not None and any(abs(v - x) < 1e-9 for x in VOLUME_PRESETS) \
+                and abs(v - float(runtime_state.get("min_event_volume"))) > 1e-9:
+            runtime_state.set("min_event_volume", v)
+            _spawn(_recompute(f"объём от {text.usd(v)}"))
+            head = "Пересчитываю пороги — пришлю итог."
+        elif cmd == "sn" and v is not None and int(v) in MIN_N_PRESETS and int(v) != int(runtime_state.get("rule_min_n")):
+            runtime_state.set("rule_min_n", int(v))
+            _spawn(_recompute(f"не меньше {int(v)} ставок"))
+            head = "Пересчитываю пороги — пришлю итог."
+        elif cmd == "sp" and v is not None and any(abs(v - x) < 1e-9 for x in STAKE_PRESETS):
+            runtime_state.set("paper_stake", v)
+        return settings_text(head), settings_markup()
     if cmd == "fx":
         from src import reporting
-        try:
-            n = await reporting.send_series_all()
-            head = ("📤 Отправил файлы: окна, ставки и варианты входа — всё, что в базе." if n
-                    else "📤 В базе пока пусто — нечего выгружать.")
-        except Exception as exc:  # noqa: BLE001
-            head = f"⚠️ Файлы не ушли: {exc}"[:300]
-        return head + "\n\n" + main_text(), main_markup()
-    if cmd == "hi":
-        return history_text(), history_markup()
-    if cmd in ("hio", "hib"):
-        from src import history_study
-        coins = ", ".join(a.upper() for a in settings.ASSETS)
-        if cmd == "hio" and history_study.start_official():
-            head = (f"🧾 Запустил: официальные исходы Polymarket 15m за {settings.SERIES_OFFICIAL_DAYS} дн. ({coins}) "
-                    "и свечи Binance по тем же окнам. 5–15 минут — пришлю итог и файл.")
-        elif cmd == "hib" and history_study.start():
-            head = (f"📚 Запустил: свечи Binance 15m за {settings.SERIES_HISTORY_DAYS} дн. ({coins}). "
-                    "Минут 5 — пришлю итог и файл. Бот в это время работает как обычно.")
-        else:
-            head = "Расчёт уже идёт."
-        return history_text(head), history_markup()
-    if cmd == "rec":
-        sb.set_enabled(not sb.enabled())
-        return history_text(), history_markup()
-    if cmd == "lv":
-        if not runtime_state.get("dry_run"):
-            runtime_state.set("dry_run", True)
-            return "🧪 Переключено в DRY RUN — реальные ставки остановлены.\n\n" + main_text(), main_markup()
-        if not settings.POLY_PRIVATE_KEY:
-            return NO_KEY_TEXT, main_markup()
-        return confirm_live_text(), _confirm_live_markup()
-    if cmd == "lvy":
-        if not settings.POLY_PRIVATE_KEY:
-            return NO_KEY_TEXT, main_markup()
-        runtime_state.set("dry_run", False)
-        return "🔴 LIVE включён.\n\n" + main_text(), main_markup()
+        _spawn(reporting.send_files())
+        return "📤 Собираю файлы — пришлю следом (расчётные ставки считаются минуту-другую).\n\n" + main_text(), \
+            _menu((Btn("🗂 Пути цены по месяцам", callback_data="fxp"),), (BACK,))
+    if cmd == "fxp":
+        from src import reporting
+        _spawn(reporting.send_paths())
+        return "🗂 Собираю пути цены по месяцам — пришлю следом.\n\n" + main_text(), main_markup()
     return main_text(), main_markup()
 
 
@@ -331,8 +406,6 @@ def _owner_chat_id() -> int | None:
 
 
 def _is_owner(update: Update) -> bool:
-    """Управлять ботом может только чат из TELEGRAM_CHAT_ID (туда же идут уведомления).
-    Не задан — без ограничения, чтобы не запереть владельца."""
     owner = _owner_chat_id()
     if owner is None:
         return True
@@ -346,10 +419,10 @@ async def _cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(_fit(main_text()), reply_markup=main_markup())
 
 
-async def _cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_owner(update):
         return
-    await update.message.reply_text(_fit(series_bot.stats_text()))
+    await update.message.reply_text(_fit(thresholds_text()), reply_markup=thresholds_markup())
 
 
 async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -357,10 +430,10 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if not _is_owner(update):
         return
-    text, markup = await handle(query.data or "m")
+    body, markup = await handle(query.data or "m")
     try:
-        await query.edit_message_text(_fit(text), reply_markup=markup)
-    except Exception as exc:  # noqa: BLE001 — повторное нажатие той же кнопки: «message is not modified»
+        await query.edit_message_text(_fit(body), reply_markup=markup)
+    except Exception as exc:  # noqa: BLE001 — «message is not modified»
         if "not modified" not in str(exc).lower():
             raise
 
@@ -370,36 +443,32 @@ def build_app() -> Application:
     _app = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
     for name in ("start", "menu", "status"):
         _app.add_handler(CommandHandler(name, _cmd_menu))
-    _app.add_handler(CommandHandler("stats", _cmd_stats))
+    _app.add_handler(CommandHandler("rules", _cmd_rules))
     _app.add_handler(CallbackQueryHandler(_on_callback))
     return _app
 
 
-def startup_text(forced_dry: bool = False) -> str:
-    lines = ["🤖 Бот запущен — 🎲 серии 15m (ставка на разворот после серии).", "Режим: " + series_bot.mode_text(),
-             "Монеты: " + coins_line() + " (✅ вкл, 🧪 тест, 🔴 реально)",
-             "Стратегия: " + ("✅ " if series_bot.trade_enabled() else "⏸ выключена, ")
-             + f"после {series_bot.trade_k()}+ подряд — {series_bot.rule_text()}, ${series_bot.trade_usdc():g}."]
-    if forced_dry:
-        lines.append("⚠️ Был сохранён LIVE, но POLY_PRIVATE_KEY не задан — откатил в DRY RUN.")
+def startup_text() -> str:
+    c = storage.archive_counts()
+    lines = ["🤖 Погодный бот запущен — 📚 архив температурных рынков, 📊 пороги, 🎯 кандидаты (без реальных ставок).",
+             archive_line()]
+    if not c["status"].get("done"):
+        lines.append(f"Качаю архив за {runtime_state.get('archive_days')} дн. — в первый раз это часы; пороги "
+                     "посчитаются по ходу, пришлю итог.")
     if storage.DB_WAS_NEW:
-        lines.append(f"⚠️ База создана заново ({settings.DB_PATH}). Если бот уже работал — данные не сохраняются "
-                     "между деплоями: подключи в Coolify постоянный том (Persistent Storage) на /app/data. "
-                     "Сейчас режим, монеты и настройки — по умолчанию, статистика пустая.")
-    if not settings.USE_LIVE_BOOK_STREAM:
-        lines.append("⚠️ USE_LIVE_BOOK_STREAM=false — без живого стакана стратегия не работает.")
+        lines.append(f"⚠️ База создана заново ({settings.DB_PATH}). Без постоянного тома (Persistent Storage на "
+                     "/app/data) архив будет качаться заново после каждого деплоя.")
     lines.append("/menu — управление.")
     return "\n".join(lines)
 
 
-async def notify(text: str) -> None:
+async def notify(msg: str) -> None:
     if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID or _app is None:
         return
-    await _app.bot.send_message(chat_id=settings.TELEGRAM_CHAT_ID, text=_fit(text))
+    await _app.bot.send_message(chat_id=settings.TELEGRAM_CHAT_ID, text=_fit(msg))
 
 
 async def send_document(path: str, caption: str | None) -> None:
-    """Файл (CSV-отчёт и т.п.) в чат."""
     if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID or _app is None:
         return
     with open(path, "rb") as f:

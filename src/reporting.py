@@ -1,117 +1,221 @@
 """
-Отчёт раз в REPORT_INTERVAL_HOURS: три CSV-файла в Telegram —
-  *_series.csv          — окна (цены сторон, путь цены, снимки стакана, исходы);
-  *_series_trades.csv   — ставки стратегии (тестовые и реальные);
-  *_series_variants.csv — виртуальные ставки вариантов входа.
-В каждом — период и 30 минут прошлого (уже с исходами; повторы отличаются по id).
-Момент последнего отчёта хранится в bot_settings — переживает рестарт.
+Файлы и сводки в Telegram.
+
+📤 Файлы (кнопка):
+  weather_events.zip     — события и корзины: город, макс/мин, дата, станция, объём, какая корзина выиграла;
+  weather_study.zip      — study_bets.csv (каждая расчётная ставка: касание уровня, вход, время, итог)
+                           и study_cells.csv (все ячейки: город × тип × сторона × уровень × окно);
+  weather_candidates.csv — кандидаты и тестовые ставки;
+  weather_snapshots.zip  — снимки цен открытых рынков за 7 дней.
+🗂 Пути цены (кнопка): weather_paths_<месяц>.zip — история цены YES каждой корзины
+  (t0 — начало, dts — шаги по времени в секундах, ps — цены в десятитысячных).
+
+Раз в сутки (REPORT_HOUR_UTC) — сводка: архив, лучшие правила, кандидаты за сутки.
 """
 from __future__ import annotations
 import asyncio
 import csv
+import io
+import json
 import logging
 import os
 import time
+import zipfile
 
 from config import settings
-from src import series_bot, storage, telegram_notify
+from src import live, storage, study, telegram_notify, text
 
 log = logging.getLogger("reporting")
 
-_LAST_REPORT_KEY = "last_report_ts"
-OVERLAP_SEC = 30 * 60
-# Telegram отклоняет подпись к файлу длиннее 1024 символов (считает в UTF-16)
 CAPTION_LIMIT = 1024
+ZIP_PART_LIMIT = 40 * 1024 * 1024
+_LAST_DAILY_KEY = "last_daily_report"
 
 
-def _caption_len(text: str) -> int:
-    return len(text.encode("utf-16-le")) // 2
+def _caption_len(s: str) -> int:
+    return len(s.encode("utf-16-le")) // 2
 
 
-def _fit_caption(text: str, limit: int = CAPTION_LIMIT) -> str:
-    if _caption_len(text) <= limit:
-        return text
-    while text and _caption_len(text) > limit - 1:
-        text = text[:-1]
-    return text + "…"
+def _fit_caption(s: str, limit: int = CAPTION_LIMIT) -> str:
+    if _caption_len(s) <= limit:
+        return s
+    while s and _caption_len(s) > limit - 1:
+        s = s[:-1]
+    return s + "…"
 
 
-def _write_csv(path: str, columns: list[str], rows: list[tuple]) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(columns)
-        w.writerows(rows)
+def _csv_bytes(columns, rows) -> bytes:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(columns)
+    w.writerows(rows)
+    return buf.getvalue().encode("utf-8")
 
 
-def _get_last_report_ts() -> int:
-    raw = storage.get_setting(_LAST_REPORT_KEY)
+def _dir() -> str:
+    os.makedirs(settings.REPORTS_DIR, exist_ok=True)
+    return settings.REPORTS_DIR
+
+
+async def _send(path: str, caption: str) -> None:
     try:
-        return int(float(raw)) if raw else int(time.time()) - int(settings.REPORT_INTERVAL_HOURS * 3600)
-    except ValueError:
-        return int(time.time()) - int(settings.REPORT_INTERVAL_HOURS * 3600)
-
-
-def _set_last_report_ts(ts: int) -> None:
-    storage.set_setting(_LAST_REPORT_KEY, ts)
-
-
-async def _send_series(base: str, from_label: str, to_label: str, since_ts: int, rows_since: int) -> int:
-    """Окна, ставки и варианты с rows_since — тремя файлами. Возвращает число окон."""
-    rows = storage.series_export(rows_since)
-    trades = storage.series_trades_export(rows_since)
-    variants = storage.series_variants_export(rows_since)
-    if not rows and not trades and not variants:
-        return 0
-    files = []
-    if rows:
-        files.append((f"{base}_series.csv", storage.SERIES_COLUMNS, rows,
-                      series_bot.report_caption(from_label, to_label, since_ts)))
-    if trades:
-        files.append((f"{base}_series_trades.csv", storage.SERIES_TRADE_COLUMNS, trades,
-                      "\n".join(series_bot.strategy_lines())))
-    if variants:
-        files.append((f"{base}_series_variants.csv", storage.SERIES_VARIANT_COLUMNS, variants,
-                      "🎲 " + "\n".join(series_bot.variant_lines())))
-    try:
-        for path, columns, data, caption in files:
-            _write_csv(path, columns, data)
-            await telegram_notify.send_document(path, _fit_caption(caption))
+        await telegram_notify.send_document(path, _fit_caption(caption))
     finally:
-        for path, *_rest in files:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def build_events_zip(path: str) -> int:
+    rows = storage.events_export()
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("weather_events.csv", _csv_bytes(storage.EVENTS_EXPORT_COLUMNS, rows))
     return len(rows)
 
 
-async def build_and_send_report() -> None:
-    since_ts = _get_last_report_ts()
-    now_ts = int(time.time())
-    from_label = time.strftime("%Y%m%d-%H%M", time.gmtime(since_ts))
-    to_label = time.strftime("%Y%m%d-%H%M", time.gmtime(now_ts))
-    base = os.path.join(settings.REPORTS_DIR, f"{from_label}_to_{to_label}")
-    await _send_series(base, from_label, to_label, since_ts, max(0, since_ts - OVERLAP_SEC))
-    _set_last_report_ts(now_ts)
+def build_study_zip(path: str) -> dict:
+    """Пересчитать пороги с записью всех расчётных ставок и упаковать ставки и ячейки."""
+    bets_csv = path + ".bets.csv"
+    try:
+        summary = study.run(bets_path=bets_csv)
+        cells = study.cells() or []
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(bets_csv, "study_bets.csv")
+            zf.writestr("study_cells.csv", _csv_bytes(study.CELL_COLUMNS, [[c.get(k) for k in study.CELL_COLUMNS]
+                                                                            for c in cells]))
+            zf.writestr("study_summary.json", json.dumps(summary, ensure_ascii=False, indent=1))
+    finally:
+        try:
+            os.remove(bets_csv)
+        except OSError:
+            pass
+    return summary
 
 
-async def send_series_all() -> int:
-    """Кнопка 📤: все окна, ставки и варианты из базы."""
-    to_label = time.strftime("%Y%m%d-%H%M", time.gmtime())
-    return await _send_series(os.path.join(settings.REPORTS_DIR, f"all_to_{to_label}"), "всё в базе", to_label, 0, 0)
+def build_candidates_csv(path: str) -> int:
+    rows = storage.candidates()
+    cols = storage.CANDIDATE_COLUMNS + ["city", "kind", "date", "unit", "bucket"]
+    with open(path, "wb") as f:
+        f.write(_csv_bytes(cols, [[r.get(c) for c in cols] for r in reversed(rows)]))
+    return len(rows)
+
+
+def build_snapshots_zip(path: str, since_ts: int) -> int:
+    rows = storage.snapshots_export(since_ts)
+    if not rows:
+        return 0
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("weather_snapshots.csv", _csv_bytes(["event_id", "city", "kind", "date", "ts",
+                                                         "data_idx_bid_ask_last_liquidity"], rows))
+    return len(rows)
+
+
+async def send_files() -> int:
+    """Кнопка 📤: события, расчёт порогов со всеми ставками, кандидаты, снимки."""
+    d = _dir()
+    stamp = time.strftime("%Y%m%d-%H%M", time.gmtime())
+    sent = 0
+    c = storage.archive_counts()
+    if c["events"]:
+        p = os.path.join(d, f"weather_events_{stamp}.zip")
+        n = await asyncio.to_thread(build_events_zip, p)
+        await _send(p, f"📚 События и корзины: {text.n_events(c['events'])}, {n} корзин, "
+                       f"{c['first']} … {c['last']}.")
+        sent += 1
+    if c["status"].get("done"):
+        p = os.path.join(d, f"weather_study_{stamp}.zip")
+        sm = await asyncio.to_thread(build_study_zip, p)
+        await _send(p, f"📊 Расчёт порогов: {text.n_bets(sm['bets'])} по {text.n_events(sm['events'])}, "
+                       f"проверенных правил {sm['rules']}. study_bets.csv — каждая ставка, study_cells.csv — ячейки.")
+        sent += 1
+    p = os.path.join(d, f"weather_candidates_{stamp}.csv")
+    if await asyncio.to_thread(build_candidates_csv, p):
+        st = live.paper_stats(0)
+        await _send(p, f"🎯 Кандидаты: {st['n']}, с итогом {st['settled']}, выигр. {st['wins']}, {st['pnl']:+.2f} $.")
+        sent += 1
+    elif os.path.exists(p):
+        os.remove(p)
+    p = os.path.join(d, f"weather_snapshots_{stamp}.zip")
+    if await asyncio.to_thread(build_snapshots_zip, p, int(time.time()) - 7 * 86400):
+        await _send(p, "📈 Снимки цен открытых рынков за 7 дней: [корзина, bid, ask, последняя, ликвидность].")
+        sent += 1
+    if not sent:
+        await telegram_notify.notify("📤 В базе пока пусто — нечего выгружать.")
+    return sent
+
+
+def build_paths_zips(month: str, base: str) -> list[str]:
+    """Пути цены событий месяца — zip-частями до ZIP_PART_LIMIT."""
+    paths, zf, part, rows = [], None, 0, storage.paths_export(month)
+    cols = ["event_id", "idx", "t0", "dts", "ps"]
+    try:
+        for i in range(0, len(rows), 500):
+            chunk = []
+            for eid, idx, js in rows[i:i + 500]:
+                pts = json.loads(js)
+                if not pts:
+                    continue
+                t0 = pts[0][0]
+                dts = [pts[0][0] - t0] + [b[0] - a[0] for a, b in zip(pts, pts[1:])]
+                chunk.append([eid, idx, t0, json.dumps(dts, separators=(",", ":")),
+                              json.dumps([int(round(p * 10000)) for _, p in pts], separators=(",", ":"))])
+            if not chunk:
+                continue
+            if zf is None:
+                part += 1
+                path = f"{base}_{part}.zip" if part > 1 else f"{base}.zip"
+                zf = zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED)
+                paths.append(path)
+            zf.writestr(f"paths_{month}_{i // 500:04d}.csv", _csv_bytes(cols, chunk))
+            if sum(x.compress_size for x in zf.infolist()) > ZIP_PART_LIMIT:
+                zf.close()
+                zf = None
+    finally:
+        if zf is not None:
+            zf.close()
+    return paths
+
+
+async def send_paths() -> int:
+    d = _dir()
+    sent = 0
+    for month in storage.months():
+        files = await asyncio.to_thread(build_paths_zips, month, os.path.join(d, f"weather_paths_{month}"))
+        for i, p in enumerate(files, 1):
+            await _send(p, f"🗂 Пути цены YES корзин, {month}" + (f", часть {i} из {len(files)}" if len(files) > 1 else "")
+                        + ". t0 — начало, dts — шаги в секундах, ps — цены ×10000.")
+            sent += 1
+    if not sent:
+        await telegram_notify.notify("🗂 Путей цены в архиве пока нет.")
+    return sent
+
+
+def daily_text(now: float | None = None) -> str:
+    now = time.time() if now is None else now
+    from src import telegram_notify as tn
+    st = live.paper_stats(int(now) - 86400)
+    lines = ["🌡 Сводка за сутки", tn.archive_line(), tn.study_line(),
+             f"🎯 Кандидатов за сутки: {st['n']}" + (f", с итогом {st['settled']}: выигр. {st['wins']}, {st['pnl']:+.2f} $"
+                                                   if st["settled"] else "")]
+    rules = study.top_rules(5, cities=True) or study.top_rules(5)
+    if rules:
+        lines += ["", "Лучшие правила:"] + [f"• {study.rule_text(r, short=True)}" for r in rules]
+    return "\n".join(lines)
 
 
 async def report_loop() -> None:
-    """Фоновая задача: отчёт раз в REPORT_INTERVAL_HOURS (момент последнего — в базе)."""
-    interval = max(60.0, settings.REPORT_INTERVAL_HOURS * 3600)
     while True:
-        wait = _get_last_report_ts() + interval - time.time()
-        if wait > 0:
-            await asyncio.sleep(min(wait, 300))
-            continue
-        try:
-            await build_and_send_report()
-        except Exception as exc:  # noqa: BLE001 — отчёт не должен ронять бота
-            log.warning("Отчёт не ушёл: %s", exc)
-            await asyncio.sleep(300)
+        now = time.time()
+        day = int(now // 86400)
+        due = (now % 86400) >= settings.REPORT_HOUR_UTC * 3600
+        last = storage.get_setting(_LAST_DAILY_KEY)
+        if last is None:                       # первый запуск: первая сводка — завтра
+            storage.set_setting(_LAST_DAILY_KEY, day)
+        elif due and int(float(last)) < day:
+            storage.set_setting(_LAST_DAILY_KEY, day)
+            try:
+                await telegram_notify.notify(daily_text(now))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Сводка не ушла: %s", exc)
+        await asyncio.sleep(300)

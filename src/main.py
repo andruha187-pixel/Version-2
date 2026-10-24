@@ -1,49 +1,34 @@
 """
-Точка входа бота серий 15m.
+Точка входа погодного бота.
 
 Фоновые задачи:
-  - book_stream   — живой стакан Polymarket (WebSocket);
-  - chainlink_feed — цена Chainlink (исход окна, если стакан в конце не решил);
-  - series_bot    — 🔁 запись окон и 🎲 ставки стратегии (тест и реальные);
-  - reporting     — CSV-отчёт в Telegram раз в REPORT_INTERVAL_HOURS;
-  - Telegram      — меню и уведомления.
+  - archive   — 📚 докачка закрытых температурных событий и истории цены;
+  - live      — 🎯 открытые события: касания уровней, кандидаты, тестовые ставки, снимки цен;
+  - reporting — сводка раз в сутки;
+  - Telegram  — меню и уведомления.
 """
 from __future__ import annotations
 import asyncio
 import logging
 
-from config import settings
-from src import book_stream, chainlink_feed, reporting, runtime_state, series_bot, storage, telegram_notify
+from src import archive, live, reporting, runtime_state, storage, telegram_notify
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("polymarket-series-bot")
+log = logging.getLogger("polymarket-weather-bot")
 
 
 async def main():
     storage.init_db()
     runtime_state.init_from_db()
-    if not series_bot.rule_since():
-        series_bot.mark_rule_change()    # первый запуск этой версии: сравнение входов — с него
-
-    # Защита от «тихого» LIVE без ключа: в базе сохранён LIVE, а ключа сейчас нет
-    forced_dry = False
-    if not runtime_state.get("dry_run") and not settings.POLY_PRIVATE_KEY:
-        runtime_state.set("dry_run", True)
-        forced_dry = True
-
     app = telegram_notify.build_app()
     async with app:
         await app.start()
         await app.updater.start_polling()
         try:
-            await telegram_notify.notify(telegram_notify.startup_text(forced_dry))
+            await telegram_notify.notify(telegram_notify.startup_text())
         except Exception as exc:  # noqa: BLE001
             log.warning("Стартовое сообщение не ушло: %s", exc)
-
-        jobs = [chainlink_feed.run_forever(), series_bot.run_forever(), reporting.report_loop()]
-        if settings.USE_LIVE_BOOK_STREAM:
-            jobs.append(book_stream.run_forever())
-        tasks = [asyncio.create_task(j) for j in jobs]
+        tasks = [asyncio.create_task(j) for j in (archive.run_forever(), live.run_forever(), reporting.report_loop())]
         try:
             await asyncio.gather(*tasks)
         finally:
