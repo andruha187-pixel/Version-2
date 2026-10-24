@@ -20,7 +20,9 @@ from src import cities
 TITLE_RE = re.compile(r"^\s*(highest|lowest)\s+temperature\s+in\s+(.+?)\s+on\s+([A-Za-z]+)\.?\s+(\d{1,2})"
                       r"(?:st|nd|rd|th)?(?:,?\s*(\d{4}))?\s*\??\s*$", re.I)
 QUESTION_RE = re.compile(r"\bbe\s+(.+?)\s+on\s+[A-Za-z]+\.?\s+\d{1,2}", re.I)
-WU_RE = re.compile(r"wunderground\.com/history/daily/([a-z]{2})/([^/\s?#]+)/([A-Za-z0-9]{3,5})", re.I)
+# …/history/daily/gb/london/EGLC, а в США, Канаде, Австралии — со штатом: …/us/ny/new-york-city/KLGA
+WU_RE = re.compile(r"wunderground\.com/history/daily/([a-z]{2})/(?:([a-z]{2,3})/)?([^/\s?#]+)/([A-Za-z0-9]{3,5})"
+                   r"(?=[/?#\s\"'<>).,;]|$)", re.I)
 
 MONTHS = {m: i + 1 for i, m in enumerate(
     ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
@@ -196,8 +198,9 @@ def parse_event(ev: dict) -> dict | None:
             text += " " + str(mk.get("resolutionSource") or "") + " " + str(mk.get("description") or "")[:400]
             break
     wu = WU_RE.search(text)
-    country, station = (wu.group(1).lower(), wu.group(3).upper()) if wu else (None, None)
-    tz, tz_ok = cities.tz_for(city, country)
+    country, state, station = ((wu.group(1).lower(), (wu.group(2) or "").lower() or None, wu.group(4).upper())
+                               if wu else (None, None, None))
+    tz, tz_ok = cities.tz_for(city, country, state)
     buckets = []
     unit = None
     for mk in ev.get("markets") or []:

@@ -220,6 +220,15 @@ def archive_counts() -> dict:
             "status": by_status, "kinds": by_kind, "fidelity": fid, "no_path": no_path, "open": open_n}
 
 
+def pending_by_volume(min_volume: float) -> tuple[int, int]:
+    """Закрытых событий без истории цены: (с объёмом от min_volume, меньше)."""
+    big = _query("SELECT COUNT(*) FROM events WHERE closed = 1 AND status IN ('new', 'error') "
+                 "AND COALESCE(volume, 0) >= ?", (min_volume,))[0][0]
+    small = _query("SELECT COUNT(*) FROM events WHERE closed = 1 AND status IN ('new', 'error') "
+                   "AND COALESCE(volume, 0) < ?", (min_volume,))[0][0]
+    return big, small
+
+
 def city_stats(min_volume: float = 0.0) -> list[dict]:
     """По городам: событий (макс/мин), средний объём, станция, пояс."""
     rows = _query("SELECT city_key, MAX(city), kind, COUNT(*), AVG(volume), MAX(station), MAX(tz), MIN(tz_ok) "

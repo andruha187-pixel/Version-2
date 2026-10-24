@@ -69,7 +69,10 @@ def archive_line() -> str:
     if p["phase"] == "discover":
         s += f"; ищу события ({p['window']})"
     elif p["phase"] == "paths" and p["paths_total"]:
-        s += f"; качаю историю: {p['paths_done']}/{p['paths_total']} корзин"
+        s += f"; качаю историю: {text.thousands(p['paths_done'])}/{text.thousands(p['paths_total'])} корзин"
+        eta = archive.eta_sec()
+        if eta is not None:
+            s += f", осталось ~{text.duration(eta)}"
     elif not runtime_state.get("archive_enabled"):
         s += "; докачка ⏸"
     return s
@@ -248,6 +251,11 @@ def archive_text(head: str = "") -> str:
         f"раз в {settings.ARCHIVE_REFRESH_HOURS:g} ч.",
         f"Закрытых событий найдено: {c['events']} (без истории: {c['status'].get('new', 0)}, ошибок: "
         f"{c['status'].get('error', 0)}); открытых в базе: {c['open']}."]
+    vmin = float(runtime_state.get("min_event_volume"))
+    big, small = storage.pending_by_volume(vmin)
+    if big or small:
+        lines.append(f"В очереди: {text.n_events(big)} с объёмом от {text.usd(vmin)} (качаются первыми — они и идут "
+                     "в расчёт)" + (f" и {small} мелких." if small else "."))
     if c["fidelity"]:
         tot = sum(c["fidelity"].values())
         parts = ", ".join(f"{k} мин — {100 * v / tot:.0f}%" for k, v in sorted(c["fidelity"].items()))

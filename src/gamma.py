@@ -21,7 +21,7 @@ log = logging.getLogger("gamma")
 PAGE = 100
 MAX_PAGES = 30                     # на одно окно дат и один способ — страховка от бесконечного листания
 
-_strategy_stats: dict[str, dict] = {}     # способ -> {"events": найдено температурных, "error": текст}
+_strategy_stats: dict[str, dict] = {}     # способ -> {"ids": разные найденные события, "error": текст}
 
 
 def _iso(ts: float) -> str:
@@ -34,15 +34,16 @@ def strategies() -> list[str]:
 
 
 def strategy_stats() -> dict:
-    return {k: dict(v) for k, v in _strategy_stats.items()}
+    """{способ: {"events": сколько разных температурных событий нашёл, "error": последняя ошибка}}."""
+    return {k: {"events": len(v["ids"]), "error": v["error"]} for k, v in _strategy_stats.items()}
 
 
-def _note(strategy: str, found: int = 0, error: str = "") -> None:
-    st = _strategy_stats.setdefault(strategy, {"events": 0, "error": ""})
-    st["events"] += found
+def _note(strategy: str, ids=(), error: str = "") -> None:
+    st = _strategy_stats.setdefault(strategy, {"ids": set(), "error": ""})
+    st["ids"].update(ids)
     if error:
         st["error"] = error[:160]
-    elif found:
+    elif ids:
         st["error"] = ""
 
 
@@ -110,17 +111,17 @@ async def find_events(closed: bool | None, t0: float, t1: float) -> list[dict]:
             _note(strategy, error=str(exc))
             errors.append(f"{strategy}: {exc}")
             continue
-        n = 0
+        ids = []
         for ev in evs:
             if not isinstance(ev, dict) or not weather_parse.is_temperature_title(ev.get("title") or ""):
                 continue
             key = str(ev.get("id"))
+            ids.append(key)
             if key not in found:
-                n += 1
                 found[key] = ev
             elif not found[key].get("markets") and ev.get("markets"):
                 found[key] = ev
-        _note(strategy, n)
+        _note(strategy, ids)
     if errors and len(errors) == len(strategies()):
         raise http_api.ApiError("все способы поиска не сработали — " + "; ".join(errors)[:300])
     out = []

@@ -25,10 +25,14 @@ WINDOW_SEC = 2 * 86400
 RECENT_SEC = 4 * 86400
 OLDEST_KEY = "archive_oldest_ts"           # до какого момента назад архив уже просмотрен
 MAX_ERRORS_PER_EVENT = 3
-CHUNK_EVENTS = 400                          # после каждых 400 скачанных событий — пересчёт порогов
+CHUNK_EVENTS = 1000                         # после каждой 1000 скачанных событий — пересчёт порогов
+# Версия разбора событий: поменялась (например, пояса городов США по штату) — один раз заново
+# просматриваем все окна, чтобы обновить пояс, станцию и границы дня у уже скачанных событий
+PARSE_VERSION = 2
+PARSE_VERSION_KEY = "archive_parse_version"
 
 _progress = {"phase": "idle", "found": 0, "new": 0, "paths_total": 0, "paths_done": 0, "events_done": 0,
-             "errors": 0, "started": 0, "finished": 0, "last_error": "", "window": ""}
+             "errors": 0, "started": 0, "finished": 0, "last_error": "", "window": "", "paths_t0": 0.0}
 _wake = None                                # asyncio.Event: «синхронизировать сейчас»
 _running = {"on": False}
 _error_counts: dict[int, int] = {}
@@ -92,18 +96,35 @@ def _path_window(ev: dict, now: float) -> tuple[int, int]:
     return int(start), int(max(end, start + 3600))
 
 
+def _todo() -> list[dict]:
+    """Очередь на историю цены: сначала события с объёмом от порога расчёта (они и нужны для порогов),
+    потом мелкие; внутри — от новых к старым."""
+    vmin = float(runtime_state.get("min_event_volume"))
+    todo = [e for e in storage.events("closed = 1 AND status IN ('new', 'error')", order="date DESC, id DESC")
+            if _error_counts.get(e["id"], 0) < MAX_ERRORS_PER_EVENT]
+    todo.sort(key=lambda e: 0 if (e["volume"] or 0) >= vmin else 1)        # сортировка устойчивая
+    return todo
+
+
 def pending_events() -> int:
     """Сколько закрытых событий ещё без истории цены."""
-    return len([e for e in storage.events("closed = 1 AND status IN ('new', 'error')")
-                if _error_counts.get(e["id"], 0) < MAX_ERRORS_PER_EVENT])
+    return len(_todo())
+
+
+def eta_sec() -> float | None:
+    """Сколько ещё качать историю, секунд (по скорости этого прохода)."""
+    p = _progress
+    if p["phase"] != "paths" or p["paths_done"] < 50 or not p["paths_t0"]:
+        return None
+    rate = p["paths_done"] / max(1.0, time.monotonic() - p["paths_t0"])
+    return max(0.0, (p["paths_total"] - p["paths_done"]) / rate) if rate > 0 else None
 
 
 async def fetch_paths(now: float | None = None, limit: int | None = None) -> tuple[int, int]:
-    """Скачать историю цены корзин закрытых событий без неё (новые сначала).
+    """Скачать историю цены корзин закрытых событий без неё (крупные и новые сначала).
     Возвращает (сколько событий скачали, сколько было в очереди этого прохода)."""
     now = time.time() if now is None else now
-    todo = [e for e in storage.events("closed = 1 AND status IN ('new', 'error')", order="date DESC, id DESC")
-            if _error_counts.get(e["id"], 0) < MAX_ERRORS_PER_EVENT]
+    todo = _todo()
     if limit:
         todo = todo[:limit]
     done = 0
@@ -141,11 +162,14 @@ async def sync(now: float | None = None) -> dict:
         _progress[k] = 0
     _progress.update(phase="discover", started=int(time.time()), last_error="")
     try:
+        if storage.get_setting(PARSE_VERSION_KEY) != str(PARSE_VERSION):
+            storage.set_setting(OLDEST_KEY, int(time.time() if now is None else now))   # всё заново, история остаётся
         new = await discover(now)
+        storage.set_setting(PARSE_VERSION_KEY, PARSE_VERSION)
         _progress["phase"] = "paths"
-        _progress["paths_total"] = sum(e["n_buckets"] or 0 for e in storage.events(
-            "closed = 1 AND status IN ('new', 'error')"))
+        _progress["paths_total"] = sum(e["n_buckets"] or 0 for e in _todo())
         _progress["paths_done"] = 0
+        _progress["paths_t0"] = time.monotonic()
         done = 0
         first = True
         while True:

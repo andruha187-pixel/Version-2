@@ -37,6 +37,13 @@ def utc(ts: float | None, fmt: str = "%d.%m %H:%M") -> str:
     return time.strftime(fmt, time.gmtime(ts)) if ts else "—"
 
 
+def duration(sec: float) -> str:
+    """5400 → «1 ч 30 мин», 600 → «10 мин»."""
+    m = int(round(sec / 60))
+    h, m = divmod(m, 60)
+    return f"{h} ч {m} мин" if h else f"{max(1, m)} мин"
+
+
 def hhmm_local(hour: float) -> str:
     """Час от местной полуночи дня рынка → «16:40», «накануне 22:10», «+1 д 03:00»."""
     day, rem = divmod(hour, 24.0)

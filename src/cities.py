@@ -89,6 +89,35 @@ ALIASES = {"new york city": "nyc", "new york": "nyc", "la": "los angeles", "sf":
            "bengaluru": "bangalore", "new delhi": "delhi"}
 
 
+# Штат/провинция из ссылки Weather Underground — для городов, которых нет в CITY_TZ.
+# В штатах с двумя поясами — пояс крупных городов.
+STATE_TZ = {
+    "us": {"al": "America/Chicago", "ak": "America/Anchorage", "az": "America/Phoenix", "ar": "America/Chicago",
+           "ca": "America/Los_Angeles", "co": "America/Denver", "ct": "America/New_York", "de": "America/New_York",
+           "dc": "America/New_York", "fl": "America/New_York", "ga": "America/New_York", "hi": "Pacific/Honolulu",
+           "id": "America/Boise", "il": "America/Chicago", "in": "America/Indiana/Indianapolis",
+           "ia": "America/Chicago", "ks": "America/Chicago", "ky": "America/New_York", "la": "America/Chicago",
+           "me": "America/New_York", "md": "America/New_York", "ma": "America/New_York", "mi": "America/Detroit",
+           "mn": "America/Chicago", "ms": "America/Chicago", "mo": "America/Chicago", "mt": "America/Denver",
+           "ne": "America/Chicago", "nv": "America/Los_Angeles", "nh": "America/New_York", "nj": "America/New_York",
+           "nm": "America/Denver", "ny": "America/New_York", "nc": "America/New_York", "nd": "America/Chicago",
+           "oh": "America/New_York", "ok": "America/Chicago", "or": "America/Los_Angeles", "pa": "America/New_York",
+           "ri": "America/New_York", "sc": "America/New_York", "sd": "America/Chicago", "tn": "America/Chicago",
+           "tx": "America/Chicago", "ut": "America/Denver", "vt": "America/New_York", "va": "America/New_York",
+           "wa": "America/Los_Angeles", "wv": "America/New_York", "wi": "America/Chicago", "wy": "America/Denver",
+           "pr": "America/Puerto_Rico"},
+    "ca": {"on": "America/Toronto", "qc": "America/Toronto", "bc": "America/Vancouver", "ab": "America/Edmonton",
+           "mb": "America/Winnipeg", "sk": "America/Regina", "ns": "America/Halifax", "nb": "America/Moncton",
+           "nl": "America/St_Johns", "pe": "America/Halifax"},
+    "au": {"nsw": "Australia/Sydney", "act": "Australia/Sydney", "vic": "Australia/Melbourne",
+           "qld": "Australia/Brisbane", "wa": "Australia/Perth", "sa": "Australia/Adelaide",
+           "tas": "Australia/Hobart", "nt": "Australia/Darwin"},
+    "br": {"sp": "America/Sao_Paulo", "rj": "America/Sao_Paulo", "df": "America/Sao_Paulo",
+           "mg": "America/Sao_Paulo", "rs": "America/Sao_Paulo", "pr": "America/Sao_Paulo",
+           "ba": "America/Bahia", "pe": "America/Recife", "ce": "America/Fortaleza", "am": "America/Manaus"},
+}
+
+
 def city_key(name: str) -> str:
     """Ключ города: «New York City» и «NYC» → «nyc» (одни и те же рынки под разными названиями)."""
     s = re.sub(r"[^\w\s.\-']", " ", (name or "").strip().lower())
@@ -96,13 +125,17 @@ def city_key(name: str) -> str:
     return ALIASES.get(s, s)
 
 
-def tz_for(city: str, country: str | None = None) -> tuple[str, bool]:
-    """(IANA-пояс, известен ли он точно). Неизвестный город — UTC, False."""
+def tz_for(city: str, country: str | None = None, state: str | None = None) -> tuple[str, bool]:
+    """(IANA-пояс, известен ли он точно): по городу, потом по стране и штату из ссылки
+    Weather Underground, потом по стране. Неизвестно — UTC, False."""
     key = city_key(city)
     if key in CITY_TZ:
         return CITY_TZ[key], True
-    if country and country.lower() in COUNTRY_TZ:
-        return COUNTRY_TZ[country.lower()], True
+    c = (country or "").lower()
+    if state and state.lower() in STATE_TZ.get(c, {}):
+        return STATE_TZ[c][state.lower()], True
+    if c in COUNTRY_TZ:
+        return COUNTRY_TZ[c], True
     return "UTC", False
 
 
