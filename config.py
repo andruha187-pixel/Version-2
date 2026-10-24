@@ -59,8 +59,9 @@ class Settings:
     # Уровни цены, на которых смотрим «цена впервые дошла до X → выиграла ли сторона»
     STUDY_LEVELS: list = field(default_factory=lambda: _floats(
         os.getenv("STUDY_LEVELS", "0.80,0.83,0.85,0.87,0.90,0.92,0.94,0.96")))
-    # Цена входа = цена в истории + столько (ask выше середины/последней сделки)
-    STUDY_SLIP: float = _get_float("STUDY_SLIP", 0.01)
+    # Цена входа = цена в истории + столько (ask выше середины спреда; в момент касаний половина
+    # спреда в среднем ~2.5¢ — по живым касаниям и снимкам стакана)
+    STUDY_SLIP: float = _get_float("STUDY_SLIP", 0.025)
     # Цена перепрыгнула уровень больше чем на столько — считаем, что по уровню было не войти
     STUDY_MAX_JUMP: float = _get_float("STUDY_MAX_JUMP", 0.05)
     # Комиссия тейкера погодных рынков: сумма × FEE_RATE × (1 − цена)
@@ -79,6 +80,7 @@ class Settings:
     LIVE_POLL_SEC: float = _get_float("LIVE_POLL_SEC", 60.0)
     SNAPSHOT_EVERY_MIN: float = _get_float("SNAPSHOT_EVERY_MIN", 10.0)   # снимок цен открытых рынков в базу
     ALERTS_ENABLED: bool = _get_bool("ALERTS_ENABLED", True)
+    ALERTS_HOURLY: bool = _get_bool("ALERTS_HOURLY", True)          # кандидаты сводкой раз в час
     PAPER_STAKE_USDC: float = _get_float("PAPER_STAKE_USDC", 10.0)       # тестовая ставка на кандидата
 
     # --- База и отчёты ---
