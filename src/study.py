@@ -65,6 +65,9 @@ PHASES = (("за 2+ дня", ("за 2+ дня",)), ("накануне", ("нак
           ("в день", ("0–8 ч", "8–12 ч", "12–16 ч", "16–20 ч", "20–24 ч")))
 # Версия расчёта: поменялись окна или проверка — сохранённые правила прошлой версии не берём
 STUDY_VERSION = 2
+# Кандидаты — только по порогам, посчитанным по архиву, скачанному хотя бы на столько (пока архив качается,
+# пороги считаются по последним дням — правила по ним ненадёжны)
+READY_SHARE = 0.9
 ANY = "любое"
 ALL = "*"
 SPLIT_SHARE = 0.6                    # старая часть архива — первые 60% дат
@@ -74,7 +77,7 @@ BET_COLUMNS = ["event_id", "date", "city", "kind", "unit", "idx", "bucket", "sid
                "price", "entry", "win", "ret", "event_volume", "part"]
 CELL_COLUMNS = ["city", "city_key", "kind", "side", "level", "window", "n", "events", "wins", "win_pct", "avg_entry",
                 "breakeven_pct", "ev_pct", "lb90_pct", "n_old", "wins_old", "ev_old_pct", "p_old", "n_new", "wins_new",
-                "ev_new_pct", "per_day", "passed"]
+                "ev_new_pct", "per_day", "passed", "active"]
 
 _lock = threading.Lock()
 _state = {"summary": None, "rules": None, "cells": None, "against": None, "index": None, "running": False}
@@ -310,7 +313,10 @@ def compute(min_volume: float | None = None, bets_path: str | None = None) -> di
         if f is not None:
             f.close()
     rows, rules, against = finish(cells, names, _days(first, last), min_n, min_part)
+    pending, _small = storage.pending_by_volume(min_volume)
+    share = n_events / (n_events + pending) if n_events + pending else 0.0
     summary = {"computed": int(time.time()), "version": STUDY_VERSION, "events": n_events, "bets": n_bets,
+               "archive_share": round(share, 4), "pending": pending,
                "jumped": jumped, "active": sum(r["active"] for r in rules),
                "rules": len(rules), "first": first, "last": last, "split": split, "min_volume": min_volume,
                "min_n": min_n, "min_part": min_part, "max_p": float(settings.RULE_MAX_P), "cells": len(rows),
@@ -365,6 +371,13 @@ def _load_json(key: str) -> list:
     except ValueError:
         v = []
     return v if isinstance(v, list) else []
+
+
+def ready() -> bool:
+    """Пороги посчитаны этой версией по почти полному архиву (≥ READY_SHARE событий с историей) — можно
+    искать кандидатов."""
+    sm = summary()
+    return _current() and float(sm.get("archive_share", 1.0)) >= READY_SHARE
 
 
 def rules() -> list[dict]:

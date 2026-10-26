@@ -195,7 +195,9 @@ async def _notify_first(done: int) -> None:
     sm = study.summary() or {}
     try:
         await telegram_notify.notify(f"📊 Первые пороги готовы — по {done} последним событиям, проверенных правил: "
-                                     f"{sm.get('rules', 0)}. /menu → 📊 Пороги. Архив докачивается дальше.")
+                                     f"{sm.get('rules', 0)}. /menu → 📊 Пороги. Архив докачивается дальше; "
+                                     "кандидаты — когда он докачается хотя бы на 90% (по последним дням правила "
+                                     "ненадёжны).")
     except Exception:  # noqa: BLE001
         pass
 

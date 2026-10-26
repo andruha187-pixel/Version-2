@@ -234,6 +234,10 @@ def candidates_text() -> str:
              "98% — уже минус). Цена покупки — средняя по стакану на всю тестовую ставку; в стакане не хватает до "
              f"лучшей цены + {live.FILL_MAX_SLIP:g} — не кандидат."
              + _skipped_text(), ""]
+    sm = study.summary() or {}
+    if sm and not study.ready():
+        lines[-1:-1] = [f"⏳ Пороги посчитаны по неполному архиву ({100 * float(sm.get('archive_share', 0)):.0f}% "
+                        "событий) — кандидаты появятся, когда архив докачается."]
     for name, s in (("Всего", st), ("За 7 дней", week)):
         line = f"{name}: {s['n']} {text.plural(s['n'], 'кандидат', 'кандидата', 'кандидатов')}"
         if s["settled"]:
@@ -261,7 +265,9 @@ def candidates_text() -> str:
 def _skipped_text() -> str:
     st = live.stats()
     parts = [f"слабых по цене {st['weak']}" if st["weak"] else "",
-             f"тонкий стакан {st['thin']}" if st["thin"] else ""]
+             f"тонкий стакан {st['thin']}" if st["thin"] else "",
+             f"цена ушла {st['moved']}" if st["moved"] else "",
+             f"архив ещё качается {st['not_ready']}" if st["not_ready"] else ""]
     parts = [p for p in parts if p]
     return (" Отсеяно с запуска: " + ", ".join(parts) + ".") if parts else ""
 

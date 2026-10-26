@@ -8,11 +8,14 @@
 запуска бота — неизвестно).
 
 Касание → правило (📊 study.find_rule): для города и окна местного времени, только
-если та же ячейка проверена и по всем городам. Доход считаем по цене, по которой
+если та же ячейка проверена и по всем городам. Пороги посчитаны по неполному архиву
+(архив ещё качается) — кандидатов не ищем. Доход считаем по цене, по которой
 можно купить сейчас: сначала по лучшей цене (ask), потом — по стакану: средняя
 цена на всю тестовую ставку PAPER_STAKE_USDC. В стакане не хватает до лучшей
-цены + FILL_MAX_SLIP — «тонко», не кандидат. Доход ниже порога (кнопки 0…+5%) —
-не кандидат. Кандидат — тестовая ставка по этой средней цене и строка в Telegram:
+цены + FILL_MAX_SLIP — «тонко», не кандидат. Середина спреда по самому стакану уже
+ниже уровня (цена Gamma отстала и цена ушла вниз) или средняя цена покупки дальше
+уровня, чем допускает расчёт, — «цена ушла», не кандидат. Доход ниже порога
+(кнопки 0…+5%) — не кандидат. Кандидат — тестовая ставка по этой средней цене и строка в Telegram:
 сразу или сводкой раз в час. По одному кандидату на сторону корзины. Итог — по
 исходу корзины, когда событие закроется.
 
@@ -42,10 +45,14 @@ _last_snap: dict[int, float] = {}
 _stats = {"polls": 0, "open_events": 0, "candidates": 0, "last_poll": 0, "last_error": "", "settled": 0,
           "weak": 0,                 # касания с правилом, но по цене покупки доход ниже порога
           "thin": 0,                 # в стакане не хватает на тестовую ставку до лучшей цены + FILL_MAX_SLIP
+          "moved": 0,                # по стакану цена уже ниже уровня или покупка дальше допустимого
+          "not_ready": 0,            # касание с правилом, но пороги посчитаны по неполному архиву
           "book_err": 0}             # стакан не ответил — тестовая ставка по лучшей цене
 _last_settle = {"t": 0.0}
 _digest: list[str] = []              # кандидаты для сводки раз в час
 _last_digest = {"t": 0.0}
+_done: set = set()                   # (событие, корзина, сторона) — уже кандидаты (повторно стакан не спрашиваем)
+_done_loaded = {"on": False}
 
 
 def reset() -> None:
@@ -56,6 +63,15 @@ def reset() -> None:
     _last_settle["t"] = 0.0
     _digest.clear()
     _last_digest["t"] = 0.0
+    _done.clear()
+    _done_loaded["on"] = False
+
+
+def _is_done(key: tuple) -> bool:
+    if not _done_loaded["on"]:
+        _done.update((c["event_id"], c["idx"], c["side"]) for c in storage.candidates())
+        _done_loaded["on"] = True
+    return key in _done
 
 
 def stats() -> dict:
@@ -103,18 +119,20 @@ def _snapshot(ev: dict, now: float) -> None:
                                                b.get("liquidity")] for b in ev["buckets"]])
 
 
-async def _book_fill(token: str, best: float, stake: float) -> tuple[str, float | None, float | None]:
-    """Покупка на stake по стакану: ("ok", средняя цена, $ до цены + 1¢) / ("thin", None, $) / ("err", None, None)."""
+async def _book_fill(token: str, best: float, stake: float) -> tuple[str, float | None, float | None, float | None]:
+    """Покупка на stake по стакану: ("ok", средняя цена, $ до цены + 1¢, середина спреда по стакану) /
+    ("thin", None, $, середина) / ("err", None, None, None)."""
     try:
         bk = await clob.book(token)
     except http_api.ApiError:
-        return "err", None, None
-    asks = bk["asks"]
+        return "err", None, None, None
+    asks, bids = bk["asks"], bk["bids"]
+    book_mid = (bids[0][0] + asks[0][0]) / 2 if bids and asks else None
     depth = clob.depth_usdc(asks, min(0.999, best + 0.01))
     price = clob.fill_price(asks, stake, min(0.999, best + FILL_MAX_SLIP))
     if price is None:
-        return "thin", None, depth
-    return "ok", price, depth
+        return "thin", None, depth, book_mid
+    return "ok", price, depth, book_mid
 
 
 async def _notify(msg: str) -> None:
@@ -139,6 +157,8 @@ async def check_event(ev: dict, now: float) -> int:
     city_only = bool(runtime_state.get("alerts_city_only"))
     sides = {"yes": ("YES",), "no": ("NO",)}.get(str(runtime_state.get("alerts_sides")), ("YES", "NO"))
     min_ev = float(runtime_state.get("alert_min_ev"))
+    ready = study.ready()
+    max_over = float(settings.STUDY_MAX_JUMP) + float(settings.STUDY_SLIP)
     made, short = [], []
     for b in ev["buckets"]:
         if b.get("closed") or b.get("accepting") is False:
@@ -147,10 +167,13 @@ async def check_event(ev: dict, now: float) -> int:
             mid, buy = side_prices(b, side)
             if mid is None:
                 continue
-            crossed = crossings((ev["id"], b["idx"], side), mid, levels)
+            key = (ev["id"], b["idx"], side)
+            crossed = crossings(key, mid, levels)
+            if not crossed or _is_done(key):
+                continue                           # касаний нет или по этой корзине кандидат уже был
             best = None
             for level in crossed:
-                if buy > level + float(settings.STUDY_MAX_JUMP) + float(settings.STUDY_SLIP) + 1e-9:
+                if buy > level + max_over + 1e-9:
                     continue                       # этот уровень цена перепрыгнула — по нему так не входили
                 r = study.find_rule(ev["city_key"], ev["kind"], side, level, window, city_only=city_only)
                 if r is None:
@@ -161,18 +184,25 @@ async def check_event(ev: dict, now: float) -> int:
             if best is None:
                 continue
             level, r, e = best
+            if not ready:
+                _stats["not_ready"] += 1           # архив ещё качается — пороги по последним дням ненадёжны
+                continue
             if 100 * e < min_ev - 1e-9:
                 _stats["weak"] += 1                # по лучшей цене правило не окупается (или доход мал)
                 continue
             stake = float(runtime_state.get("paper_stake"))
             token = b["yes_token"] if side == "YES" else b["no_token"]
-            status, fill, depth = await _book_fill(token, buy, stake)
+            status, fill, depth, book_mid = await _book_fill(token, buy, stake)
             if status == "thin":
                 _stats["thin"] += 1                # на ставку в стакане не хватает — так не войти
                 continue
             if status == "err":
                 _stats["book_err"] += 1
                 fill = buy
+            elif ((book_mid is not None and book_mid < level - 0.005)
+                  or fill > level + max_over + 1e-9):
+                _stats["moved"] += 1               # Gamma отстала: по стакану цена уже не та, касания нет
+                continue
             e = ev_at(r, fill)
             if 100 * e < min_ev - 1e-9:
                 _stats["weak"] += 1                # по средней цене на всю ставку — уже ниже порога
@@ -203,6 +233,7 @@ def _candidate(ev: dict, b: dict, side: str, level: float, mid: float, buy: floa
                                 hour=round(hour, 2), rule=study.rule_text(r, short=True), rule_n=r["n"],
                                 rule_wins=r["wins"], rule_ev=r["ev_pct"], depth_usdc=depth, stake=stake,
                                 shares=round(stake / entry, 4), fee=fee, ev_now=round(100 * e, 2))
+    _done.add((ev["id"], b["idx"], side))
     if not cid:
         return None
     _stats["candidates"] += 1
