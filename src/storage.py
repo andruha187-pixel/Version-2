@@ -56,6 +56,25 @@ CREATE TABLE IF NOT EXISTS candidates (
     UNIQUE (event_id, idx, side)
 );
 CREATE INDEX IF NOT EXISTS idx_candidates_ts ON candidates(ts);
+
+-- 📡 Наблюдения METAR со станции города (та же станция, по которой резолвится рынок): официальная
+-- сводка — ground truth. obs_ts — время наблюдения (из METAR), recv_ts — когда бот его увидел,
+-- temp_c — температура (десятые по RMK Tttt, иначе целые °C из тела). Для измерения задержки стакана.
+CREATE TABLE IF NOT EXISTS metar_obs (
+    station TEXT, obs_ts INTEGER, recv_ts INTEGER, temp_c REAL, raw TEXT, city_key TEXT,
+    PRIMARY KEY (station, obs_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_metar_recv ON metar_obs(recv_ts);
+
+-- 🔮 Прогноз дневного макс/мин по ансамблю моделей (Open-Meteo), по городу и дате рынка, во времени.
+-- members — JSON-список дневного макс (kind=high) или мин (kind=low) °C по каждому участнику ансамбля.
+-- По нему строятся вероятности корзин; сверяется с METAR (факт) и снимками стакана (цена рынка).
+CREATE TABLE IF NOT EXISTS forecasts (
+    city_key TEXT, date TEXT, kind TEXT, run_ts INTEGER,
+    n_members INTEGER, members TEXT, src TEXT,
+    PRIMARY KEY (city_key, date, kind, run_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_forecasts_run ON forecasts(run_ts);
 """
 
 
@@ -275,6 +294,69 @@ def paths_export(month: str) -> list[tuple]:
 def months() -> list[str]:
     return [r[0] for r in _query("SELECT DISTINCT substr(date, 1, 7) FROM events WHERE closed = 1 AND status = 'done' "
                                  "ORDER BY 1")]
+
+
+# ------------------------------------------------------------- METAR ----
+
+METAR_COLUMNS = ["station", "city_key", "obs_ts", "recv_ts", "temp_c", "raw"]
+
+
+def metar_add(station: str, obs_ts: int, recv_ts: int, temp_c, raw: str, city_key: str) -> bool:
+    """Записать наблюдение. True — оно новое (такого obs_ts у станции ещё не было)."""
+    with _conn() as conn:
+        cur = conn.execute("INSERT OR IGNORE INTO metar_obs (station, obs_ts, recv_ts, temp_c, raw, city_key) "
+                           "VALUES (?, ?, ?, ?, ?, ?)", (station, int(obs_ts), int(recv_ts),
+                                                         None if temp_c is None else float(temp_c), raw, city_key))
+        return cur.rowcount > 0
+
+
+def metar_last_obs() -> dict[str, int]:
+    """Станция → последнее obs_ts в базе (чтобы после рестарта не считать старое новым)."""
+    return {r[0]: r[1] for r in _query("SELECT station, MAX(obs_ts) FROM metar_obs GROUP BY station")}
+
+
+def metar_count() -> int:
+    return _query("SELECT COUNT(*) FROM metar_obs")[0][0]
+
+
+def metar_recent(limit: int = 10) -> list[dict]:
+    rows = _query("SELECT station, city_key, obs_ts, recv_ts, temp_c, raw FROM metar_obs "
+                  "ORDER BY recv_ts DESC LIMIT ?", (int(limit),))
+    return [dict(zip(METAR_COLUMNS, r)) for r in rows]
+
+
+def metar_export(since_ts: int) -> list[tuple]:
+    return _query("SELECT station, city_key, obs_ts, recv_ts, temp_c, raw FROM metar_obs WHERE recv_ts >= ? "
+                  "ORDER BY recv_ts", (since_ts,))
+
+
+# ------------------------------------------------------------ прогноз ----
+
+FORECAST_COLUMNS = ["city_key", "date", "kind", "run_ts", "n_members", "members", "src"]
+
+
+def forecast_add(city_key: str, date: str, kind: str, run_ts: int, members: list, src: str) -> None:
+    import json as _json
+    with _conn() as conn:
+        conn.execute("INSERT OR REPLACE INTO forecasts (city_key, date, kind, run_ts, n_members, members, src) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     (city_key, date, kind, int(run_ts), len(members),
+                      _json.dumps([round(float(m), 1) for m in members], separators=(",", ":")), src))
+
+
+def forecast_count() -> int:
+    return _query("SELECT COUNT(*) FROM forecasts")[0][0]
+
+
+def forecast_recent(limit: int = 10) -> list[dict]:
+    rows = _query("SELECT city_key, date, kind, run_ts, n_members, members, src FROM forecasts "
+                  "ORDER BY run_ts DESC LIMIT ?", (int(limit),))
+    return [dict(zip(FORECAST_COLUMNS, r)) for r in rows]
+
+
+def forecast_export(since_ts: int) -> list[tuple]:
+    return _query("SELECT city_key, date, kind, run_ts, n_members, members, src FROM forecasts WHERE run_ts >= ? "
+                  "ORDER BY run_ts", (since_ts,))
 
 
 # --------------------------------------------------------------- снимки ----

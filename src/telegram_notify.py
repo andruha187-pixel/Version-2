@@ -6,7 +6,7 @@
   🏙 Города     — города архива: события, объём; у города — пороги и кандидаты вкл/выкл
   🎯 Кандидаты  — последние кандидаты и итог тестовых ставок; сообщения: сразу / раз в час / выкл
   📚 Архив      — что скачано, ход докачки, способы поиска; глубина; докачать сейчас
-  📤 Файлы      — события, расчётные ставки, ячейки, кандидаты, снимки; пути цены
+  📤 Файлы      — события, расчётные ставки, ячейки, кандидаты, снимки, METAR, прогнозы; пути цены
   ⚙️ Настройки  — объём события, ставок для правила, тестовая ставка
 
 Управлять может только чат из TELEGRAM_CHAT_ID.
@@ -104,10 +104,37 @@ def candidates_line() -> str:
 
 # ------------------------------------------------------------------ экраны ----
 
+def metar_line() -> str:
+    from src import metar_feed
+    m = metar_feed.stats()
+    if not settings.METAR_ENABLED:
+        return "📡 METAR: выключен"
+    s = (f"📡 METAR: наблюдений {text.thousands(storage.metar_count())} по {m['stations']} станциям"
+         + (f" (источник {m['source']})" if m["source"] else ""))
+    if m["last_poll"]:
+        s += f", опрос {text.utc(m['last_poll'], '%H:%M')} UTC"
+    if m["last_error"] and not m["source"]:
+        s += f"; ⚠️ {m['last_error']}"
+    return s
+
+
+def forecast_line() -> str:
+    from src import forecast_feed
+    f = forecast_feed.stats()
+    if not settings.FORECAST_ENABLED:
+        return "🔮 Прогноз: выключен"
+    s = f"🔮 Прогноз: строк {text.thousands(storage.forecast_count())}"
+    if f["last_run"]:
+        s += f", прогон {text.utc(f['last_run'], '%H:%M')} UTC по {f['ok_cities']}/{f['cities']} городам"
+    if f["last_error"] and not f["ok_cities"]:
+        s += f"; ⚠️ {f['last_error']}"
+    return s
+
+
 def main_text() -> str:
     ls = live.stats()
     lines = ["🌡 Погодный бот Polymarket — архив температурных рынков, пороги цены и кандидаты", "",
-             archive_line(), study_line(), candidates_line()]
+             archive_line(), study_line(), candidates_line(), metar_line(), forecast_line()]
     if ls["last_poll"]:
         lines.append(f"Открытых температурных событий: {ls['open_events']} (проверка {text.utc(ls['last_poll'], '%H:%M')} UTC)")
     if ls["last_error"]:

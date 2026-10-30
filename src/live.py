@@ -110,8 +110,9 @@ def crossings(key: tuple, value: float, levels) -> list[float]:
     return out
 
 
-def _snapshot(ev: dict, now: float) -> None:
-    if now - _last_snap.get(ev["id"], 0) < float(settings.SNAPSHOT_EVERY_MIN) * 60:
+def _snapshot(ev: dict, now: float, force: bool = False) -> None:
+    # force — сразу после нового наблюдения METAR (стакан в этот момент — для измерения задержки)
+    if not force and now - _last_snap.get(ev["id"], 0) < float(settings.SNAPSHOT_EVERY_MIN) * 60:
         return
     _last_snap[ev["id"]] = now
     storage.event_upsert(ev)
@@ -318,6 +319,8 @@ async def poll(now: float | None = None) -> int:
     """Один проход по открытым событиям. Возвращает, сколько новых кандидатов."""
     now = time.time() if now is None else now
     raws = await gamma.find_events(closed=False, t0=now - LOOKBACK_SEC, t1=now + LOOKAHEAD_SEC)
+    from src import metar_feed
+    fresh_obs = metar_feed.take_pending()       # города, где только что вышло новое наблюдение
     made = 0
     n_open = 0
     for raw in raws:
@@ -325,7 +328,7 @@ async def poll(now: float | None = None) -> int:
         if ev is None or ev["closed"]:
             continue
         n_open += 1
-        _snapshot(ev, now)
+        _snapshot(ev, now, force=ev["city_key"] in fresh_obs)   # сразу после наблюдения — внеочередной снимок
         made += await check_event(ev, now)
     _stats.update(polls=_stats["polls"] + 1, open_events=n_open, last_poll=int(now))
     return made

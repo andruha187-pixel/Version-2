@@ -6,7 +6,9 @@
   weather_study.zip      — study_bets.csv (каждая расчётная ставка: касание уровня, вход, время, итог)
                            и study_cells.csv (все ячейки: город × тип × сторона × уровень × окно);
   weather_candidates.csv — кандидаты и тестовые ставки;
-  weather_snapshots.zip  — снимки цен открытых рынков за 7 дней.
+  weather_snapshots.zip  — снимки цен открытых рынков за 7 дней;
+  weather_metar.zip      — наблюдения METAR станций за 14 дней (official temp, ground truth);
+  weather_forecasts.zip  — прогнозы дневного макс/мин (ансамбль Open-Meteo) за 14 дней.
 🗂 Пути цены (кнопка): weather_paths_<месяц>.zip — история цены YES каждой корзины
   (t0 — начало, dts — шаги по времени в секундах, ps — цены в десятитысячных).
 
@@ -111,8 +113,26 @@ def build_snapshots_zip(path: str, since_ts: int) -> int:
     return len(rows)
 
 
+def build_metar_zip(path: str, since_ts: int) -> int:
+    rows = storage.metar_export(since_ts)
+    if not rows:
+        return 0
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("weather_metar.csv", _csv_bytes(["station", "city_key", "obs_ts", "recv_ts", "temp_c", "raw"], rows))
+    return len(rows)
+
+
+def build_forecast_zip(path: str, since_ts: int) -> int:
+    rows = storage.forecast_export(since_ts)
+    if not rows:
+        return 0
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("weather_forecasts.csv", _csv_bytes(storage.FORECAST_COLUMNS, rows))
+    return len(rows)
+
+
 async def send_files() -> int:
-    """Кнопка 📤: события, расчёт порогов со всеми ставками, кандидаты, снимки."""
+    """Кнопка 📤: события, расчёт порогов со всеми ставками, кандидаты, снимки, METAR."""
     d = _dir()
     stamp = time.strftime("%Y%m%d-%H%M", time.gmtime())
     sent = 0
@@ -139,6 +159,18 @@ async def send_files() -> int:
     p = os.path.join(d, f"weather_snapshots_{stamp}.zip")
     if await asyncio.to_thread(build_snapshots_zip, p, int(time.time()) - 7 * 86400):
         await _send(p, "📈 Снимки цен открытых рынков за 7 дней: [корзина, bid, ask, последняя, ликвидность].")
+        sent += 1
+    p = os.path.join(d, f"weather_metar_{stamp}.zip")
+    if await asyncio.to_thread(build_metar_zip, p, int(time.time()) - 14 * 86400):
+        await _send(p, "📡 Наблюдения METAR за 14 дней: station, city_key, obs_ts (время сводки), recv_ts "
+                       "(когда бот увидел), temp_c, raw. Сверять с weather_snapshots по времени — есть ли "
+                       "задержка стакана.")
+        sent += 1
+    p = os.path.join(d, f"weather_forecasts_{stamp}.zip")
+    if await asyncio.to_thread(build_forecast_zip, p, int(time.time()) - 14 * 86400):
+        await _send(p, "🔮 Прогнозы за 14 дней: city_key, date, kind (high/low), run_ts (когда посчитан), "
+                       "n_members, members (дневной макс/мин °C по участникам ансамбля). Сверять с weather_metar "
+                       "(факт, смещение модель−станция) и weather_snapshots (цена рынка против прогноза).")
         sent += 1
     if not sent:
         await telegram_notify.notify("📤 В базе пока пусто — нечего выгружать.")

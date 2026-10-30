@@ -168,11 +168,56 @@ STATE_TZ = {
 }
 
 
+# Станция города (ICAO аэропорта) — та же, по которой резолвится рынок (из resolutionSource событий).
+# По ней берём METAR (📡 metar_feed). 4 города без неё (Hong Kong, Istanbul, Moscow, Tel Aviv): станция
+# Polymarket неизвестна — METAR по ним не берём, чтобы не сверять с чужой станцией.
+CITY_ICAO = {
+    "amsterdam": "EHAM", "ankara": "LTAC", "atlanta": "KATL", "austin": "KAUS", "beijing": "ZBAA",
+    "buenos aires": "SAEZ", "busan": "RKPK", "cape town": "FACT", "chengdu": "ZUUU", "chicago": "KORD",
+    "chongqing": "ZUCK", "dallas": "KDAL", "denver": "KBKF", "guangzhou": "ZGGG", "helsinki": "EFHK",
+    "houston": "KHOU", "jeddah": "OEJN", "jinan": "ZSJN", "karachi": "OPKC", "kuala lumpur": "WMKK",
+    "london": "EGLC", "los angeles": "KLAX", "lucknow": "VILK", "madrid": "LEMD", "manila": "RPLL",
+    "mexico city": "MMMX", "miami": "KMIA", "milan": "LIMC", "munich": "EDDM", "nyc": "KLGA",
+    "panama city": "MPMG", "paris": "LFPB", "qingdao": "ZSQD", "san francisco": "KSFO", "sao paulo": "SBGR",
+    "seattle": "KSEA", "seoul": "RKSI", "shanghai": "ZSPD", "shenzhen": "ZGSZ", "singapore": "WSSS",
+    "taipei": "RCSS", "tokyo": "RJTT", "toronto": "CYYZ", "warsaw": "EPWA", "wellington": "NZWN",
+    "wuhan": "ZHHH", "zhengzhou": "ZHCC",
+}
+
+
 def city_key(name: str) -> str:
     """Ключ города: «New York City» и «NYC» → «nyc» (одни и те же рынки под разными названиями)."""
     s = re.sub(r"[^\w\s.\-']", " ", (name or "").strip().lower())
     s = re.sub(r"\s+", " ", s).strip()
     return ALIASES.get(s, s)
+
+
+# Координаты станции города (прибл.) — для прогноза Open-Meteo. Та же точка, что у ICAO выше.
+CITY_LATLON = {
+    "amsterdam": (52.31, 4.76), "ankara": (40.12, 32.99), "atlanta": (33.64, -84.43), "austin": (30.19, -97.67),
+    "beijing": (40.08, 116.58), "buenos aires": (-34.82, -58.54), "busan": (35.17, 128.94),
+    "cape town": (-33.97, 18.60), "chengdu": (30.58, 103.95), "chicago": (41.98, -87.90),
+    "chongqing": (29.72, 106.64), "dallas": (32.85, -96.85), "denver": (39.70, -104.75),
+    "guangzhou": (23.39, 113.30), "helsinki": (60.32, 24.96), "houston": (29.65, -95.28), "jeddah": (21.68, 39.16),
+    "jinan": (36.86, 117.22), "karachi": (24.91, 67.16), "kuala lumpur": (2.75, 101.71), "london": (51.50, 0.05),
+    "los angeles": (33.94, -118.41), "lucknow": (26.76, 80.89), "madrid": (40.47, -3.56), "manila": (14.51, 121.02),
+    "mexico city": (19.44, -99.07), "miami": (25.79, -80.29), "milan": (45.63, 8.72), "munich": (48.35, 11.79),
+    "nyc": (40.78, -73.87), "panama city": (8.97, -79.56), "paris": (48.97, 2.44), "qingdao": (36.27, 120.37),
+    "san francisco": (37.62, -122.37), "sao paulo": (-23.43, -46.47), "seattle": (47.45, -122.31),
+    "seoul": (37.46, 126.44), "shanghai": (31.14, 121.81), "shenzhen": (22.64, 113.81), "singapore": (1.36, 103.99),
+    "taipei": (25.07, 121.55), "tokyo": (35.55, 139.78), "toronto": (43.68, -79.63), "warsaw": (52.17, 20.97),
+    "wellington": (-41.33, 174.81), "wuhan": (30.78, 114.21), "zhengzhou": (34.52, 113.84),
+}
+
+
+def latlon_for(city: str) -> tuple[float, float] | None:
+    """(широта, долгота) станции города — для прогноза; None — нет координат."""
+    return CITY_LATLON.get(city_key(city))
+
+
+def icao_for(city: str) -> str | None:
+    """ICAO станции города (или None — станция неизвестна, METAR не берём)."""
+    return CITY_ICAO.get(city_key(city))
 
 
 def tz_for(city: str, country: str | None = None, state: str | None = None) -> tuple[str, bool]:
