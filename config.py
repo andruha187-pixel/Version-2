@@ -83,6 +83,21 @@ class Settings:
     ALERTS_HOURLY: bool = _get_bool("ALERTS_HOURLY", True)          # кандидаты сводкой раз в час
     PAPER_STAKE_USDC: float = _get_float("PAPER_STAKE_USDC", 10.0)       # тестовая ставка на кандидата
 
+    # --- 📡 METAR: официальные сводки станций (ground truth) для измерения задержки стакана ---
+    METAR_ENABLED: bool = _get_bool("METAR_ENABLED", True)
+    METAR_POLL_SEC: float = _get_float("METAR_POLL_SEC", 30.0)          # как часто опрашивать станции
+    METAR_AVWX_URL: str = os.getenv("METAR_AVWX_URL", "https://aviationweather.gov/api/data/metar")
+    METAR_TGFTP_BASE: str = os.getenv("METAR_TGFTP_BASE",
+                                      "https://tgftp.nws.noaa.gov/data/observations/metar/stations")
+
+    # --- 🔮 Прогноз (Open-Meteo ансамбль): вероятности корзин из распределения дневного макс/мин ---
+    FORECAST_ENABLED: bool = _get_bool("FORECAST_ENABLED", True)
+    FORECAST_POLL_MIN: float = _get_float("FORECAST_POLL_MIN", 120.0)   # как часто обновлять прогноз, минут
+    FORECAST_DAYS: int = _get_int("FORECAST_DAYS", 3)                   # на сколько дней вперёд
+    FORECAST_URL: str = os.getenv("FORECAST_URL", "https://ensemble-api.open-meteo.com/v1/ensemble")
+    FORECAST_MODELS: str = os.getenv("FORECAST_MODELS", "icon_seamless,gfs_seamless")
+    FORECAST_PAUSE_SEC: float = _get_float("FORECAST_PAUSE_SEC", 1.0)   # пауза между городами (вежливо к API)
+
     # --- База и отчёты ---
     DB_PATH: str = os.getenv("DB_PATH", "data/weather.db")
     REPORTS_DIR: str = os.getenv("REPORTS_DIR", "data/reports")
