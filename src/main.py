@@ -1,38 +1,50 @@
 """
-Точка входа погодного бота.
+Точка входа ⏱ бота позднего входа на 5m-рынках.
 
 Фоновые задачи:
-  - archive   — 📚 докачка закрытых температурных событий и истории цены;
-  - live      — 🎯 открытые события: касания уровней, кандидаты, тестовые ставки, снимки цен;
-  - metar     — 📡 официальные сводки станций (ground truth) для измерения задержки стакана;
-  - forecast  — 🔮 ансамблевый прогноз дневного макс/мин (Open-Meteo), вероятности корзин;
-  - reporting — сводка раз в сутки;
-  - Telegram  — меню и уведомления.
+  - book_stream    — живой стакан Polymarket (WebSocket);
+  - chainlink_feed — цена Chainlink (страйк, текущая цена, исход окна);
+  - atr_feed       — ATR по 1-минутным свечам Binance;
+  - late_bot       — 🔁 запись окон всех монет и ⏱ ставки (тест и реальные);
+  - reporting      — файлы в Telegram раз в REPORT_INTERVAL_HOURS;
+  - Telegram       — меню и уведомления.
 """
 from __future__ import annotations
 import asyncio
 import logging
 
-from src import archive, forecast_feed, live, metar_feed, reporting, runtime_state, storage, telegram_notify
+from config import settings
+from src import atr_feed, book_stream, chainlink_feed, late_bot, reporting, runtime_state, storage, telegram_notify
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("polymarket-weather-bot")
+log = logging.getLogger("polymarket-5m-late-bot")
 
 
 async def main():
     storage.init_db()
     runtime_state.init_from_db()
+    if not late_bot.rule_since():
+        late_bot.mark_rule_change()      # первый запуск: итоги «по нынешнему правилу» — с него
+
+    # Защита от «тихого» LIVE без ключа: в базе сохранён LIVE, а ключа сейчас нет
+    forced_dry = False
+    if not runtime_state.get("dry_run") and not settings.POLY_PRIVATE_KEY:
+        runtime_state.set("dry_run", True)
+        forced_dry = True
+
     app = telegram_notify.build_app()
     async with app:
         await app.start()
         await app.updater.start_polling()
         try:
-            await telegram_notify.notify(telegram_notify.startup_text())
+            await telegram_notify.notify(telegram_notify.startup_text(forced_dry))
         except Exception as exc:  # noqa: BLE001
             log.warning("Стартовое сообщение не ушло: %s", exc)
-        tasks = [asyncio.create_task(j) for j in (archive.run_forever(), live.run_forever(),
-                                              metar_feed.run_forever(), forecast_feed.run_forever(),
-                                              reporting.report_loop())]
+
+        jobs = [chainlink_feed.run_forever(), atr_feed.run_forever(), late_bot.run_forever(), reporting.report_loop()]
+        if settings.USE_LIVE_BOOK_STREAM:
+            jobs.append(book_stream.run_forever())
+        tasks = [asyncio.create_task(j) for j in jobs]
         try:
             await asyncio.gather(*tasks)
         finally:

@@ -32,7 +32,7 @@ _ws_ready = asyncio.Event()
 # Когда токен добавлен в подписку — чтобы сторож мог понять, что данные по
 # нему так и не пришли (см. _watchdog).
 _subscribed_at: dict[str, int] = {}
-# Рынок, который ещё не начался (🔁 серии подписывают следующее окно 15m
+# Рынок, который ещё не начался (бот подписывает следующее окно 5m
 # заранее): стакана по нему может не быть до старта — сторож до этого момента
 # (мс) на такие токены не смотрит, иначе рвал бы сокет всем каждые 30 с.
 _watch_after: dict[str, int] = {}
@@ -182,6 +182,19 @@ def best_bid(asset: str) -> float | None:
     if not b or not b.get("bids"):
         return None
     return max(b["bids"])
+
+
+def top_of_book(asset: str) -> tuple:
+    """(лучший бид, объём на нём, лучший аск, объём на нём). None по отсутствующей стороне.
+    Один проход по стакану — для записи точки пути (симуляция мейкера хочет и бид, и объёмы)."""
+    b = _books.get(asset)
+    if not b:
+        return (None, None, None, None)
+    bids, asks = b.get("bids") or {}, b.get("asks") or {}
+    bid = max(bids) if bids else None
+    ask = min(asks) if asks else None
+    return (bid, bids.get(bid) if bid is not None else None,
+            ask, asks.get(ask) if ask is not None else None)
 
 
 def ask_liquidity_usdc(asset: str, depth_levels: int = 5) -> float:

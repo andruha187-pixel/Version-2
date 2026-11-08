@@ -82,7 +82,7 @@ def _field(obj, key):
     return getattr(obj, key, None)
 
 
-# Публичный алиас — series_bot.py читает поля ответа ордера тем же способом,
+# Публичный алиас — late_bot.py читает поля ответа ордера тем же способом,
 # не дублируя логику dict-vs-объект у себя.
 response_field = _field
 
@@ -180,7 +180,7 @@ async def place_buy_order(token_id: str, price_cap: float, amount_usdc: float, t
     order_type:
       "FOK" — всё или ничего;
       "FAK" — исполнить сколько есть по цене не хуже потолка, остаток
-              отменить (так входит 🎲 стратегия — см. series_bot._live_buy).
+              отменить (так входит ⏱ бот — см. late_bot._live_buy).
     """
     client = await _get_client()
     return await client.place_market_order(
@@ -210,14 +210,90 @@ def filled_amounts(resp) -> tuple[float, float] | None:
 
 _NO_FILL_MARKERS = ("fully filled", "no orders found", "no match", "insufficientliquidity",
                     "insufficient liquidity", "couldn't be", "could not be", "fok order", "fak order")
+# Ошибки, которые повтором не лечатся: денег/разрешения нет, ключ или подпись неверны, доступ закрыт
+_FATAL_MARKERS = ("not enough balance", "insufficient balance", "insufficient funds", "balance is not enough",
+                  "allowance", "invalid signature", "signature", "unauthorized", "invalid api key", "api key",
+                  "forbidden", "401", "403", "geoblock", "restricted", "banned", "invalid private key",
+                  "maker address not allowed")
+
+
+def _text(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}".lower()
 
 
 def is_no_fill_error(exc: BaseException) -> bool:
     """Ордер отклонён, потому что по нашей цене в стакане уже нечего купить
     (цена ушла, заявки сняли) — такое имеет смысл повторить по свежему
     стакану. Ошибки баланса, подписи и т.п. повторять бессмысленно."""
-    text = f"{type(exc).__name__}: {exc}".lower()
+    text = _text(exc)
     return any(marker in text for marker in _NO_FILL_MARKERS)
+
+
+def is_fatal_error(exc: BaseException) -> bool:
+    """Ошибка, после которой в этом окне пробовать снова бессмысленно (баланс, разрешения, ключ)."""
+    text = _text(exc)
+    return not is_no_fill_error(exc) and any(marker in text for marker in _FATAL_MARKERS)
+
+
+# --------------------------------------------------------------- баланс ----
+
+def parse_usdc_balance(resp) -> float | None:
+    """USDC из ответа SDK о балансе. Поле balance (или collateral / available / amount); целое число
+    без точки — в микро-USDC (6 знаков, как в CLOB: «213400000» = $213.40), с точкой — уже в долларах."""
+    if resp is None:
+        return None
+    if isinstance(resp, (int, float, str)):
+        raw = resp
+    else:
+        raw = None
+        for key in ("balance", "collateral", "available", "amount", "usdc"):
+            raw = _field(resp, key)
+            if raw is not None:
+                break
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        if isinstance(raw, str):
+            txt = raw.strip()
+            val = float(txt)
+            is_int = "." not in txt and "e" not in txt.lower()
+        else:
+            val = float(raw)
+            is_int = isinstance(raw, int)
+    except (TypeError, ValueError):
+        return None
+    if val < 0 or math.isnan(val):
+        return None
+    if is_int and val >= 10_000:
+        val /= 1_000_000                       # микро-USDC
+    return round(val, 2)
+
+
+async def get_usdc_balance() -> float | None:
+    """Свободные USDC на торговом кошельке (по SDK). None — без ключа или если SDK баланс не отдал."""
+    if not settings.POLY_PRIVATE_KEY:
+        return None
+    client = await _get_client()
+    calls = (("get_balance_allowance", {"asset_type": "COLLATERAL"}), ("get_balance_allowance", {}),
+             ("get_collateral_balance", {}), ("get_balance", {}))
+    last_exc = None
+    for name, kwargs in calls:
+        fn = getattr(client, name, None)
+        if fn is None:
+            continue
+        try:
+            res = fn(**kwargs)
+            if inspect.isawaitable(res):
+                res = await res
+        except TypeError as exc:              # другая сигнатура — пробуем следующий вариант
+            last_exc = exc
+            continue
+        val = parse_usdc_balance(res)
+        if val is not None:
+            return val
+    if last_exc is not None:
+        raise last_exc
+    return None
 
 
 _warmed_tokens: set[str] = set()
@@ -226,8 +302,8 @@ _warmed_tokens: set[str] = set()
 async def prewarm_market(token_ids: list[str]) -> int:
     """Прогрев рынка в SDK для токенов нового окна. Перед первым ордером по
     токену SDK запрашивает метаданные рынка (шаг цены, тип рынка, комиссию) —
-    лишний сетевой запрос ровно в момент сигнала, а рынок 15m новый каждые
-    15 минут. create_market_order подписывает ордер локально и НЕ отправляет
+    лишний сетевой запрос ровно в момент сигнала, а рынок 5m новый каждые
+    5 минут. create_market_order подписывает ордер локально и НЕ отправляет
     его, но по пути кладёт метаданные в кэш SDK. Ошибки игнорируем: прогрев
     необязателен."""
     if not settings.POLY_PRIVATE_KEY:

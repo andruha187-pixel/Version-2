@@ -1,43 +1,41 @@
 """
-Телеграм: меню погодного бота и уведомления.
+Телеграм: кнопочное меню ⏱ бота позднего входа и уведомления.
 
 /menu:
-  📊 Пороги     — лучшие проверенные правила; все города по уровням; пересчитать
-  🏙 Города     — города архива: события, объём; у города — пороги и кандидаты вкл/выкл
-  🎯 Кандидаты  — последние кандидаты и итог тестовых ставок; сообщения: сразу / раз в час / выкл
-  📚 Архив      — что скачано, ход докачки, способы поиска; глубина; докачать сейчас
-  📤 Файлы      — события, расчётные ставки, ячейки, кандидаты, снимки, METAR, прогнозы; пути цены
-  ⚙️ Настройки  — объём события, ставок для правила, тестовая ставка
+  ⚙️ Настройки — вкл/выкл, окно входа (за сколько до конца), цена, до страйка
+                 (% и ATR), сумма входа, дневной стоп; ✏️ — своё значение сообщением
+  🪙 Монеты    — у каждой: ✅ вкл / ⏸ выкл, 🧪 тест / 🔴 реально и 💵 своя сумма входа
+                 (общая, фиксированная $ или % от банка), 🏦 свой банк монеты и
+                 🎯 сторона реальных ставок (обе / только UP / только DOWN)
+  ➕ Докупка    — докупка на откате после ставки: ✅ вкл / ⏸ выкл, 🧪 тест / 🔴 реально
+                 (своё, независимо от основной стратегии), уровни цены и $ на уровень
+  📊 Статистика · 📤 Файлы
+  🔴 Включить LIVE (с подтверждением) / 🧪 Выключить LIVE
 
-Управлять может только чат из TELEGRAM_CHAT_ID.
+Реальная ставка уходит, только если монета включена и 🔴, а бот в 🔴 LIVE.
+Изменения пишутся в runtime_state (SQLite) и переживают рестарт, если база
+на постоянном томе. Управлять может только чат из TELEGRAM_CHAT_ID.
 """
 from __future__ import annotations
-import asyncio
 import logging
+import re
 import time
 
 from telegram import Update, InlineKeyboardButton as Btn, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 from config import settings
-from src import archive, gamma, live, runtime_state, storage, study, text
+from src import late_bot, runtime_state, storage
 
 log = logging.getLogger("telegram")
 
 _app: Application | None = None
 TG_TEXT_LIMIT = 4096
-TOP_CITY_RULES = 8
-TOP_ALL_RULES = 4
-VOLUME_PRESETS = (0.0, 2000.0, 5000.0, 20000.0)
-MIN_N_PRESETS = (20, 30, 50, 100)
-STAKE_PRESETS = (5.0, 10.0, 20.0, 50.0)
-DAYS_PRESETS = (60, 120, 240, 365)
-MIN_EV_PRESETS = (0.0, 1.0, 2.0, 3.0, 5.0)
-_tasks: set = set()
 
 
-def _fit(s: str) -> str:
-    return s if len(s) <= TG_TEXT_LIMIT else s[:TG_TEXT_LIMIT - 2].rstrip() + "\n…"
+def _fit(text: str) -> str:
+    """Не длиннее лимита Telegram (иначе экран не откроется вовсе)."""
+    return text if len(text) <= TG_TEXT_LIMIT else text[:TG_TEXT_LIMIT - 2].rstrip() + "\n…"
 
 
 def _menu(*rows) -> InlineKeyboardMarkup:
@@ -51,344 +49,662 @@ def _mark(ok: bool) -> str:
     return "✅ " if ok else ""
 
 
-def _spawn(coro) -> None:
-    t = asyncio.create_task(coro)
-    _tasks.add(t)
-    t.add_done_callback(_tasks.discard)
+def _same(a: float, b: float) -> bool:
+    return abs(a - b) < 1e-9
 
 
-# ------------------------------------------------------------- строки-сводки ----
+# ------------------------------------------------------------ главное меню ----
 
-def archive_line() -> str:
-    c = storage.archive_counts()
-    done = c["status"].get("done", 0)
-    s = (f"📚 Архив: {text.n_events(done)} с историей цены ({text.n_cities(c['cities'])}; "
-         f"макс {c['kinds'].get('high', 0)}, мин {c['kinds'].get('low', 0)})")
-    if c["first"]:
-        s += f", {c['first'][8:10]}.{c['first'][5:7]} … {c['last'][8:10]}.{c['last'][5:7]}"
-    p = archive.progress()
-    if p["phase"] == "discover":
-        s += f"; ищу события ({p['window']})"
-    elif p["phase"] == "paths" and p["paths_total"]:
-        s += f"; качаю историю: {text.thousands(p['paths_done'])}/{text.thousands(p['paths_total'])} корзин"
-        eta = archive.eta_sec()
-        if eta is not None:
-            s += f", осталось ~{text.duration(eta)}"
-    elif not runtime_state.get("archive_enabled"):
-        s += "; докачка ⏸"
-    return s
+def coins_line() -> str:
+    return " · ".join(f"{a.upper()} {'✅' if runtime_state.is_asset_enabled(a) else '⏸'}"
+                      f"{'🔴' if runtime_state.is_asset_live(a) else '🧪'}" for a in settings.ASSETS)
 
 
-def study_line() -> str:
-    sm = study.summary()
-    if study.is_running():
-        return "📊 Пороги: считаю…"
-    if not sm:
-        return "📊 Пороги: ещё не считались — нужен архив"
-    return (f"📊 Пороги: {text.utc(sm['computed'])} UTC — {text.n_events(sm['events'])}, "
-            f"расчётных ставок: {text.thousands(sm['bets'])}; проверенных правил: {sm['rules']}")
-
-
-def candidates_line() -> str:
+def _day_line() -> str:
     day = int(time.time() // 86400) * 86400
-    st, today = live.paper_stats(0), live.paper_stats(day)
-    s = f"🎯 Кандидаты: сегодня {today['n']}, всего {st['n']}"
-    if st["settled"]:
-        s += f"; тестовые ставки: выигр. {st['wins']}/{st['settled']}, {st['pnl']:+.2f} $"
-    if not runtime_state.get("alerts_enabled"):
-        s += " (сообщения ⏸)"
-    elif runtime_state.get("alerts_hourly"):
-        s += " (сообщения — сводкой раз в час)"
-    return s
+
+    def part(st: dict) -> str:
+        if not st["bets"]:
+            return "ставок нет"
+        s = late_bot.bets_text(st["bets"])
+        if st["settled"]:
+            s += f", выигр. {st['wins']}/{st['settled']}, {st['pnl']:+.2f} $"
+        return s
+    test, real = late_bot.trade_stats(day, live=False), late_bot.trade_stats(day, live=True)
+    line = f"Сегодня (UTC): тест — {part(test)}"
+    if real["bets"] or late_bot.live_coins():
+        line += f"; реальные — {part(real)}"
+    add = late_bot.addon_stats(day, live=False)
+    if add["bets"]:
+        line += f"; докупка (тест) — {late_bot.buys_text(add['bets'])}" + (
+            f", {add['pnl']:+.2f} $" if add["settled"] else "")
+    return line
 
 
-# ------------------------------------------------------------------ экраны ----
-
-def metar_line() -> str:
-    from src import metar_feed
-    m = metar_feed.stats()
-    if not settings.METAR_ENABLED:
-        return "📡 METAR: выключен"
-    s = (f"📡 METAR: наблюдений {text.thousands(storage.metar_count())} по {m['stations']} станциям"
-         + (f" (источник {m['source']})" if m["source"] else ""))
-    if m["last_poll"]:
-        s += f", опрос {text.utc(m['last_poll'], '%H:%M')} UTC"
-    if m["last_error"] and not m["source"]:
-        s += f"; ⚠️ {m['last_error']}"
-    return s
-
-
-def forecast_line() -> str:
-    from src import forecast_feed
-    f = forecast_feed.stats()
-    if not settings.FORECAST_ENABLED:
-        return "🔮 Прогноз: выключен"
-    s = f"🔮 Прогноз: строк {text.thousands(storage.forecast_count())}"
-    if f["last_run"]:
-        s += f", прогон {text.utc(f['last_run'], '%H:%M')} UTC по {f['ok_cities']}/{f['cities']} городам"
-    if f["last_error"] and not f["ok_cities"]:
-        s += f"; ⚠️ {f['last_error']}"
-    return s
+def stake_text() -> str:
+    s = late_bot.stop()
+    return (f"{late_bot.stakes_text()} (не меньше 5 акций)"
+            + (f", дневной стоп реальных −${s:g}" if s > 0 else ", без дневного стопа"))
 
 
 def main_text() -> str:
-    ls = live.stats()
-    lines = ["🌡 Погодный бот Polymarket — архив температурных рынков, пороги цены и кандидаты", "",
-             archive_line(), study_line(), candidates_line(), metar_line(), forecast_line()]
-    if ls["last_poll"]:
-        lines.append(f"Открытых температурных событий: {ls['open_events']} (проверка {text.utc(ls['last_poll'], '%H:%M')} UTC)")
-    if ls["last_error"]:
-        lines.append(f"⚠️ Кандидаты: {ls['last_error']}")
+    lines = [
+        "⏱ Поздний вход 5m — ставка на сторону, которая за ~3 минуты до конца уже далеко от страйка",
+        "",
+        "Режим: " + late_bot.mode_text(),
+        f"Правило: {'✅' if late_bot.enabled() else '⏸ выключено —'} {late_bot.rule_short()}; {stake_text()}",
+        f"➕ Докупка: {late_bot.addon_short()}",
+        "Монеты: " + coins_line(),
+        _day_line(),
+    ]
+    why = late_bot.live_blocked() if late_bot.live_coins() and not runtime_state.get("dry_run") else None
+    if why:
+        lines.append(f"⚠️ Реальные ставки сейчас не уходят: {why}")
+    if not settings.USE_LIVE_BOOK_STREAM:
+        lines.append("⚠️ USE_LIVE_BOOK_STREAM=false — без живого стакана ставок не будет.")
+    lines += late_bot.feed_warnings()
     return "\n".join(lines)
 
 
 def main_markup() -> InlineKeyboardMarkup:
+    live_btn = (Btn("🔴 Включить LIVE", callback_data="lv") if runtime_state.get("dry_run")
+                else Btn("🧪 Выключить LIVE (в DRY RUN)", callback_data="lv"))
     return _menu(
-        (Btn("📊 Пороги", callback_data="th"), Btn("🏙 Города", callback_data="ci")),
-        (Btn("🎯 Кандидаты", callback_data="ca"), Btn("📚 Архив", callback_data="ar")),
-        (Btn("📤 Файлы", callback_data="fx"), Btn("⚙️ Настройки", callback_data="se")),
+        (Btn("⚙️ Настройки", callback_data="se"), Btn("🪙 Монеты", callback_data="co"),
+         Btn("➕ Докупка", callback_data="ad")),
+        (Btn("📊 Статистика", callback_data="sta"), Btn("📤 Файлы", callback_data="fx")),
+        (live_btn,),
         (Btn("🔄 Обновить", callback_data="m"),),
     )
 
 
-def thresholds_text(head: str = "") -> str:
-    sm = study.summary()
-    lines = ([head, ""] if head else []) + ["📊 Пороги"]
-    if not sm:
-        lines.append("Ещё не считались: архив качается — пороги посчитаются сами по ходу (или «♻️ Пересчитать»).")
-        return "\n".join(lines)
-    lines += [
-        f"Расчёт {text.utc(sm['computed'])} UTC: {text.n_events(sm['events'])} ({text.n_cities(sm['cities'])}), "
-        f"{sm['first']} … {sm['last']}, объём события от {text.usd(sm['min_volume'])}.",
-        f"Проверено = не меньше {sm['min_n']} ставок; до {sm['split']} выигрышей значимо больше окупаемости "
-        f"(случайно — с вероятностью ≤ {sm.get('max_p', 0.05):g}), после — в плюсе.",
-        "«YES от 0.90» — цена корзины впервые дошла до 0.90 (побыв ниже); вход — цена "
-        f"+{sm['slip']:g} (ask), комиссия {sm['fee_rate']:g}×(1−цена). Время — местное в городе.",
-        ""]
-    rules = study.rules()
-    active = [r for r in rules if r.get("active")]
-    if active:
-        city_rules, all_rules = study.top_rules(TOP_CITY_RULES, cities=True), study.top_rules(TOP_ALL_RULES, cities=False)
-        lines.append(f"Правил для кандидатов: {len(active)} из {len(rules)} проверенных — в окне времени, и только "
-                     "если то же правило проверено и по всем городам (у одного города «перевес» там, где у всех "
-                     "его нет, — скорее везение). Повторы скрыты. Лучшие по доходу в день:")
-        if city_rules:
-            lines += ["", "По городам:"] + [f"{i}. {study.rule_text(r)}" for i, r in enumerate(city_rules, 1)]
-        if all_rules:
-            lines += ["", "Все города вместе:"] + [f"{i}. {study.rule_text(r)}" for i, r in enumerate(all_rules, 1)]
-    elif rules:
-        lines.append(f"Проверенных ячеек: {len(rules)}, но правил для кандидатов нет: ни одно не подтверждено "
-                     "по всем городам в своём окне времени.")
-    else:
-        lines.append("Проверенных правил пока нет — архив мал или перевеса нет.")
+# ----------------------------------------------------------------- монеты ----
+
+def coins_text() -> str:
+    lines = ["🪙 Монеты",
+             "✅ — бот ставит по монете, ⏸ — нет (окна всё равно пишутся — чтобы потом выбрать монеты по архивам).",
+             "🧪 — только тестовые ставки, 🔴 — ещё и реальные, когда бот в 🔴 LIVE.",
+             "💵 — сумма входа монеты: общая (⚙️), своя фиксированная $ или % от банка.",
+             "🏦 — у монеты свой банк: растёт и падает только от её реальных ставок (задаётся в 💵).",
+             "⬆️/⬇️ — реальные ставки по монете только UP / только DOWN (тест — по обеим сторонам; задаётся в 💵).",
+             ""] + late_bot.coin_lines() + ["", "Режим: " + late_bot.mode_text()]
+    warn = late_bot.banks_warning()
+    if warn:
+        lines.append(warn)
     return "\n".join(lines)
 
 
-def thresholds_markup() -> InlineKeyboardMarkup:
-    return _menu((Btn("📋 Все города по уровням", callback_data="tho"), Btn("🏙 По городам", callback_data="ci")),
-                 (Btn("♻️ Пересчитать", callback_data="thr"), BACK))
+def coins_markup() -> InlineKeyboardMarkup:
+    rows = []
+    for a in settings.ASSETS:
+        on, live = runtime_state.is_asset_enabled(a), runtime_state.is_asset_live(a)
+        rows.append((Btn(f"{a.upper()} {'✅ вкл' if on else '⏸ выкл'}", callback_data=f"c:on:{a}"),
+                     Btn(f"{'🔴 реально' if live else '🧪 тест'}{late_bot.side_mark(a)}", callback_data=f"c:lv:{a}"),
+                     Btn(f"💵 {late_bot.stake_button(a)}", callback_data=f"cs:{a}")))
+    rows.append((Btn("🔄 Обновить", callback_data="co"), BACK))
+    return _menu(*rows)
 
 
-def overview_text() -> str:
-    if study.cells() is None:
-        return "📋 Все города по уровням — таблица появится после расчёта в этом запуске (♻️ Пересчитать)."
-    sm = study.summary() or {}
-    head = ("📋 Все города — доход на ставку по времени касания: «за 2+ дня» — рынок только открылся "
-            "(события выставляют за ~1.5–2 суток), «накануне», «в день» рынка (местное время). Вход — цена "
-            f"касания + {sm.get('slip', settings.STUDY_SLIP):g}, с комиссией; в скобках — ставок; "
-            "✅ — по этому окну ищутся кандидаты.")
-    return "\n".join([head, ""] + study.overview_lines())
+# ------------------------------------------------- сумма входа монеты 💵 ----
 
-
-def cities_text() -> str:
-    rows = storage.city_stats(float(runtime_state.get("min_event_volume")))
-    if not rows:
-        return "🏙 Города — архив ещё пуст."
-    lines = ["🏙 Города архива (событий макс/мин, средний объём события). 🎯 — кандидаты по городу; "
-             "⏸ — выключены; ▫️ — объём меньше порога, в расчёт не входит.", ""]
-    for d in rows:
-        mark = ("🎯" if runtime_state.city_alerts_on(d["city_key"]) else "⏸") + ("" if d["in_study"] else "▫️")
-        vol = max(d["vol_high"], d["vol_low"])
-        tz = "" if d["tz_ok"] else " · пояс? (UTC)"
-        lines.append(f"{mark} {d['city']}: {d['high']}/{d['low']}, ~{text.usd(vol)}{tz}")
-    return "\n".join(lines)
-
-
-def cities_markup() -> InlineKeyboardMarkup:
-    rows = storage.city_stats(float(runtime_state.get("min_event_volume")))
-    btns = [Btn(d["city"], callback_data=f"cy:{d['city_key']}"[:64]) for d in rows[:60]]
-    grid = [tuple(btns[i:i + 3]) for i in range(0, len(btns), 3)]
-    return _menu(*grid, (Btn("🔄 Обновить", callback_data="ci"), BACK))
-
-
-def city_text(key: str, head: str = "") -> str:
-    rows = [d for d in storage.city_stats() if d["city_key"] == key]
-    if not rows:
-        return "Нет такого города в архиве."
-    d = rows[0]
+def coin_stake_text(asset: str, head: str = "") -> str:
+    lb = late_bot
+    mode, _value = lb.stake_rule(asset)
+    a = asset.upper()
     lines = ([head, ""] if head else []) + [
-        f"🏙 {d['city']} — станция {d['station'] or '?'}, пояс {d['tz']}" + ("" if d["tz_ok"] else " (не знаю пояс — UTC)"),
-        "Событий: " + ", ".join(f"{name} {d[k]} (~{text.usd(d['vol_' + k])})" for k, name in
-                                (("high", "макс"), ("low", "мин")) if d[k]) + ".",
-        f"Кандидаты: {'🎯 вкл' if runtime_state.city_alerts_on(key) else '⏸ выкл'}.", ""]
-    if study.cells() is None:
-        lines.append("Пороги по городу появятся после расчёта в этом запуске (📊 → ♻️ Пересчитать).")
+        f"💵 {a} — сумма входа",
+        f"Сейчас: {lb.stake_label(asset)}" + (" (как в ⚙️ Настройках)" if mode == "общая" else "") + ".",
+        "",
+        f"• общая — как в ⚙️ Настройках (сейчас ${lb.stake():g});",
+        "• $ — своя фиксированная сумма;",
+        f"• % — доля банка в момент входа: своего банка {a} (🏦), а если его нет — общего (баланс кошелька "
+        "Polymarket, читается раз в минуту; не читается — заданный вручную; неизвестен — общая сумма).",
+        "",
+        f"🏦 Свой банк {a} — отдельный счёт монеты: задаёшь сумму, дальше он растёт и падает только от "
+        f"реальных ставок {a}. Ставка не больше свободных денег банка; кончились — реальные ставки по {a} "
+        "не идут (тест идёт), пока не задашь банк заново.",
+        "Меньше 5 акций биржа не берёт (при цене 0.95 это ~$4.8) — ставка будет не меньше. Тестовые ставки "
+        "считаются с той же суммой.",
+        "",
+        f"🎯 Сторона реальных ставок {a}: {lb.side_label(asset)}. Тестовые ставки идут по обеим сторонам — "
+        "в 📊 и в отчёте видно, как сыграла бы выключенная.",
+        "",
+        lb.coin_bank_line(asset),
+        lb.bank_line(),
+    ]
+    return "\n".join(lines)
+
+
+def coin_stake_markup(asset: str) -> InlineKeyboardMarkup:
+    lb = late_bot
+    mode, value = lb.stake_rule(asset)
+    own = runtime_state.coin_bank(asset)
+    return _menu(
+        (Btn(_mark(mode == "общая") + f"общая (${lb.stake():g})", callback_data=f"csg:{asset}"),),
+        tuple(Btn(_mark(mode == "usd" and _same(value, v)) + f"${v:g}", callback_data=f"csu:{asset}:{v:g}")
+              for v in lb.STAKE_PRESETS) + (Btn("✏️ $", callback_data=f"in:cu:{asset}"),),
+        tuple(Btn(_mark(mode == "pct" and _same(value, v)) + f"{v:g}%", callback_data=f"csp:{asset}:{v:g}")
+              for v in lb.PCT_PRESETS) + (Btn("✏️ %", callback_data=f"in:cp:{asset}"),),
+        (Btn(f"🏦 ✏️ свой банк {asset.upper()}", callback_data=f"in:cb:{asset}"),)
+        + ((Btn("🏦 ✖️ убрать свой банк", callback_data=f"cbx:{asset}"),) if own else ()),
+        (Btn("🏦 ✏️ общий банк вручную", callback_data=f"in:bank:{asset}"),),
+        tuple(Btn(_mark(runtime_state.coin_side(asset) == s) + label, callback_data=f"csd:{asset}:{s or 'both'}")
+              for s, label in ((None, "🎯 обе"), ("UP", "⬆️ только UP"), ("DOWN", "⬇️ только DOWN"))),
+        (Btn("◀️ Монеты", callback_data="co"), BACK),
+    )
+
+
+COIN_PROMPTS = {
+    "cu": "✏️ {A}: своя сумма входа в $ — например «15» или «7.5» (от 1 до 1000).",
+    "cp": "✏️ {A}: сумма входа в % от банка — например «3» или «2.5» (от 0.1 до 100).",
+    "cb": "✏️ {A}: свой банк монеты в $ — например «100». С этой минуты банк {A} = эта сумма + результат её "
+          "реальных ставок. Задашь заново — счёт начнётся с новой суммы. «0» или «нет» — убрать свой банк "
+          "(ставки в % снова от общего банка).",
+    "bank": "✏️ Общий банк для ставок в % — в $, например «200». Берётся у монет без своего банка и только "
+            "если баланс кошелька прочитать нельзя. 0 — не задан.",
+}
+
+
+def coin_prompt_text(kind: str, asset: str, head: str = "") -> str:
+    lb = late_bot
+    if kind in ("cu", "cp"):
+        cur = lb.stake_label(asset)
+    elif kind == "cb":
+        cur = lb.coin_bank_short(asset)
     else:
-        cl = study.city_lines(key)
-        lines += cl if cl else ["Расчётных ставок по городу нет (мало событий или объём меньше порога)."]
-        lines.append("Доход на ставку: за 2+ дня / накануне / в день рынка; в скобках — ставок. ✅ — в этом окне "
-                     "по городу ищутся кандидаты (своё правило или правило всех городов, если у города не минус).")
-    return "\n".join(lines)
+        manual = float(runtime_state.get("late_bank_manual") or 0)
+        cur = f"${manual:g}" if manual > 0 else "не задан"
+    return ((head + "\n\n") if head else "") + COIN_PROMPTS[kind].format(A=asset.upper()) + f"\nСейчас: {cur}."
 
 
-def city_markup(key: str) -> InlineKeyboardMarkup:
-    on = runtime_state.city_alerts_on(key)
-    return _menu((Btn("🎯 Кандидаты: ✅ вкл" if on else "🎯 Кандидаты: ⏸ выкл", callback_data=f"ct:{key}"[:64]),),
-                 (Btn("◀️ Города", callback_data="ci"), BACK))
+def apply_coin_stake(asset: str, mode: str | None, value: float | None = None) -> str:
+    runtime_state.set_coin_stake(asset, mode, value)
+    return f"✅ {asset.upper()}: сумма входа — {late_bot.stake_label(asset)}."
 
 
-def candidates_text() -> str:
-    st, week = live.paper_stats(0), live.paper_stats(int(time.time()) - 7 * 86400)
-    mode = ("⏸ выкл" if not runtime_state.get("alerts_enabled")
-            else ("🕐 сводкой раз в час" if runtime_state.get("alerts_hourly") else "⚡ сразу"))
-    lines = ["🎯 Кандидаты — цена стороны впервые дошла до уровня из правила для этого окна времени.",
-             f"Сообщения: {mode}; правила: "
-             + ("только самого города" if runtime_state.get("alerts_city_only") else "города и «все города»")
-             + "; стороны: " + {"yes": "только YES", "no": "только NO"}.get(str(runtime_state.get("alerts_sides")), "YES и NO")
-             + f"; тестовая ставка ${runtime_state.get('paper_stake'):g}.",
-             f"Кандидат — только если по цене покупки ожидаемо от {runtime_state.get('alert_min_ev'):+g}% на ставку "
-             "(по проценту выигрышей правила: правило «NO от 0.90» собрано из входов около 0.92, и по 0.99 те же "
-             "98% — уже минус). Цена покупки — средняя по стакану на всю тестовую ставку; в стакане не хватает до "
-             f"лучшей цены + {live.FILL_MAX_SLIP:g} — не кандидат."
-             + _skipped_text(), ""]
-    sm = study.summary() or {}
-    if sm and not study.ready():
-        lines[-1:-1] = [f"⏳ Пороги посчитаны по неполному архиву ({100 * float(sm.get('archive_share', 0)):.0f}% "
-                        "событий) — кандидаты появятся, когда архив докачается."]
-    for name, s in (("Всего", st), ("За 7 дней", week)):
-        line = f"{name}: {s['n']} {text.plural(s['n'], 'кандидат', 'кандидата', 'кандидатов')}"
-        if s["settled"]:
-            line += (f", с итогом {s['settled']}: выигр. {s['wins']} ({100 * s['wins'] / s['settled']:.0f}%), "
-                     f"{s['pnl']:+.2f} $" + (f" ({100 * s['pnl'] / s['staked']:+.1f}%)" if s["staked"] else ""))
-        lines.append(line)
-    by_win = [(w, x) for w, x in live.paper_by_window(int(time.time()) - 7 * 86400) if x["settled"]]
-    if by_win:
-        lines += ["", "За 7 дней по окнам времени (с итогом):"]
-        for w, x in by_win:
-            lines.append(f"  {w}: {x['settled']}, выигр. {x['wins']} ({100 * x['wins'] / x['settled']:.0f}%), "
-                         f"{x['pnl']:+.2f} $" + (f" ({100 * x['pnl'] / x['staked']:+.1f}%)" if x["staked"] else ""))
-    recent = storage.candidates(limit=10)
-    if recent:
-        lines += ["", "Последние:"]
-        for c in recent:
-            res = "⏳" if c["outcome"] is None else ("🟢" if (c["outcome"] == 1) == (c["side"] == "YES") else "🔴")
-            pnl = f" {c['pnl']:+.2f} $" if c["pnl"] is not None else ""
-            lines.append(f"{res} {text.utc(c['ts'])} {c['city'] or '?'} {study.KIND_RU.get(c['kind'], '')} "
-                         f"{(c['date'] or '')[8:10]}.{(c['date'] or '')[5:7]} «{c['bucket'] or c['idx']}» {c['side']} "
-                         f"по {c['entry']:.3f}{pnl}")
-    return "\n".join(lines)
+def apply_coin_side(asset: str, side: str | None) -> str:
+    runtime_state.set_coin_side(asset, side)
+    a = asset.upper()
+    if side is None:
+        return f"✅ {a}: реальные ставки по обеим сторонам."
+    return (f"✅ {a}: реальные ставки только {side}. Тестовые идут по обеим — в 📊 и в отчёте видно, "
+            f"как сыграла бы {'DOWN' if side == 'UP' else 'UP'}.")
 
 
-def _skipped_text() -> str:
-    st = live.stats()
-    parts = [f"слабых по цене {st['weak']}" if st["weak"] else "",
-             f"тонкий стакан {st['thin']}" if st["thin"] else "",
-             f"цена ушла {st['moved']}" if st["moved"] else "",
-             f"архив ещё качается {st['not_ready']}" if st["not_ready"] else ""]
-    parts = [p for p in parts if p]
-    return (" Отсеяно с запуска: " + ", ".join(parts) + ".") if parts else ""
+def apply_coin_bank(asset: str, value: float | None) -> str:
+    a = asset.upper()
+    if not value or value <= 0:
+        runtime_state.set_coin_bank(asset, None)
+        return f"✅ {a}: свой банк убран — ставки в % считаются от общего банка."
+    runtime_state.set_coin_bank(asset, round(value, 2))
+    return f"✅ {a}: свой банк ${value:g} — с этой минуты он растёт и падает только от реальных ставок {a}."
 
 
-def candidates_markup() -> InlineKeyboardMarkup:
-    on, hourly = bool(runtime_state.get("alerts_enabled")), bool(runtime_state.get("alerts_hourly"))
-    return _menu(
-        (Btn(_mark(on and not hourly) + "⚡ сразу", callback_data="cam:now"),
-         Btn(_mark(on and hourly) + "🕐 раз в час", callback_data="cam:hour"),
-         Btn(_mark(not on) + "⏸ выкл", callback_data="cam:off")),
-        (Btn(_mark(not runtime_state.get("alerts_city_only")) + "город + все города", callback_data="cac:0"),
-         Btn(_mark(bool(runtime_state.get("alerts_city_only"))) + "только город", callback_data="cac:1")),
-        tuple(Btn(_mark(runtime_state.get("alerts_sides") == k) + name, callback_data=f"cas:{k}")
-              for k, name in (("both", "YES и NO"), ("yes", "только YES"), ("no", "только NO"))),
-        tuple(Btn(_mark(abs(float(runtime_state.get("alert_min_ev")) - v) < 1e-9) + f"от {v:+g}%", callback_data=f"cae:{v:g}")
-              for v in MIN_EV_PRESETS),
-        (Btn("🔄 Обновить", callback_data="ca"), BACK))
+def apply_coin_input(kind: str, asset: str, text: str) -> str:
+    if kind == "cu":
+        return apply_coin_stake(asset, "usd", parse_number(text.replace("$", ""), *runtime_state.STAKE_LIMITS,
+                                                           allow_off=False))
+    if kind == "cp":
+        return apply_coin_stake(asset, "pct", parse_number(text.replace("%", ""), *runtime_state.PCT_LIMITS,
+                                                           allow_off=False))
+    if kind == "cb":
+        return apply_coin_bank(asset, parse_number(text.replace("$", ""), *runtime_state.BANK_LIMITS))
+    if kind == "bank":
+        v = parse_number(text.replace("$", ""), *runtime_state.BANK_LIMITS)
+        runtime_state.set("late_bank_manual", round(v, 2))
+        return (f"✅ Банк вручную: ${v:g} — для ставок в %, если баланс кошелька не читается." if v > 0
+                else "✅ Банк вручную не задан.")
+    raise ValueError("неизвестная настройка")
 
 
-def archive_text(head: str = "") -> str:
-    c = storage.archive_counts()
-    p = archive.progress()
-    lines = ([head, ""] if head else []) + [
-        archive_line(),
-        f"Глубина: {runtime_state.get('archive_days')} дн.; докачка {'✅ вкл' if runtime_state.get('archive_enabled') else '⏸ выкл'}, "
-        f"раз в {settings.ARCHIVE_REFRESH_HOURS:g} ч.",
-        f"Закрытых событий найдено: {c['events']} (без истории: {c['status'].get('new', 0)}, ошибок: "
-        f"{c['status'].get('error', 0)}); открытых в базе: {c['open']}."]
-    vmin = float(runtime_state.get("min_event_volume"))
-    big, small = storage.pending_by_volume(vmin)
-    if big or small:
-        lines.append(f"В очереди: {text.n_events(big)} с объёмом от {text.usd(vmin)} (качаются первыми — они и идут "
-                     "в расчёт)" + (f" и {small} мелких." if small else "."))
-    if c["fidelity"]:
-        tot = sum(c["fidelity"].values())
-        parts = ", ".join(f"{k} мин — {100 * v / tot:.0f}%" for k, v in sorted(c["fidelity"].items()))
-        lines.append(f"Шаг истории цены: {parts}; корзин без истории: {c['no_path']}.")
-    if p["started"]:
-        lines.append(f"Последний проход: начат {text.utc(p['started'])} UTC"
-                     + (f", закончен {text.utc(p['finished'])}" if p["finished"] and p["phase"] == "idle" else "")
-                     + f"; найдено {p['found']}, новых {p['new']}, скачано {p['events_done']}, ошибок {p['errors']}.")
-    if p["last_error"]:
-        lines.append(f"Последняя ошибка: {p['last_error']}")
-    st = gamma.strategy_stats()
-    if st:
-        lines.append("Поиск событий: " + "; ".join(
-            f"{k} — {v['events']}" + (f" (ошибка: {v['error'][:60]})" if v["error"] else "") for k, v in st.items()))
-    from src import http_api
-    hs = http_api.stats()
-    lines.append(f"Запросов к API: {hs['requests']}, повторов {hs['retries']}, ошибок {hs['errors']}.")
-    return "\n".join(lines)
-
-
-def archive_markup() -> InlineKeyboardMarkup:
-    days = int(runtime_state.get("archive_days"))
-    return _menu(
-        (Btn("🔄 Докачать сейчас", callback_data="ars"),
-         Btn("⏸ Пауза докачки" if runtime_state.get("archive_enabled") else "▶️ Включить докачку", callback_data="are")),
-        tuple(Btn(_mark(days == d) + f"{d} дн.", callback_data=f"ard:{d}") for d in DAYS_PRESETS),
-        (Btn("🔄 Обновить", callback_data="ar"), BACK))
-
+# --------------------------------------------------------------- настройки ----
 
 def settings_text(head: str = "") -> str:
-    return "\n".join(([head, ""] if head else []) + [
-        "⚙️ Настройки",
-        f"• Объём события от {text.usd(runtime_state.get('min_event_volume'))} — события поменьше в расчёт порогов "
-        "не входят (тонкий стакан, цена мало что значит).",
-        f"• Правило проверено, если ставок не меньше {runtime_state.get('rule_min_n')}, на старой части архива "
-        f"(60% дней) выигрышей значимо больше окупаемости (p ≤ {settings.RULE_MAX_P:g}), на новой — в плюсе.",
-        f"• Тестовая ставка на кандидата: ${runtime_state.get('paper_stake'):g}.",
-        "Смена объёма или числа ставок — пороги пересчитаются сразу."])
+    lines = ([head, ""] if head else []) + [
+        "⚙️ Настройки ⏱",
+        f"Правило: {late_bot.rule_text()}.",
+        f"Ставка: {stake_text()}.",
+        "Стратегия: " + ("✅ включена" if late_bot.enabled() else "⏸ выключена — ставок нет, окна пишутся"),
+        f"➕ Докупка на откате: {late_bot.addon_short()} (кнопка ниже).",
+        "",
+        "• Окно входа — сколько осталось до конца 5-минутного окна. Бот проверяет раз в секунду и входит на "
+        "первой секунде окна, где выполнены все условия; одна ставка на окно, держим до конца.",
+        "• Цена — ask стороны, которая сейчас выигрывает (цена Chainlink выше страйка — UP, ниже — DOWN). "
+        "Ордер — не дороже ask + 1¢.",
+        "• До страйка — насколько цена Chainlink ушла от страйка (цены на начало окна): в % и в ATR "
+        "(Wilder ATR(7) по 1-минутным свечам Binance).",
+        "• ✏️ — своё значение сообщением (окно, цена, %, ATR, сумма, стоп).",
+        "",
+        "На данных 25.09–20.10: 3:00–3:10, 0.92–0.95, ≥0.10% и ≥2 ATR — 232 ставки, 98.3% выигрышей; соседние "
+        "окна (2:50–3:10, 3:00–3:20) — 96.7–97.7%. Окупаемость при цене ~0.94 — от ~95% выигрышей.",
+    ]
+    return "\n".join(lines)
+
+
+def _window_label(a: int, b: int) -> str:
+    hi, lo = max(a, b), min(a, b)
+    return late_bot.mmss(lo) if hi == lo else f"{late_bot.mmss(lo)}–{late_bot.mmss(hi)}"
 
 
 def settings_markup() -> InlineKeyboardMarkup:
-    vol, mn, stake = (float(runtime_state.get("min_event_volume")), int(runtime_state.get("rule_min_n")),
-                      float(runtime_state.get("paper_stake")))
+    lb = late_bot
+    cur_w = (int(runtime_state.get("late_from_sec")), int(runtime_state.get("late_to_sec")))
+    pl, ph = lb.price_range()
+    dist, atr, stake, stop = lb.min_dist(), lb.min_atr(), lb.stake(), lb.stop()
     return _menu(
-        tuple(Btn(_mark(abs(vol - v) < 1e-9) + ("любой объём" if not v else f"от {text.usd(v)}"),
-                  callback_data=f"sv:{v:g}") for v in VOLUME_PRESETS),
-        tuple(Btn(_mark(mn == v) + f"≥{v} ставок", callback_data=f"sn:{v}") for v in MIN_N_PRESETS),
-        tuple(Btn(_mark(abs(stake - v) < 1e-9) + f"${v:g}", callback_data=f"sp:{v:g}") for v in STAKE_PRESETS),
-        (Btn("🔄 Обновить", callback_data="se"), BACK))
+        (Btn("⏱ ✅ включена" if lb.enabled() else "⏱ ⏸ выключена", callback_data="set"),),
+        tuple(Btn(_mark(cur_w == (a, b)) + _window_label(a, b), callback_data=f"sw:{a}:{b}")
+              for a, b in lb.WINDOW_PRESETS) + (Btn("✏️ окно", callback_data="in:win"),),
+        tuple(Btn(_mark(_same(pl, a) and _same(ph, b)) + f"{a:.2f}–{b:.2f}", callback_data=f"sp:{a:.2f}:{b:.2f}")
+              for a, b in lb.PRICE_PRESETS) + (Btn("✏️ цена", callback_data="in:price"),),
+        tuple(Btn(_mark(_same(dist, v)) + f"≥{v:g}%", callback_data=f"sd:{v:g}") for v in lb.DIST_PRESETS)
+        + (Btn("✏️ %", callback_data="in:dist"),),
+        tuple(Btn(_mark(_same(atr, v)) + (f"≥{v:g} ATR" if v else "без ATR"), callback_data=f"sa:{v:g}")
+              for v in lb.ATR_PRESETS) + (Btn("✏️ ATR", callback_data="in:atr"),),
+        tuple(Btn(_mark(_same(stake, v)) + f"${v:g}", callback_data=f"su:{v:g}") for v in lb.STAKE_PRESETS)
+        + (Btn("✏️ $", callback_data="in:stake"),),
+        tuple(Btn(_mark(_same(stop, v)) + (f"стоп ${v:g}" if v else "без стопа"), callback_data=f"ss:{v:g}")
+              for v in lb.STOP_PRESETS) + (Btn("✏️ стоп", callback_data="in:stop"),),
+        (Btn(f"➕ Докупка: {_addon_button()}", callback_data="ad"),),
+        (Btn("🔄 Обновить", callback_data="se"), BACK),
+    )
 
 
-# ----------------------------------------------------------------- действия ----
+# ------------------------------------------------------------ ➕ докупка ----
 
-async def _recompute(reason: str) -> None:
+def _levels_label(levels) -> str:
+    """Кнопка уровней: «0.95…0.90» (подряд по центу) или «0.95·0.93·0.91»."""
+    lv = sorted(levels, reverse=True)
+    if len(lv) >= 3 and all(abs(a - b - 0.01) < 1e-6 for a, b in zip(lv, lv[1:])):
+        return f"{lv[0]:.2f}…{lv[-1]:.2f}"
+    return "·".join(f"{x:.2f}" for x in lv)
+
+
+def _same_levels(a, b) -> bool:
+    a, b = sorted(a, reverse=True), sorted(b, reverse=True)
+    return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
+
+
+def _addon_button() -> str:
+    lb = late_bot
+    if not lb.addon_on():
+        return "⏸ выкл"
+    return f"{'🔴' if lb.addon_live() else '🧪'} ${lb.addon_usd():g} · {_levels_label(lb.addon_levels())}"
+
+
+def _live_addon_range() -> tuple[float, float, float]:
+    """(меньше всего, больше всего на уровень, на все уровни) — реальная докупка с учётом 5 акций."""
+    per = [late_bot.addon_live_usd(x) for x in late_bot.addon_levels()] or [late_bot.addon_usd()]
+    return min(per), max(per), sum(per)
+
+
+def _live_each() -> str:
+    """Сколько реально на уровень: «$10» или «~$4.51–$4.76 (меньше 5 акций биржа не берёт)»."""
+    lo, hi, _total = _live_addon_range()
+    usd = late_bot.addon_usd()
+    if hi <= usd + 0.005:
+        return f"${usd:g}"
+    return f"~${lo:.2f}–${hi:.2f} (меньше 5 акций биржа не берёт, поэтому не ${usd:g})"
+
+
+def addon_text(head: str = "") -> str:
+    lb = late_bot
+    _lo, _hi, total = _live_addon_range()
+    lines = ([head, ""] if head else []) + [
+        "➕ Докупка на откате",
+        f"Сейчас: {lb.addon_short()}.",
+        "",
+        f"После основной ставки бот до {lb.mmss(lb.ADDON_MIN_LEFT_SEC)} до конца окна следит за ценой нашей "
+        "стороны (ask). Опустилась до уровня — докупка не дороже этого уровня; каждый уровень — один раз за окно "
+        "(провалилась сразу через несколько — докупка на каждом). Уровни не ниже цены входа пропускаются — это "
+        "не откат.",
+        "• 🧪 тест — на бумаге, по живому стакану, с комиссией тейкера; реальных ордеров нет. В итоге каждой "
+        "реальной ставки — «с тестовой докупкой было бы …».",
+        "• 🔴 реально — ещё и реальные ордера, когда по окну есть реальная основная ставка (монета 🔴, бот в "
+        f"LIVE): на уровень {_live_each()}, на все уровни — до ~${total:.2f} за окно сверх основной ставки.",
+        "Тестовая докупка идёт всегда, пока докупка ✅ (и при 🔴 тоже), — по всем включённым монетам.",
+        "",
+        "На архиве (вход 3:30–3:20 по 0.96–0.97): после сигнала цена BTC/ETH откатывала до 0.93 примерно в 40% "
+        "окон, и докупка на откате была в плюсе во всех периодах. Но проигрышные окна откатывают всегда — с "
+        "докупкой каждый проигрыш больше.",
+        "",
+    ] + lb.addon_lines()
+    return "\n".join(lines)
+
+
+def addon_markup() -> InlineKeyboardMarkup:
+    lb = late_bot
+    usd, levels = lb.addon_usd(), lb.addon_levels()
+    return _menu(
+        (Btn("✅ включена" if lb.addon_on() else "⏸ выключена", callback_data="adt"),
+         Btn("🔴 реально" if lb.addon_live() else "🧪 тест", callback_data="adl")),
+        tuple(Btn(_mark(_same(usd, v)) + f"${v:g}", callback_data=f"adu:{v:g}") for v in lb.ADDON_USD_PRESETS)
+        + (Btn("✏️ $", callback_data="in:adu"),),
+        tuple(Btn(_mark(_same_levels(levels, p)) + _levels_label(p), callback_data=f"adv:{i}")
+              for i, p in enumerate(lb.ADDON_LEVEL_PRESETS)) + (Btn("✏️ уровни", callback_data="in:adlv"),),
+        (Btn("🔄 Обновить", callback_data="ad"), Btn("◀️ Настройки", callback_data="se"), BACK),
+    )
+
+
+def confirm_addon_live_text() -> str:
+    lb = late_bot
+    _lo, _hi, total = _live_addon_range()
+    lines = ["⚠️ Включить реальную докупку?", "",
+             f"По окну, где есть реальная основная ставка, бот реально докупит на каждом уровне ({lb.levels_text()}), "
+             f"до которого откатит цена: {_live_each()} на уровень. На все уровни — до ~${total:.2f} за окно сверх "
+             "основной ставки: "
+             f"проигрыш такого окна — основная ставка + до ~${total:.2f}.",
+             "Реальные ордера — только по монетам 🔴 и когда бот в 🔴 LIVE; дневной стоп и банк монеты считают и "
+             "докупку. Тестовая докупка идёт как раньше."]
+    if runtime_state.get("dry_run"):
+        lines.append("Сейчас бот в 🧪 DRY RUN — реальных ордеров не будет, пока не включишь LIVE.")
+    return "\n".join(lines)
+
+
+ADDON_PROMPTS = {
+    "adu": "✏️ Докупка: сумма на один уровень в $ — например «1» или «2.5» (от 0.1 до 1000). Реальная докупка "
+           "всё равно не меньше 5 акций (~$4.6 при цене 0.92).",
+    "adlv": "✏️ Уровни докупки — цены через запятую или пробел: «0.95, 0.94, 0.93» или в центах «95 93 91»; "
+            "диапазон «0.95-0.90» — каждый цент. От 0.50 до 0.99, не больше 20 уровней. Уровни не ниже цены "
+            "входа бот пропускает.",
+}
+
+
+def addon_prompt_text(kind: str, head: str = "") -> str:
+    cur = f"${late_bot.addon_usd():g}" if kind == "adu" else late_bot.levels_text()
+    return ((head + "\n\n") if head else "") + ADDON_PROMPTS[kind] + f"\nСейчас: {cur}."
+
+
+def _cents(x: str) -> float:
+    v = float(x)
+    return v / 100 if v > 1 else v
+
+
+def parse_levels(text: str) -> list[float]:
+    """«0.95, 0.94, 0.93» / «95 93 91» / «0,95; 0,93» / диапазон «0.95-0.90» (каждый цент) → от большего к меньшему."""
+    t = re.sub(r"(?<!\d)0,(\d)", r"0.\1", (text or "").strip())          # десятичная запятая: «0,95»
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(?:-|–|—|\.\.\.?|…)\s*(\d+(?:\.\d+)?)\s*", t)
+    if m:
+        a, b = _cents(m.group(1)), _cents(m.group(2))
+        hi, lo = max(a, b), min(a, b)
+        vals = [round(hi - i * 0.01, 2) for i in range(int(round((hi - lo) * 100)) + 1)]
+    else:
+        vals = [_cents(x) for x in re.findall(r"\d+(?:\.\d+)?", t)]
+    if not vals:
+        raise ValueError("нужны цены — например «0.95, 0.94, 0.93»")
+    lo_lim, hi_lim = runtime_state.PRICE_LIMITS
+    for v in vals:
+        if not lo_lim - 1e-9 <= v <= hi_lim + 1e-9:
+            raise ValueError(f"{v:.2f} — вне пределов {lo_lim:.2f}–{hi_lim:.2f}")
+    out = sorted({round(v, 2) for v in vals}, reverse=True)
+    if len(out) > runtime_state.ADDON_MAX_LEVELS:
+        raise ValueError(f"уровней {len(out)} — больше {runtime_state.ADDON_MAX_LEVELS}")
+    return out
+
+
+def apply_addon_usd(v: float) -> str:
+    runtime_state.set("late_addon_usd", round(v, 2))
+    lo, hi, _total = _live_addon_range()
+    usd = late_bot.addon_usd()
+    return (f"✅ Докупка: ${usd:g} на уровень" + (f" (реальная — не меньше 5 акций, ~${lo:.2f}–${hi:.2f})"
+                                                if hi > usd + 0.005 else "") + ".")
+
+
+def apply_addon_levels(levels) -> str:
+    runtime_state.set_addon_levels(list(levels))
+    return f"✅ Уровни докупки: {late_bot.levels_text()}."
+
+
+def apply_addon_input(kind: str, text: str) -> str:
+    if kind == "adu":
+        return apply_addon_usd(parse_number(text.replace("$", ""), *runtime_state.ADDON_USD_LIMITS, allow_off=False))
+    if kind == "adlv":
+        return apply_addon_levels(parse_levels(text))
+    raise ValueError("неизвестная настройка")
+
+
+def _addon_cancel_markup() -> InlineKeyboardMarkup:
+    return _menu((Btn("❌ Отмена", callback_data="ad"),))
+
+
+def _handle_addon(cmd: str, parts: list[str]) -> tuple[str, InlineKeyboardMarkup]:
+    lb = late_bot
+    head = ""
+    if cmd == "adt":
+        runtime_state.set("late_addon_on", not lb.addon_on())
+        head = (f"➕ Докупка ✅ включена — {'🔴 реально и тест' if lb.addon_live() else '🧪 тест по стакану'}."
+                if lb.addon_on() else "➕ Докупка ⏸ выключена — ни тестовых, ни реальных докупок.")
+    elif cmd == "adl":
+        if not lb.addon_live():
+            return confirm_addon_live_text(), _menu((Btn("✅ Да, реальная докупка", callback_data="adly"),
+                                                     Btn("❌ Отмена", callback_data="ad")))
+        runtime_state.set("late_addon_live", False)
+        head = "➕ Докупка: 🧪 только тест — реальных ордеров докупки нет."
+    elif cmd == "adly" and not lb.addon_live():
+        runtime_state.set("late_addon_live", True)
+        head = "➕ Докупка: 🔴 реально — по окнам с реальной ставкой (монета 🔴, бот в LIVE)."
+        if runtime_state.get("dry_run"):
+            head += " Сейчас бот в 🧪 DRY RUN — пойдёт после «🔴 Включить LIVE»."
+        if not lb.addon_on():
+            head += " Докупка ⏸ выключена — включи кнопкой ниже."
+    elif cmd == "adu" and len(parts) == 2:
+        v = _float(parts[1])
+        if v is not None and any(_same(v, x) for x in lb.ADDON_USD_PRESETS) and not _same(v, lb.addon_usd()):
+            head = apply_addon_usd(v)
+    elif cmd == "adv" and len(parts) == 2:
+        i = int(parts[1]) if parts[1].isdigit() else -1
+        if 0 <= i < len(lb.ADDON_LEVEL_PRESETS) and not _same_levels(lb.addon_levels(), lb.ADDON_LEVEL_PRESETS[i]):
+            head = apply_addon_levels(lb.ADDON_LEVEL_PRESETS[i])
+    return addon_text(head), addon_markup()
+
+
+# ------------------------------------------------- ввод своего значения ✏️ ----
+
+_await: dict = {"kind": None}          # какое значение ждём сообщением (владелец один)
+
+PROMPTS = {
+    "win": "✏️ Окно входа — сколько осталось до конца 5-минутного окна. Пришли сообщением, например: "
+           "«3:00-3:10», «2:50-3:20» или одно время «3:00» (вход в эту секунду). Можно в секундах: «180-190». "
+           "Пределы — от 0:05 до 4:55.",
+    "price": "✏️ Цена стороны-лидера (ask) — от и до, например «0.92-0.95» (можно в центах: «92-95»). "
+             "Пределы 0.50–0.99.",
+    "dist": "✏️ Минимум до страйка в процентах — например «0.1» или «0.12». 0 — без условия.",
+    "atr": "✏️ Минимум до страйка в ATR — например «2» или «1.8». 0 — без условия по ATR.",
+    "stake": "✏️ Сумма входа в $ — например «7» или «12.5» (от 1 до 1000). Меньше 5 акций биржа не берёт: при "
+             "цене 0.95 это ~$4.8 — ставка будет не меньше.",
+    "stop": "✏️ Дневной стоп реальных ставок в $ — например «40». 0 — без стопа.",
+}
+
+_NUM = r"\d+(?:[.,]\d+)?"
+_OFF_WORDS = ("нет", "без", "выкл", "off", "no")
+
+
+def _numbers(text: str) -> list[float]:
+    return [float(x.replace(",", ".")) for x in re.findall(_NUM, text or "")]
+
+
+def parse_window(text: str) -> tuple[int, int]:
+    """«3:00-3:10» / «3:10-3:00» / «3:00» / «180-190» / «3.00-3.10» → (от, до) секунд до конца."""
+    toks = re.findall(r"\d{1,2}:\d{1,2}|" + _NUM, text or "")
+    if not 1 <= len(toks) <= 2:
+        raise ValueError("нужно одно время или два: например «3:00-3:10»")
+    secs = []
+    for tok in toks:
+        tok = tok.replace(",", ".")
+        m = re.fullmatch(r"(\d{1,2}):(\d{1,2})", tok) or re.fullmatch(r"(\d)\.(\d{2})", tok)
+        if m:
+            mi, s = int(m.group(1)), int(m.group(2))
+            if s >= 60:
+                raise ValueError(f"«{tok}»: секунд больше 59")
+            secs.append(mi * 60 + s)
+        elif re.fullmatch(r"\d+", tok):
+            secs.append(int(tok))
+        else:
+            raise ValueError(f"«{tok}» — непонятное время; пиши как «3:10»")
+    lo_lim, hi_lim = runtime_state.WINDOW_LIMITS
+    for s in secs:
+        if not lo_lim <= s <= hi_lim:
+            raise ValueError(f"{late_bot.mmss(s)} — вне пределов {late_bot.mmss(lo_lim)}–{late_bot.mmss(hi_lim)}")
+    return max(secs), min(secs)
+
+
+def parse_price(text: str) -> tuple[float, float]:
+    vals = [v / 100 if v > 1 else v for v in _numbers(text)]
+    if len(vals) != 2:
+        raise ValueError("нужно два числа — от и до, например «0.92-0.95»")
+    lo_lim, hi_lim = runtime_state.PRICE_LIMITS
+    for v in vals:
+        if not lo_lim - 1e-9 <= v <= hi_lim + 1e-9:
+            raise ValueError(f"{v:.2f} — вне пределов {lo_lim:.2f}–{hi_lim:.2f}")
+    return round(min(vals), 2), round(max(vals), 2)
+
+
+def parse_number(text: str, lo: float, hi: float, allow_off: bool = True) -> float:
+    low = (text or "").strip().lower()
+    if allow_off and any(low.startswith(w) for w in _OFF_WORDS):
+        return 0.0
+    vals = _numbers(low)
+    if len(vals) != 1:
+        raise ValueError("нужно одно число")
+    v = vals[0]
+    if not lo <= v <= hi:
+        raise ValueError(f"{v:g} — вне пределов {lo:g}–{hi:g}")
+    return v
+
+
+def _rule_changed() -> str:
+    late_bot.mark_rule_change()
+    return " Итоги «по нынешнему правилу» — с этого момента."
+
+
+def apply_window(a: int, b: int) -> str:
+    runtime_state.set("late_from_sec", int(max(a, b)))
+    runtime_state.set("late_to_sec", int(min(a, b)))
+    return f"✅ Окно входа: {late_bot.window_phrase()}." + _rule_changed()
+
+
+def apply_price(lo: float, hi: float) -> str:
+    runtime_state.set("late_min_price", min(lo, hi))
+    runtime_state.set("late_max_price", max(lo, hi))
+    pl, ph = late_bot.price_range()
+    return f"✅ Цена: {pl:.2f}–{ph:.2f}." + _rule_changed()
+
+
+def apply_dist(v: float) -> str:
+    runtime_state.set("late_min_dist", round(v, 4))
+    return (f"✅ До страйка: не меньше {late_bot.min_dist():g}%." if v > 0 else "✅ Без условия по % до страйка.") \
+        + _rule_changed()
+
+
+def apply_atr(v: float) -> str:
+    runtime_state.set("late_min_atr", round(v, 3))
+    return (f"✅ До страйка: не меньше {late_bot.min_atr():g} ATR." if v > 0 else "✅ Без условия по ATR.") \
+        + _rule_changed()
+
+
+def apply_stake(v: float) -> str:
+    runtime_state.set("late_stake", round(v, 2))
+    return f"✅ Сумма входа: ${late_bot.stake():g} (не меньше 5 акций)."
+
+
+def apply_stop(v: float) -> str:
+    runtime_state.set("late_stop", round(v, 2))
+    return f"✅ Дневной стоп реальных ставок: −${late_bot.stop():g}." if v > 0 else "✅ Без дневного стопа."
+
+
+def apply_input(kind: str, text: str) -> str:
+    """Своё значение из сообщения → строка-итог. ValueError — с понятной причиной."""
+    if kind == "win":
+        return apply_window(*parse_window(text))
+    if kind == "price":
+        return apply_price(*parse_price(text))
+    if kind == "dist":
+        return apply_dist(parse_number(text.replace("%", ""), 0.0, 5.0))
+    if kind == "atr":
+        return apply_atr(parse_number(text, 0.0, 20.0))
+    if kind == "stake":
+        return apply_stake(parse_number(text.replace("$", ""), *runtime_state.STAKE_LIMITS, allow_off=False))
+    if kind == "stop":
+        return apply_stop(parse_number(text.replace("$", ""), 0.0, 100000.0))
+    raise ValueError("неизвестная настройка")
+
+
+def _current_value(kind: str) -> str:
+    lb = late_bot
+    pl, ph = lb.price_range()
+    return {"win": lb.window_phrase(), "price": f"{pl:.2f}–{ph:.2f}",
+            "dist": f"≥{lb.min_dist():g}%" if lb.min_dist() > 0 else "без условия",
+            "atr": lb.atr_text(), "stake": f"${lb.stake():g}",
+            "stop": f"−${lb.stop():g}" if lb.stop() > 0 else "без стопа"}.get(kind, "")
+
+
+def prompt_text(kind: str, head: str = "") -> str:
+    return ((head + "\n\n") if head else "") + PROMPTS[kind] + f"\nСейчас: {_current_value(kind)}."
+
+
+def _prompt_markup() -> InlineKeyboardMarkup:
+    return _menu((Btn("❌ Отмена", callback_data="inx"),))
+
+
+def handle_text(text: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Сообщение от владельца: значение для ✏️ (если ждём) или просто главное меню."""
+    kind = _await.get("kind")
+    if not kind:
+        return main_text(), main_markup()
+    if kind in ADDON_PROMPTS:                 # ➕ докупка: сумма на уровень / уровни
+        try:
+            head = apply_addon_input(kind, text)
+        except ValueError as exc:
+            return (addon_prompt_text(kind, f"⚠️ Не понял: {exc}. Попробуй ещё раз или нажми «Отмена»."),
+                    _addon_cancel_markup())
+        _await["kind"] = None
+        return addon_text(head), addon_markup()
+    if ":" in kind:                       # сумма / банк монеты: «cu:btc», «cp:eth», «cb:btc», «bank:sol»
+        ckind, asset = kind.split(":", 1)
+        try:
+            head = apply_coin_input(ckind, asset, text)
+        except ValueError as exc:
+            return (coin_prompt_text(ckind, asset, f"⚠️ Не понял: {exc}. Попробуй ещё раз или нажми «Отмена»."),
+                    _menu((Btn("❌ Отмена", callback_data=f"cs:{asset}"),)))
+        _await["kind"] = None
+        return coin_stake_text(asset, head), coin_stake_markup(asset)
     try:
-        sm = await asyncio.to_thread(study.run)
-        await notify(f"📊 Пороги пересчитаны ({reason}): {text.n_bets(sm['bets'])} по {text.n_events(sm['events'])}, "
-                     f"проверенных правил: {sm['rules']}.")
-    except Exception as exc:  # noqa: BLE001
-        await notify(f"⚠️ Пороги не пересчитались: {exc}"[:300])
+        head = apply_input(kind, text)
+    except ValueError as exc:
+        return prompt_text(kind, f"⚠️ Не понял: {exc}. Попробуй ещё раз или нажми «Отмена»."), _prompt_markup()
+    _await["kind"] = None
+    return settings_text(head), settings_markup()
 
+
+# ---------------------------------------------------------------- режим LIVE ----
+
+def confirm_live_text() -> str:
+    lb = late_bot
+    coins = lb.live_coins()
+    lines = ["⚠️ Включить LIVE? Бот начнёт ставить реальные деньги на Polymarket.", ""]
+    if coins:
+        lines.append(f"Реальные ставки пойдут по: {', '.join(lb.coin_name(a) for a in coins)} — {stake_text()}; "
+                     f"правило: {lb.rule_short()}.")
+        test = [a.upper() for a in lb.trade_assets() if a not in coins]
+        if test:
+            lines.append(f"Остальные включённые монеты ({', '.join(test)}) — только тест.")
+        if not lb.enabled():
+            lines.append("⚠️ Стратегия сейчас ⏸ выключена — ставок не будет, пока не включишь в ⚙️ Настройках.")
+    else:
+        lines.append("Ни одна включённая монета не помечена 🔴 — реальных ставок не будет, пока не пометишь "
+                     "в 🪙 Монетах.")
+    return "\n".join(lines)
+
+
+def _confirm_live_markup() -> InlineKeyboardMarkup:
+    return _menu((Btn("✅ Да, включить LIVE", callback_data="lvy"), Btn("❌ Отмена", callback_data="m")))
+
+
+NO_KEY_TEXT = ("❌ Нельзя включить LIVE: POLY_PRIVATE_KEY не задан в переменных окружения. "
+               "Добавь ключ и передеплой бота.")
+
+
+# -------------------------------------------------------------- обработка ----
 
 def _float(s: str) -> float | None:
     try:
@@ -397,94 +713,120 @@ def _float(s: str) -> float | None:
         return None
 
 
+def _handle_settings(cmd: str, parts: list[str]) -> tuple[str, InlineKeyboardMarkup] | None:
+    lb = late_bot
+    head = ""
+    if cmd == "set":
+        runtime_state.set("late_enabled", not lb.enabled())
+        head = "⏱ Стратегия ✅ включена." if lb.enabled() else "⏱ Стратегия ⏸ выключена — ставок нет, окна пишутся."
+    elif cmd == "sw" and len(parts) == 3:
+        try:
+            a, b = int(parts[1]), int(parts[2])
+        except ValueError:
+            a = b = -1
+        cur = (int(runtime_state.get("late_from_sec")), int(runtime_state.get("late_to_sec")))
+        if (a, b) in lb.WINDOW_PRESETS and (a, b) != cur:
+            head = apply_window(a, b)
+    elif cmd == "sp" and len(parts) == 3:
+        a, b = _float(parts[1]), _float(parts[2])
+        if (a is not None and b is not None and any(_same(a, x) and _same(b, y) for x, y in lb.PRICE_PRESETS)
+                and (a, b) != lb.price_range()):
+            head = apply_price(a, b)
+    elif cmd in ("sd", "sa", "su", "ss") and len(parts) == 2:
+        v = _float(parts[1])
+        presets, current, fn = {"sd": (lb.DIST_PRESETS, lb.min_dist(), apply_dist),
+                                "sa": (lb.ATR_PRESETS, lb.min_atr(), apply_atr),
+                                "su": (lb.STAKE_PRESETS, lb.stake(), apply_stake),
+                                "ss": (lb.STOP_PRESETS, lb.stop(), apply_stop)}[cmd]
+        if v is not None and any(_same(v, x) for x in presets) and not _same(v, current):
+            head = fn(v)
+    else:
+        return None
+    return settings_text(head), settings_markup()
+
+
 async def handle(data: str) -> tuple[str, InlineKeyboardMarkup]:
-    """Нажатие кнопки → (текст, кнопки) экрана."""
-    parts = data.split(":", 1)
-    cmd, arg = parts[0], (parts[1] if len(parts) > 1 else "")
-    if cmd == "th":
-        return thresholds_text(), thresholds_markup()
-    if cmd == "tho":
-        return overview_text(), thresholds_markup()
-    if cmd == "thr":
-        if study.is_running():
-            return thresholds_text("Уже считаю — пришлю итог."), thresholds_markup()
-        _spawn(_recompute("по кнопке"))
-        return thresholds_text("♻️ Пересчитываю — пришлю итог сообщением."), thresholds_markup()
-    if cmd == "ci":
-        return cities_text(), cities_markup()
-    if cmd == "cy" and arg:
-        return city_text(arg), city_markup(arg)
-    if cmd == "ct" and arg:
-        on = runtime_state.toggle_city(arg)
-        return city_text(arg, "🎯 Кандидаты по городу " + ("✅ включены." if on else "⏸ выключены.")), city_markup(arg)
-    if cmd == "ca":
-        return candidates_text(), candidates_markup()
-    if cmd == "cat":
-        runtime_state.set("alerts_enabled", not runtime_state.get("alerts_enabled"))
-        return candidates_text(), candidates_markup()
-    if cmd == "cam" and arg in ("now", "hour", "off"):
-        runtime_state.set("alerts_enabled", arg != "off")
-        if arg != "off":
-            runtime_state.set("alerts_hourly", arg == "hour")
-        return candidates_text(), candidates_markup()
-    if cmd == "cac" and arg in ("0", "1"):
-        runtime_state.set("alerts_city_only", arg == "1")
-        return candidates_text(), candidates_markup()
-    if cmd == "cae":
-        v = _float(arg)
-        if v is not None and any(abs(v - x) < 1e-9 for x in MIN_EV_PRESETS):
-            runtime_state.set("alert_min_ev", v)
-        return candidates_text(), candidates_markup()
-    if cmd == "cas" and arg in ("both", "yes", "no"):
-        runtime_state.set("alerts_sides", arg)
-        return candidates_text(), candidates_markup()
-    if cmd == "ar":
-        return archive_text(), archive_markup()
-    if cmd == "ars":
-        if archive.is_running():
-            return archive_text("Докачка уже идёт."), archive_markup()
-        if not runtime_state.get("archive_enabled"):
-            runtime_state.set("archive_enabled", True)
-        archive.request_sync()
-        return archive_text("🔄 Запустил докачку."), archive_markup()
-    if cmd == "are":
-        runtime_state.set("archive_enabled", not runtime_state.get("archive_enabled"))
-        if runtime_state.get("archive_enabled"):
-            archive.request_sync()
-        return archive_text(), archive_markup()
-    if cmd == "ard" and arg.isdigit() and int(arg) in DAYS_PRESETS:
-        head = ""
-        if int(arg) != int(runtime_state.get("archive_days")):
-            runtime_state.set("archive_days", int(arg))
-            archive.request_sync()
-            head = f"Глубина архива: {arg} дн. — докачиваю недостающее."
-        return archive_text(head), archive_markup()
+    """Нажатие кнопки → (текст, кнопки) экрана, который показать."""
+    parts = data.split(":")
+    cmd = parts[0]
+    if cmd == "in" and len(parts) == 2 and parts[1] in PROMPTS:
+        _await["kind"] = parts[1]
+        return prompt_text(parts[1]), _prompt_markup()
+    if cmd == "in" and len(parts) == 2 and parts[1] in ADDON_PROMPTS:
+        _await["kind"] = parts[1]
+        return addon_prompt_text(parts[1]), _addon_cancel_markup()
+    if cmd == "in" and len(parts) == 3 and parts[1] in COIN_PROMPTS and parts[2] in settings.ASSETS:
+        _await["kind"] = f"{parts[1]}:{parts[2]}"
+        return coin_prompt_text(parts[1], parts[2]), _menu((Btn("❌ Отмена", callback_data=f"cs:{parts[2]}"),))
+    _await["kind"] = None                         # любая другая кнопка — ввод отменён
+    if cmd == "inx":
+        return settings_text("Ввод отменён."), settings_markup()
     if cmd == "se":
         return settings_text(), settings_markup()
-    if cmd in ("sv", "sn", "sp"):
-        v = _float(arg)
-        head = ""
-        if cmd == "sv" and v is not None and any(abs(v - x) < 1e-9 for x in VOLUME_PRESETS) \
-                and abs(v - float(runtime_state.get("min_event_volume"))) > 1e-9:
-            runtime_state.set("min_event_volume", v)
-            _spawn(_recompute(f"объём от {text.usd(v)}"))
-            head = "Пересчитываю пороги — пришлю итог."
-        elif cmd == "sn" and v is not None and int(v) in MIN_N_PRESETS and int(v) != int(runtime_state.get("rule_min_n")):
-            runtime_state.set("rule_min_n", int(v))
-            _spawn(_recompute(f"не меньше {int(v)} ставок"))
-            head = "Пересчитываю пороги — пришлю итог."
-        elif cmd == "sp" and v is not None and any(abs(v - x) < 1e-9 for x in STAKE_PRESETS):
-            runtime_state.set("paper_stake", v)
-        return settings_text(head), settings_markup()
+    if cmd in ("ad", "adt", "adl", "adly", "adu", "adv"):
+        return _handle_addon(cmd, parts)
+    res = _handle_settings(cmd, parts)
+    if res is not None:
+        return res
+    if cmd == "co":
+        return coins_text(), coins_markup()
+    if cmd in ("cs", "csg", "csu", "csp", "cbx", "csd") and len(parts) >= 2 and parts[1] in settings.ASSETS:
+        asset, head = parts[1], ""
+        if cmd == "csd" and len(parts) == 3 and parts[2] in ("both", "UP", "DOWN"):
+            new = None if parts[2] == "both" else parts[2]
+            if runtime_state.coin_side(asset) != new:
+                head = apply_coin_side(asset, new)
+        elif cmd == "cbx" and runtime_state.coin_bank(asset):
+            head = apply_coin_bank(asset, None)
+        elif cmd == "csg" and runtime_state.coin_stake(asset):
+            head = apply_coin_stake(asset, None)
+        elif cmd in ("csu", "csp") and len(parts) == 3:
+            v = _float(parts[2])
+            presets, mode = (late_bot.STAKE_PRESETS, "usd") if cmd == "csu" else (late_bot.PCT_PRESETS, "pct")
+            if v is not None and any(_same(v, x) for x in presets) and runtime_state.coin_stake(asset) != (mode, v):
+                head = apply_coin_stake(asset, mode, v)
+        return coin_stake_text(asset, head), coin_stake_markup(asset)
+    if cmd == "c" and len(parts) == 3 and parts[2] in settings.ASSETS:
+        asset, head = parts[2], ""
+        if parts[1] == "on":
+            on = runtime_state.toggle_asset(asset)
+            head = f"{asset.upper()}: {'✅ включена' if on else '⏸ выключена — ставок по ней не будет'}.\n\n"
+        elif parts[1] == "lv":
+            live = not runtime_state.is_asset_live(asset)
+            runtime_state.set_asset_live(asset, live)
+            if live:
+                head = f"{asset.upper()}: 🔴 реальные ставки"
+                if runtime_state.get("dry_run"):
+                    head += " — пойдут после «🔴 Включить LIVE» в главном меню"
+                if not runtime_state.is_asset_enabled(asset):
+                    head += "; монета ⏸ выключена — сначала включи"
+                head += ".\n\n"
+            else:
+                head = f"{asset.upper()}: 🧪 только тест.\n\n"
+        return head + coins_text(), coins_markup()
+    if cmd == "sta":
+        return late_bot.stats_text(), _menu((Btn("🔄 Обновить", callback_data="sta"), BACK))
     if cmd == "fx":
         from src import reporting
-        _spawn(reporting.send_files())
-        return "📤 Собираю файлы — пришлю следом (расчётные ставки считаются минуту-другую).\n\n" + main_text(), \
-            _menu((Btn("🗂 Пути цены по месяцам", callback_data="fxp"),), (BACK,))
-    if cmd == "fxp":
-        from src import reporting
-        _spawn(reporting.send_paths())
-        return "🗂 Собираю пути цены по месяцам — пришлю следом.\n\n" + main_text(), main_markup()
+        try:
+            n = await reporting.send_all()
+            head = ("📤 Отправил файлы: окна всех монет (с путём цены) и ставки — всё, что в базе." if n
+                    else "📤 В базе пока пусто — нечего выгружать.")
+        except Exception as exc:  # noqa: BLE001
+            head = f"⚠️ Файлы не ушли: {exc}"[:300]
+        return head + "\n\n" + main_text(), main_markup()
+    if cmd == "lv":
+        if not runtime_state.get("dry_run"):
+            runtime_state.set("dry_run", True)
+            return "🧪 Переключено в DRY RUN — реальные ставки остановлены.\n\n" + main_text(), main_markup()
+        if not settings.POLY_PRIVATE_KEY:
+            return NO_KEY_TEXT, main_markup()
+        return confirm_live_text(), _confirm_live_markup()
+    if cmd == "lvy":
+        if not settings.POLY_PRIVATE_KEY:
+            return NO_KEY_TEXT, main_markup()
+        runtime_state.set("dry_run", False)
+        return "🔴 LIVE включён.\n\n" + main_text(), main_markup()
     return main_text(), main_markup()
 
 
@@ -496,6 +838,8 @@ def _owner_chat_id() -> int | None:
 
 
 def _is_owner(update: Update) -> bool:
+    """Управлять ботом может только чат из TELEGRAM_CHAT_ID (туда же идут уведомления).
+    Не задан — без ограничения, чтобы не запереть владельца."""
     owner = _owner_chat_id()
     if owner is None:
         return True
@@ -506,13 +850,28 @@ def _is_owner(update: Update) -> bool:
 async def _cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_owner(update):
         return
+    _await["kind"] = None
     await update.message.reply_text(_fit(main_text()), reply_markup=main_markup())
 
 
-async def _cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_owner(update):
         return
-    await update.message.reply_text(_fit(thresholds_text()), reply_markup=thresholds_markup())
+    _await["kind"] = None
+    await update.message.reply_text(_fit(settings_text()), reply_markup=settings_markup())
+
+
+async def _cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        return
+    await update.message.reply_text(_fit(late_bot.stats_text()))
+
+
+async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update) or update.message is None:
+        return
+    text, markup = handle_text(update.message.text or "")
+    await update.message.reply_text(_fit(text), reply_markup=markup)
 
 
 async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -520,10 +879,10 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if not _is_owner(update):
         return
-    body, markup = await handle(query.data or "m")
+    text, markup = await handle(query.data or "m")
     try:
-        await query.edit_message_text(_fit(body), reply_markup=markup)
-    except Exception as exc:  # noqa: BLE001 — «message is not modified»
+        await query.edit_message_text(_fit(text), reply_markup=markup)
+    except Exception as exc:  # noqa: BLE001 — повторное нажатие той же кнопки: «message is not modified»
         if "not modified" not in str(exc).lower():
             raise
 
@@ -533,32 +892,39 @@ def build_app() -> Application:
     _app = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
     for name in ("start", "menu", "status"):
         _app.add_handler(CommandHandler(name, _cmd_menu))
-    _app.add_handler(CommandHandler("rules", _cmd_rules))
+    _app.add_handler(CommandHandler("settings", _cmd_settings))
+    _app.add_handler(CommandHandler("stats", _cmd_stats))
     _app.add_handler(CallbackQueryHandler(_on_callback))
+    _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
     return _app
 
 
-def startup_text() -> str:
-    c = storage.archive_counts()
-    lines = ["🤖 Погодный бот запущен — 📚 архив температурных рынков, 📊 пороги, 🎯 кандидаты (без реальных ставок).",
-             archive_line()]
-    if not c["status"].get("done"):
-        lines.append(f"Качаю архив за {runtime_state.get('archive_days')} дн. — в первый раз это часы; пороги "
-                     "посчитаются по ходу, пришлю итог.")
+def startup_text(forced_dry: bool = False) -> str:
+    lines = ["🤖 Бот запущен — ⏱ поздний вход 5m.", "Режим: " + late_bot.mode_text(),
+             "Монеты: " + coins_line() + " (✅ вкл, 🧪 тест, 🔴 реально)",
+             "Правило: " + ("✅ " if late_bot.enabled() else "⏸ выключено, ") + late_bot.rule_short()
+             + f"; {stake_text()}.",
+             f"➕ Докупка: {late_bot.addon_short()}."]
+    if forced_dry:
+        lines.append("⚠️ Был сохранён LIVE, но POLY_PRIVATE_KEY не задан — откатил в DRY RUN.")
     if storage.DB_WAS_NEW:
-        lines.append(f"⚠️ База создана заново ({settings.DB_PATH}). Без постоянного тома (Persistent Storage на "
-                     "/app/data) архив будет качаться заново после каждого деплоя.")
-    lines.append("/menu — управление.")
+        lines.append(f"⚠️ База создана заново ({settings.DB_PATH}). Если бот уже работал — данные не сохраняются "
+                     "между деплоями: подключи постоянный том (Persistent Storage) на /app/data. "
+                     "Сейчас режим, монеты и настройки — по умолчанию, статистика пустая.")
+    if not settings.USE_LIVE_BOOK_STREAM:
+        lines.append("⚠️ USE_LIVE_BOOK_STREAM=false — без живого стакана ставок не будет.")
+    lines.append("/menu — управление, /settings — настройки.")
     return "\n".join(lines)
 
 
-async def notify(msg: str) -> None:
+async def notify(text: str) -> None:
     if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID or _app is None:
         return
-    await _app.bot.send_message(chat_id=settings.TELEGRAM_CHAT_ID, text=_fit(msg))
+    await _app.bot.send_message(chat_id=settings.TELEGRAM_CHAT_ID, text=_fit(text))
 
 
 async def send_document(path: str, caption: str | None) -> None:
+    """Файл (CSV / zip-отчёт) в чат."""
     if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID or _app is None:
         return
     with open(path, "rb") as f:
